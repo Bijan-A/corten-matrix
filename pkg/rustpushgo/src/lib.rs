@@ -3243,15 +3243,10 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     warn!("pending ring: unprop_conv failed for session {}: {:?}", guid, e);
                 } else {
                     info!(
-                        "pending ring: unpropped bridge from session {} — web client carries the call from here",
+                        "pending ring: unpropped bridge from session {} — peer's iOS will hide our tile via active=None",
                         guid
                     );
                 }
-            } else {
-                info!(
-                    "pending ring: session {} was never propped — no unprop needed (expected on outbound post-prop-skip)",
-                    guid
-                );
             }
             // Do NOT send a cmd 209 RemoveMember here. 20bf121f tried
             // that to drop the bridge from peer's session.members
