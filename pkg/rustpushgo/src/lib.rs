@@ -3211,11 +3211,9 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                 joiner_handle
             );
             // Flip is_ringing_inaccurate=true now that the Invitation is on
-            // the wire. create_session_no_ring starts it false to suppress
-            // prop_up_conv's RespondedElsewhere diversion; we need it true
-            // here so upstream's missed-call detection (facetime.rs:1411)
-            // trips if the callee declines / times out — otherwise a
-            // no-answer call silently drops instead of surfacing as Missed.
+            // the wire. Upstream's missed-call detection (facetime.rs:1411)
+            // keys off this flag to surface declines / timeouts as Missed;
+            // without flipping, a no-answer call silently drops.
             let mut state = ft.state.write().await;
             if let Some(session) = state.sessions.get_mut(guid) {
                 session.is_ringing_inaccurate = true;
@@ -3230,24 +3228,14 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
     if rang {
         suppress_own_device_ring(ft, guid).await;
 
-        // Leave the session now that the user's device has joined AND the
-        // ring is on the wire. The bridge was only propped in the session
-        // to satisfy upstream's OneOnOne-mode exit requirement (see
-        // upstream facetime.rs:1071-1077 comment: "we solve this by
-        // 'joining' the call until the web client has an opportunity to
-        // join, and then leaving ASAP"). Staying propped makes peer's
-        // client and the user's Mac Continuity UI render the call as
-        // "{callee} and one other person" — that "other person" being
-        // the bridge's participant with video_enabled=Some(false). The
-        // user's device handles audio + video end-to-end; the bridge is
-        // only needed through session creation and ring dispatch.
-        //
-        // Safe to unprop here because the joiner that triggered
-        // maybe_fire_pending_ring is guaranteed to be a non-caller (filtered
-        // at line 3153), so at least one user-side participant is active
-        // before the bridge leaves. Callee's own join arrives over the
-        // wire when they answer and is processed by upstream handle()
-        // independently.
+        // Defensive unprop. create_session_no_ring deliberately skips
+        // prop_up_conv and ft_handle_with_join_recovery runs its own
+        // auto-unprop on webview temp: joins, so on outbound this branch
+        // almost never fires in practice — the is_propped check falls
+        // through to the "never propped" else log. Keep the unprop as
+        // belt-and-suspenders for code paths we haven't enumerated (e.g.
+        // a future caller proppping via respond_letmein before the
+        // pending ring fires).
         let mut state = ft.state.write().await;
         if let Some(session) = state.sessions.get_mut(guid) {
             if session.is_propped {
@@ -5469,11 +5457,19 @@ impl WrappedFaceTimeClient {
     // detection (facetime.rs:1411) trips on decline / timeout.
     //
     // Historical dead-ends (see _todo/FT-phantom-tile-learnings.md):
-    //  - Propping at create + various cleanup wires (prune members,
-    //    post-ring RemoveMember, synthetic active stamp) — all regressed
-    //    outbound media in different ways.
-    //  - Known-working shape is the proxy era (c9f7a873 / 9069188e) and
-    //    88af11f8 — plain ensure_allocations, no prop, no post-ring wire.
+    //  - Prune bridge from members (b37d2400): broke outbound ring.
+    //  - Post-ring RemoveMember (c303aa59 / 20bf121f shapes): collapsed
+    //    peer's media via unpack_participants wipe-then-restore.
+    //  - Local bridge.active stamp at create (9b9c5784): built on a
+    //    hallucinated premise about 50473405; never a confirmed-working
+    //    state. Note: prop_up_conv at create alone worked in the proxy
+    //    era (9069188e) — the local stamp was the novel addition.
+    //
+    // Known-working shapes (user-confirmed): 9069188e (prop at create,
+    // no stamp) and 88af11f8 (no prop, no stamp). Current code matches
+    // 88af11f8 (simpler). If outbound video still regresses on deploy,
+    // the next thing to try is adding back prop_up_conv(session, false)
+    // after ensure_allocations — that's the only delta to 9069188e.
     pub async fn create_session_no_ring(
         &self,
         group_id: String,
