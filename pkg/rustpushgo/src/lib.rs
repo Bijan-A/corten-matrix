@@ -3632,6 +3632,83 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
+    // Inbound parity with outbound (create_session_no_ring): pre-allocate +
+    // pre-prop + pre-stamp bridge.active BEFORE respond_letmein runs. Without
+    // this, respond_letmein's needs_prop branch (facetime.rs:1078) gates on
+    // `is_ringing_inaccurate && active_count==1` — true on inbound when only
+    // the peer is active — so it runs its own prop_up_conv. Upstream's
+    // prop_up_conv leaves our own .active=None locally (facetime.rs:820),
+    // then the immediate add_members(webview) fans cmd 209 with
+    // active_participants=[peer.active] only. Peer's unpack_participants
+    // (facetime.rs:245) wipes all participants and self-excludes by token
+    // (line 254), leaving ZERO active participants on her side — webview
+    // tile never registers, no video.
+    //
+    // By pre-ensuring bridge is allocated + propped + stamped active here,
+    // needs_prop flips to false (count==2) → respond_letmein skips its
+    // internal prop → add_members fans with [peer.active, bridge.active].
+    // Peer's unpack_participants preserves bridge active after her self
+    // exclusion, and the later auto-unprop (cmd 208) flips bridge inactive
+    // cleanly once the webview joins. Mirrors the outbound path where the
+    // same pattern already works.
+    if inbound_session {
+        use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+        fn handle_from_ids(ids: &str) -> Handle {
+            let mut h = Handle::default();
+            if let Some(addr) = ids.strip_prefix("mailto:") {
+                h.set_type(HandleType::EmailAddress);
+                h.value = addr.to_string();
+            } else if let Some(phone) = ids.strip_prefix("tel:") {
+                h.set_type(HandleType::PhoneNumber);
+                h.value = phone.to_string();
+                h.iso_country_code = "us".to_string();
+            } else {
+                h.set_type(HandleType::Generic);
+                h.value = ids.to_string();
+            }
+            h
+        }
+
+        let my_token_b64 = base64_encode(&facetime.conn.get_token().await);
+        let mut state = facetime.state.write().await;
+        if let Some(session) = state.sessions.get_mut(&approved_group) {
+            if !session.is_propped {
+                facetime.ensure_allocations(session, &[]).await?;
+                facetime.prop_up_conv(session, false).await?;
+                if let Some(my_participant) = session
+                    .participants
+                    .values_mut()
+                    .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
+                {
+                    my_participant.active = Some(ConversationParticipant {
+                        version: 0,
+                        identifier: my_participant.participant_id,
+                        handle: Some(handle_from_ids(&my_participant.handle)),
+                        avc_data: include_bytes!(
+                            "../../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
+                        )
+                        .to_vec(),
+                        is_moments_available: Some(true),
+                        is_screen_sharing_available: Some(true),
+                        is_gondola_calling_available: Some(true),
+                        is_mirage_available: None,
+                        is_lightweight: None,
+                        share_play_protocol_version: 4,
+                        options: 0,
+                        is_gft_downgrade_to_one_to_one_available: Some(false),
+                        guest_mode_enabled: None,
+                        association: None,
+                        is_u_plus_n_downgrade_available: Some(false),
+                    });
+                }
+                info!(
+                    "FaceTime inbound letmein: pre-propped + stamped bridge active locally for session {} so respond_letmein's add_members fans active_participants including bridge",
+                    approved_group,
+                );
+            }
+        }
+    }
+
     // Diagnostic: dump session state right before respond_letmein so we can
     // see empirically whether session.members includes the peer on inbound.
     // Hypothesis we're testing: on inbound letmein, session.members holds
