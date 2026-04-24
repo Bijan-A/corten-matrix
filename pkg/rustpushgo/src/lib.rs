@@ -3632,6 +3632,47 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
+    // Diagnostic: dump session state right before respond_letmein so we can
+    // see empirically whether session.members includes the peer on inbound.
+    // Hypothesis we're testing: on inbound letmein, session.members holds
+    // only [webview] so upstream add_members fans to nobody and wife's
+    // phone never sees the browser join.
+    {
+        let state = facetime.state.read().await;
+        if let Some(s) = state.sessions.get(&approved_group) {
+            let members_list: Vec<&str> =
+                s.members.iter().map(|m| m.handle.as_str()).collect();
+            let participants_list: Vec<String> = s
+                .participants
+                .values()
+                .map(|p| format!("{}(active={})", p.handle, p.active.is_some()))
+                .collect();
+            let mode_str = match s.mode {
+                Some(rustpush::facetime::FTMode::Incoming) => "Incoming",
+                Some(rustpush::facetime::FTMode::Outgoing) => "Outgoing",
+                Some(rustpush::facetime::FTMode::Missed) => "Missed",
+                Some(rustpush::facetime::FTMode::MissedOutgoing) => "MissedOutgoing",
+                None => "None",
+            };
+            info!(
+                "FaceTime letmein diag: group={} inbound={} mode={} is_propped={} is_ringing_inaccurate={} my_handles={:?} members={:?} participants={:?}",
+                approved_group,
+                inbound_session,
+                mode_str,
+                s.is_propped,
+                s.is_ringing_inaccurate,
+                s.my_handles,
+                members_list,
+                participants_list,
+            );
+        } else {
+            info!(
+                "FaceTime letmein diag: group={} inbound={} SESSION NOT FOUND in state",
+                approved_group, inbound_session,
+            );
+        }
+    }
+
     // respond_letmein: sends LetMeInResponse then add_members/ring over APNs.
     // APNs can flap (early eof → SendTimedOut) especially right after boot.
     //
