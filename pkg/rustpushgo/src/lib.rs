@@ -3265,6 +3265,54 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     guid
                 );
             }
+
+            // Evict the bridge from peer's FT UI by sending cmd 209
+            // RemoveMember naming our own handle. By the time we get here
+            // the ring has fired (Invitation is on the wire), the webview
+            // has already joined (that's what triggered this function),
+            // and media flows webview↔peer directly through Apple's
+            // quickrelay. The bridge being in peer's session.members — put
+            // there by respond_letmein's add_members cmd 209 fanout — is
+            // no longer load-bearing. Removing it now causes peer iOS to
+            // drop the "invited, hasn't joined" placeholder tile without
+            // disturbing the live call.
+            //
+            // Upstream's remove_members builds its wire from
+            // session.members, so we clone the list, strip our own handle
+            // for the wire fanout, and let upstream compose the
+            // ConversationMessage::RemoveMember. The local session.members
+            // mutation inside remove_members is a no-op (see facetime.rs:
+            // 987 — `session.members = new` where new is the pre-call
+            // clone), so we keep our own view intact for bookkeeping.
+            let own_handles: Vec<String> = session.my_handles.clone();
+            let to_remove: Vec<rustpush::facetime::FTMember> = session
+                .members
+                .iter()
+                .filter(|m| own_handles.contains(&m.handle))
+                .cloned()
+                .collect();
+            if to_remove.is_empty() {
+                info!(
+                    "pending ring: session {} had no bridge handle in members — nothing to evict",
+                    guid
+                );
+            } else {
+                match ft.remove_members(session, to_remove.clone()).await {
+                    Ok(()) => info!(
+                        "pending ring: evicted {} bridge handle(s) from peer's view of session {} via cmd 209 RemoveMember",
+                        to_remove.len(),
+                        guid
+                    ),
+                    Err(e) => warn!(
+                        "pending ring: remove_members failed for session {}: {:?} — peer may still see a phantom tile",
+                        guid, e
+                    ),
+                }
+                // remove_members upstream retains session.members locally;
+                // drop the bridge from our own copy too so subsequent
+                // fanouts don't re-include it.
+                session.members.retain(|m| !own_handles.contains(&m.handle));
+            }
         }
     }
 }
@@ -5484,40 +5532,26 @@ impl WrappedFaceTimeClient {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Session.members contains ONLY the peer(s). The bridge's own handle
-        // is kept out so that the subsequent add_members call (inside
-        // respond_letmein when the webview sends letmein) fans out cmd 209
-        // with `update_context.members = before_members` that omits the
-        // bridge. Peer's handler at facetime.rs:1342 calls
-        // unpack_members(decoded_context.members), which would otherwise
-        // record the bridge as a member-without-participant — iOS renders
-        // that pairing as an "invited, hasn't joined" phantom tile that
-        // can't be cleared by a later unprop (handle isn't `temp:`, so
-        // facetime.rs:1399-1403's member-prune doesn't remove it).
+        // Session.members includes the bridge's own handle. It HAS to be
+        // there so that when respond_letmein's add_members fans the
+        // webview-added cmd 209 to `to_members = all_members_inclusive`,
+        // the webview is told the bridge is in the session — otherwise
+        // the webview's own cmd 207 self-join doesn't fanout to the bridge,
+        // maybe_fire_pending_ring never triggers, and peer never rings.
         //
-        // Inbound doesn't hit this because peer's own create_session
-        // populates her session.members from her side — the bridge is
-        // there but it ALSO has an active participant entry from our
-        // respond_letmein prop, which goes active=None on unprop and iOS
-        // hides inactive tiles.
+        // Phantom-tile cleanup happens AFTER the ring has fired, in
+        // maybe_fire_pending_ring, via remove_members (cmd 209 RemoveMember).
+        // By that point the webview has already joined and media flows
+        // webview↔peer directly through Apple's quickrelay — bridge being
+        // a member is no longer load-bearing.
         let members = participants
             .iter()
+            .chain(std::iter::once(&handle))
             .map(|p| FTMember {
                 nickname: None,
                 handle: p.clone(),
             })
             .collect();
-
-        // Ensure the bridge gets a quickrelay allocation (participant_id +
-        // token) even though it's not in session.members. ensure_allocations
-        // iterates session.members.chain(new_members) for allocation, so
-        // passing the bridge as new_members keeps it reachable via
-        // session.participants without leaking into the wire-level members
-        // list.
-        let bridge_member = FTMember {
-            nickname: None,
-            handle: handle.clone(),
-        };
 
         let session = FTSession {
             group_id: group_id.clone(),
@@ -5539,14 +5573,14 @@ impl WrappedFaceTimeClient {
         let session = state.sessions.get_mut(&group_id).expect("just inserted");
 
         self.inner
-            .ensure_allocations(session, std::slice::from_ref(&bridge_member))
+            .ensure_allocations(session, &[])
             .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("ensure_allocations failed: {:?}", e),
             })?;
 
         info!(
-            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); bridge excluded from session.members to suppress peer phantom tile",
+            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); prop_up_conv deferred — peer won't see bridge until the ring fanout fans",
             group_id,
             session.participants.len(),
         );
