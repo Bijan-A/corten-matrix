@@ -130,7 +130,7 @@ The `imessage` CLI is a thin wrapper — every subcommand maps to a small number
 |---|---|
 | `setup` | `docker exec -it Rustpush-Matrix imessage-setup` |
 | `login` | `docker exec -it Rustpush-Matrix /entrypoint.sh login` |
-| `logs` | `docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log` |
+| `logs` | `tail -F <host bind-mount>/logs/bridge.log` (read from host directly; works even when the container is stopped or restart-looping) |
 | `status` | `docker ps --filter name=^Rustpush-Matrix$` |
 | `shell` | `docker exec -it Rustpush-Matrix bash` |
 | `bbctl <args>` | `docker exec -it Rustpush-Matrix bbctl <args>` |

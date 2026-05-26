@@ -41,11 +41,11 @@ DAILY (work from any directory — container looked up by name)
                       Interactive setup wizard inside the container.
     login           → docker exec -it Rustpush-Matrix /entrypoint.sh login
                       Re-run only the iMessage login flow.
-    logs            → docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log
-                      Live-watch the bridge's full log file when the
-                      container is healthy. Falls back to `docker logs
-                      -f Rustpush-Matrix` if the container is exited or
-                      restart-looping (so you can see WHY it crashed).
+    logs            → tail -F <host bind-mount>/logs/bridge.log
+                      Live-watch the bridge's full zerolog file directly
+                      on the host volume. Works whether the container
+                      is running, restart-looping, or stopped — the
+                      file persists on the bind mount regardless.
     status          → docker ps --filter name=^Rustpush-Matrix$
                       Is the container running?
     shell           → docker exec -it Rustpush-Matrix bash
@@ -135,27 +135,23 @@ strip_marker_block() {
 cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
 cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
 cmd_logs()    {
-    # Live-tail the bridge's own log file when the container is healthy
-    # (the full zerolog stream, not just what surfaces through docker
-    # logs). When it isn't — restart-looping, exited, missing — fall
-    # back to `docker logs` so the user can see startup/crash output.
-    # `docker exec` can't run on a non-running container, so the inspect
-    # check decides up front.
-    local state
-    state=$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)
-    case "$state" in
-        running)
-            exec docker exec -it "$CONTAINER" tail -F /data/logs/bridge.log
-            ;;
-        missing)
-            echo "error: container '$CONTAINER' doesn't exist. Did you 'imessage start' yet?" >&2
-            exit 1
-            ;;
-        *)
-            echo "(container is $state — tailing 'docker logs' instead of /data/logs/bridge.log)" >&2
-            exec docker logs -f "$CONTAINER"
-            ;;
-    esac
+    # Live-tail the bridge's zerolog file directly on the host volume.
+    # We do this without `docker exec` so it keeps working even when the
+    # container is restart-looping, stopped, or otherwise unhealthy —
+    # the bind-mounted file persists regardless of container state.
+    #
+    # The host path is discovered by inspecting the container's /data
+    # mount, so it follows whatever the user put in compose (default
+    # ~/.local/share/mautrix-imessage, UNRAID /mnt/user/appdata/...,
+    # Synology /volume1/docker/..., anything).
+    local host_path
+    host_path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+    if [ -z "$host_path" ]; then
+        echo "error: container '$CONTAINER' doesn't exist or has no /data mount." >&2
+        echo "  Did you 'imessage start' yet?" >&2
+        exit 1
+    fi
+    exec tail -F "$host_path/logs/bridge.log"
 }
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
