@@ -47,15 +47,16 @@ services:
       #   "false" — self-hosted Synapse / Dendrite / Conduit
       BEEPER: "true"
 
-    # UID:GID the container runs as. Default 1000:1000 (the bundled
-    # bridge user in the image). Uncomment + edit ONLY if your host
-    # appdata directory is owned by something else.
+    # UID:GID the container runs as. Default 1000:1000 (matches the
+    # bundled bridge user in the image and the typical first Linux user).
+    # Edit if your host bind-mount sources are owned by something else.
     #
-    # Common overrides:
+    # Common alternatives:
     #   user: "99:100"     # UNRAID (nobody:users)
     #   user: "568:568"    # TrueNAS Scale (apps)
     #   user: "0:0"        # root (discouraged; only if you must)
     #
-    # Whatever UID:GID you pick, the host data directory above must be
-    # chowned to match. `imessage fix-perms` does that interactively.
-    # user: "1000:1000"
+    # Whatever UID:GID you pick, run `imessage fix-perms` to chown the
+    # bind-mount sources to match. See docs/docker.md → "Finding your
+    # UID and GID" for how to look up your host UID.
+    user: "1000:1000"
