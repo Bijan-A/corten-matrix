@@ -700,7 +700,7 @@ dev/
 
 ## Chat With Us
 
-**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#imessage-rustpush:beeper.com)
+**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#rustpush-matrix:beeper.com)
 
 ## License
 
