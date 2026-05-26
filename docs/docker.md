@@ -82,14 +82,28 @@ Open it in your editor:
 
    Run `imessage fix-perms` after editing to chown both paths to the container's UID/GID in one step.
 
-If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set the `user:` directive in compose to match — and run `imessage fix-perms` afterward to chown the bind-mount sources. See [Finding your UID and GID](#finding-your-uid-and-gid) below for how to look them up.
+If your host bind-mount sources are owned by a UID other than `1000` (UNRAID is often `99:100`, for example), update the `user:` directive in compose to match. See [Finding your UID and GID](#finding-your-uid-and-gid) for how to look up the right values.
 
-### Step 4 — Start the container
+### Step 4 — Fix permissions on the bind-mount sources
+
+**Do this before the first `imessage start`.** If the host bind-mount paths don't exist yet, Docker will create them as root on first start; if they already exist they probably aren't owned by the UID:GID your compose declares. Either way the container won't be able to read/write its own state.
+
+`imessage fix-perms` reads your compose file, finds every bind-mount source, creates any that are missing, and chowns each one to the `user:` UID:GID:
+
+```bash
+cd /path/to/the/dir/with/your/docker-compose.yml
+imessage fix-perms
+```
+
+You'll see a summary of what it found and a confirm prompt before any chown runs. Same CWD rule as `imessage start` — must be in the compose dir or set `IMESSAGE_COMPOSE_FILE`.
+
+Run this again any time you change the `user:` directive in compose or move the bind-mount paths.
+
+### Step 5 — Start the container
 
 **`imessage start` must be run from the directory that contains your `docker-compose.yml`.** Same rule as raw `docker compose up` — compose-driven subcommands (`start`, `stop`, `restart`, `pull`, `update`) need to find the file, and they look in the current directory by default.
 
 ```bash
-cd /path/to/the/dir/with/your/docker-compose.yml
 imessage start
 ```
 
@@ -102,9 +116,9 @@ imessage logs       # Ctrl-C to detach
 
 If you'd rather run lifecycle commands from anywhere, set `IMESSAGE_COMPOSE_FILE` to the absolute path of your compose file — see [Day-to-day operations](#day-to-day-operations) below.
 
-The logs should show `no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge.` every 30 seconds — that's the entrypoint waiting on step 5.
+The logs should show `no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge.` every 30 seconds — that's the entrypoint waiting on step 6.
 
-### Step 5 — Run the setup wizard
+### Step 6 — Run the setup wizard
 
 ```bash
 imessage setup
