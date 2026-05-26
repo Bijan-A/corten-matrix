@@ -59,7 +59,7 @@ Open it in your editor:
 
    You don't need to `mkdir` the path yourself — Docker creates it on first start and the entrypoint chowns it for you.
 
-If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set `PUID` / `PGID` to match. Find your host UID with `id -u` and `id -g`.
+If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set `PUID` / `PGID` to match. See [Finding your UID and GID](#finding-your-uid-and-gid) below for how to look them up.
 
 ### Step 4 — Start the container
 
@@ -183,6 +183,45 @@ The container's CMD is invoked as root, but only briefly. The entrypoint:
 5. Re-execs itself via `gosu` as the bridge user.
 
 After step 5, the long-lived bridge process is non-root. The whole root window is a few milliseconds at container start.
+
+---
+
+## Finding your UID and GID
+
+Run on the **host** (not inside the container). Three approaches, pick whichever is easiest:
+
+**Your own UID/GID** — the user you're currently logged in as:
+
+```bash
+id           # prints: uid=1000(yourname) gid=1000(yourname) groups=...
+id -u        # just the UID, e.g. 1000
+id -g        # just the GID, e.g. 1000
+```
+
+**The UID/GID that owns an existing directory** — most useful before starting the container, to make sure your `PUID`/`PGID` will line up with whatever path you're bind-mounting at `/data`:
+
+```bash
+stat -c '%u:%g' ~/.local/share/mautrix-imessage           # numeric:  1000:1000
+stat -c '%U:%G' ~/.local/share/mautrix-imessage           # by name:  david:david
+ls -ldn         ~/.local/share/mautrix-imessage           # numeric, with perms
+```
+
+If those don't match the `PUID:PGID` in your compose file, the container won't be able to read/write the state files — change `PUID`/`PGID` to match the directory, or `sudo chown -R <uid>:<gid> <path>` the directory once to match the compose values.
+
+**For another user** (e.g. you'll run Docker as a separate service account):
+
+```bash
+id beepuser
+```
+
+**Platform quick reference** (a starting point; `id` / `stat` are still authoritative):
+
+| Platform | Typical UID:GID |
+|---|---|
+| Standard Linux (first user) | `1000:1000` |
+| UNRAID (`nobody:users`) | `99:100` |
+| Synology DSM (`admin`) | `1024:100` (varies; verify with `id`) |
+| TrueNAS Scale (`apps`) | `568:568` |
 
 ---
 
