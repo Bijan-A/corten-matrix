@@ -192,15 +192,22 @@ When the script finishes you're already logged in and the bridge is up.
 
 The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform (`/mnt/user/appdata/mautrix-imessage` on UNRAID, `/volume1/docker/mautrix-imessage` on Synology, any ZFS dataset, etc.).
 
+Two one-liners to install — the image lives in GHCR, and a small `imessage` host CLI ships alongside it:
+
 ```bash
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
-# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false"
-# (self-hosted), and change the volumes: line to your preferred host path.
-docker compose up -d
-docker exec -it bridge imessage-setup
+# Install the host CLI (one line, always on PATH).
+curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage \
+    | sudo install /dev/stdin /usr/local/bin/imessage
+
+# Drop in a compose file, then start + run setup.
+curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml \
+    -o docker-compose.yml
+# Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
+imessage start
+imessage setup
 ```
 
-Updates are `docker compose pull && docker compose up -d`. Full walkthrough, including the migration path from an existing bare-Linux install, lives in [`docs/docker.md`](docs/docker.md). The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
+Updates are `imessage update`. Full walkthrough, the migration path from an existing bare-Linux install (`imessage migrate`), and the full subcommand list live in [`docs/docker.md`](docs/docker.md). The published image is at `ghcr.io/lrhodin/imessage` (built manually via the `docker` GitHub Actions workflow — not auto-published on every commit).
 
 ## Login
 

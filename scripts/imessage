@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# ============================================================================
+# imessage — host-side CLI for the mautrix-imessage-v2 Docker bridge.
+#
+# Install once (one line, always on PATH):
+#   curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage \
+#     | sudo install /dev/stdin /usr/local/bin/imessage
+#
+# To update later: re-run the same command.
+# To uninstall:    sudo rm /usr/local/bin/imessage
+#
+# All subcommands work from any directory. Compose-driven subcommands
+# (start / stop / restart / update / pull) need to know where your
+# docker-compose.yml lives — set IMESSAGE_COMPOSE_FILE, or run from the
+# directory containing it.
+# ============================================================================
+set -euo pipefail
+
+CONTAINER="${IMESSAGE_CONTAINER:-bridge}"
+COMPOSE_FILE="${IMESSAGE_COMPOSE_FILE:-}"
+
+# Marker block format matches the bare-Linux install scripts so migrating
+# in either direction never produces duplicates. Keep this string in sync
+# with scripts/install-beeper-linux.sh and scripts/install-linux.sh.
+MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
+MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
+
+usage() {
+    cat <<'EOF'
+imessage — host-side CLI for the mautrix-imessage-v2 Docker bridge.
+
+USAGE
+    imessage <command> [args...]
+
+DAILY
+    setup           Run the interactive setup wizard inside the container.
+                    Same as `docker exec -it bridge imessage-setup`.
+    login           Re-run only the iMessage login flow.
+    logs            Tail bridge logs (`docker logs -f bridge`).
+    status          Show whether the bridge container is running.
+    shell           Open a bash shell inside the container (debugging).
+
+LIFECYCLE
+    start           docker compose up -d
+    stop            docker compose stop bridge
+    restart         docker compose restart bridge
+    update          docker compose pull && docker compose up -d
+    pull            docker compose pull   (no restart)
+
+ONE-TIME
+    migrate         Migrate from a bare-Linux install — strip the old
+                    systemd-based shell aliases from your shell rc files,
+                    stop+disable+remove the systemd unit, leave your
+                    state at ~/.local/share/mautrix-imessage in place.
+                    Then run `imessage start` and `imessage setup`.
+    install-aliases Same shell shortcuts the bare-Linux installer ships
+                    (start/stop/restart/imessage-log), pointed at this
+                    CLI instead. Useful if you want `start-imessage` etc.
+                    Idempotent; re-run to refresh.
+    uninstall-aliases  Remove the alias block written by install-aliases.
+
+ENV
+    IMESSAGE_CONTAINER      Container name (default: bridge).
+    IMESSAGE_COMPOSE_FILE   Path to docker-compose.yml for lifecycle commands.
+                            Otherwise compose looks in the current dir.
+
+Examples:
+    imessage setup
+    imessage logs
+    IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml imessage update
+EOF
+}
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+# compose() — invoke docker compose with the user's compose file if set.
+compose() {
+    if [ -n "$COMPOSE_FILE" ]; then
+        docker compose -f "$COMPOSE_FILE" "$@"
+    else
+        docker compose "$@"
+    fi
+}
+
+# detect_rc_files() — print paths to host shell rc files that exist.
+# Same heuristic the bare-Linux installer uses (case "$SHELL"), but we
+# return all matching files because users may have both.
+detect_rc_files() {
+    local files=()
+    case "${SHELL:-}" in
+        */zsh)  [ -f "$HOME/.zshrc" ] && files+=("$HOME/.zshrc") ;;
+        */bash) [ -f "$HOME/.bashrc" ] && files+=("$HOME/.bashrc") ;;
+        *)
+            # Unknown shell — fall back to whichever rc files exist.
+            [ -f "$HOME/.bashrc" ] && files+=("$HOME/.bashrc")
+            [ -f "$HOME/.zshrc" ] && files+=("$HOME/.zshrc")
+            ;;
+    esac
+    printf '%s\n' "${files[@]}"
+}
+
+# strip_marker_block <rc-file>
+# Idempotent: returns 0 if anything was stripped, 1 otherwise.
+strip_marker_block() {
+    local rc="$1"
+    if [ -f "$rc" ] && grep -qF "$MARKER_START" "$rc"; then
+        awk -v s="$MARKER_START" -v e="$MARKER_END" '
+            $0 == s { skip = 1; next }
+            $0 == e { skip = 0; next }
+            !skip   { print }
+        ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+        return 0
+    fi
+    return 1
+}
+
+# install_marker_block <rc-file> <body-string>
+# Idempotent: strips any existing block before writing.
+install_marker_block() {
+    local rc="$1" body="$2"
+    strip_marker_block "$rc" || true
+    {
+        echo "$MARKER_START"
+        printf '%s\n' "$body"
+        echo "$MARKER_END"
+    } >> "$rc"
+}
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
+cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
+cmd_logs()    { exec docker logs -f "$CONTAINER"; }
+cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
+cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
+
+cmd_start()   { compose up -d; }
+cmd_stop()    { compose stop "$CONTAINER"; }
+cmd_restart() { compose restart "$CONTAINER"; }
+cmd_pull()    { compose pull; }
+cmd_update()  { compose pull && compose up -d; }
+
+cmd_migrate() {
+    echo "═══════════════════════════════════════════════"
+    echo "  mautrix-imessage → Docker migration (host)"
+    echo "═══════════════════════════════════════════════"
+    echo ""
+
+    # 1. Strip bare-Linux systemd-based shell aliases — they shell out to
+    #    `systemctl ... mautrix-imessage` and will no longer work.
+    local stripped=0
+    while IFS= read -r rc; do
+        [ -z "$rc" ] && continue
+        if strip_marker_block "$rc"; then
+            echo "✓ Removed managed-alias block from $rc"
+            stripped=1
+        fi
+    done < <(detect_rc_files)
+    [ "$stripped" -eq 0 ] && echo "✓ No managed-alias block found — nothing to strip from rc files."
+    echo ""
+
+    # 2. Stop + disable + remove the systemd unit.
+    local touched=0
+    if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
+        echo "Stopping + disabling systemd --user unit..."
+        systemctl --user stop mautrix-imessage 2>/dev/null || true
+        systemctl --user disable mautrix-imessage 2>/dev/null || true
+        rm -f "$HOME/.config/systemd/user/mautrix-imessage.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "✓ systemd --user unit removed."
+        touched=1
+    fi
+    if systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
+        echo "Stopping + disabling systemd system unit (sudo)..."
+        sudo systemctl stop mautrix-imessage 2>/dev/null || true
+        sudo systemctl disable mautrix-imessage 2>/dev/null || true
+        sudo rm -f /etc/systemd/system/mautrix-imessage.service
+        sudo systemctl daemon-reload 2>/dev/null || true
+        echo "✓ systemd system unit removed."
+        touched=1
+    fi
+    [ "$touched" -eq 0 ] && echo "✓ No systemd unit found — nothing to tear down."
+    echo ""
+
+    # 3. Sanity-check the state dir.
+    if [ -d "$HOME/.local/share/mautrix-imessage" ] && [ -f "$HOME/.local/share/mautrix-imessage/config.yaml" ]; then
+        echo "✓ State at ~/.local/share/mautrix-imessage looks intact."
+        echo "  The Docker container will resume against it as-is."
+    else
+        echo "⚠  State directory missing or empty. The bridge will run setup as a fresh install."
+    fi
+    echo ""
+
+    cat <<'EOF'
+Next:
+  1. Make sure your docker-compose.yml points at the existing state path
+     (~/.local/share/mautrix-imessage:/data by default in the example).
+  2. imessage start
+  3. The bridge should resume with no re-login. If you flip toggles or
+     re-login later: imessage setup.
+EOF
+}
+
+cmd_install_aliases() {
+    local body
+    body=$(cat <<'EOF'
+alias imessage-setup='imessage setup'
+alias imessage-logs='imessage logs'
+alias start-imessage='imessage start'
+alias stop-imessage='imessage stop'
+alias restart-imessage='imessage restart'
+EOF
+)
+    local rcs touched=0
+    rcs=$(detect_rc_files)
+    if [ -z "$rcs" ]; then
+        echo "error: no recognized shell rc file found." >&2
+        echo "  Tried ~/.bashrc and ~/.zshrc based on \$SHELL=$SHELL." >&2
+        echo "  Add your shell rc manually if it's something else." >&2
+        exit 1
+    fi
+    while IFS= read -r rc; do
+        [ -z "$rc" ] && continue
+        install_marker_block "$rc" "$body"
+        echo "✓ Installed aliases in $rc"
+        touched=1
+    done <<< "$rcs"
+    [ "$touched" -eq 1 ] && echo "Open a new terminal or 'source' your rc file to pick them up."
+}
+
+cmd_uninstall_aliases() {
+    local touched=0
+    while IFS= read -r rc; do
+        [ -z "$rc" ] && continue
+        if strip_marker_block "$rc"; then
+            echo "✓ Removed aliases from $rc"
+            touched=1
+        fi
+    done < <(detect_rc_files)
+    [ "$touched" -eq 0 ] && echo "✓ No managed-alias block found — nothing to remove."
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+cmd="${1:-}"
+[ -n "$cmd" ] && shift || true
+
+case "$cmd" in
+    setup)              cmd_setup "$@" ;;
+    login)              cmd_login "$@" ;;
+    logs)               cmd_logs "$@" ;;
+    shell)              cmd_shell "$@" ;;
+    status)             cmd_status "$@" ;;
+    start)              cmd_start "$@" ;;
+    stop)               cmd_stop "$@" ;;
+    restart)            cmd_restart "$@" ;;
+    pull)               cmd_pull "$@" ;;
+    update)             cmd_update "$@" ;;
+    migrate)            cmd_migrate "$@" ;;
+    install-aliases)    cmd_install_aliases "$@" ;;
+    uninstall-aliases)  cmd_uninstall_aliases "$@" ;;
+    ""|help|-h|--help)  usage ;;
+    *)                  echo "error: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+esac

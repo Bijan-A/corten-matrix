@@ -3,12 +3,14 @@
 #
 # Copy this file to `docker-compose.yml` and edit:
 #   - Set BEEPER to "true" (Beeper) or "false" (self-hosted homeserver).
-#   - If you're migrating from a bare-Linux install: set MIGRATE to "true"
-#     and uncomment the two rc-file mounts under volumes for the first run.
-#     After the migration completes, comment them back out and set
-#     MIGRATE back to "false".
-#   - If your host UID isn't 1000:1000, update the `user:` line to match
-#     (run `id -u` and `id -g` on the host to check).
+#   - Adjust the bind mount under volumes: to whatever HOST path suits
+#     you (see "Host paths" in docs/docker.md).
+#   - Set PUID/PGID if your host appdata dir isn't owned by UID 1000
+#     (typical first user). UNRAID is often 99:100.
+#
+# Then start the bridge with the `imessage` host CLI:
+#   imessage start
+#   imessage setup
 # ============================================================================
 
 services:
@@ -27,51 +29,25 @@ services:
       #   /mnt/user/appdata/mautrix-imessage   (UNRAID)
       #   /volume1/docker/mautrix-imessage     (Synology)
       # If the host path doesn't exist, Docker creates it on first
-      # `docker compose up` and the entrypoint chowns it for you.
+      # `imessage start` and the entrypoint chowns it for you.
       - ~/.local/share/mautrix-imessage:/data
-      # Shell rc files — uncomment whichever you actually use on the host
-      # (Docker would otherwise create the file as a directory if the
-      # source doesn't exist). Used by:
-      #   - EMIT_ALIASES below: container installs/removes the
-      #     imessage-setup / imessage-logs aliases automatically.
-      #   - MIGRATE below: container strips the bare-Linux systemd-based
-      #     aliases inherited from a previous install.
-      # Only the marker-block between
-      #   `# >>> mautrix-imessage shortcuts (managed) >>>` and
-      #   `# <<< mautrix-imessage shortcuts (managed) <<<`
-      # is touched. Nothing else in the file is modified.
-      # - ~/.bashrc:/host/.bashrc
-      # - ~/.zshrc:/host/.zshrc
     environment:
       # Required. Picks which install script runs when you invoke
-      # `docker exec -it bridge imessage-setup`. Same scripts the
-      # bare-Linux install uses; `BEEPER` is just the path selector.
+      # `imessage setup`. Same scripts the bare-Linux install uses;
+      # `BEEPER` is just the path selector.
       BEEPER: "true"
-
-      # One-shot migration flag. Set to "true" only when moving from a
-      # bare-Linux install — the container will strip old systemd-based
-      # shell aliases (if the rc files are bind-mounted above) and tell
-      # you the host-side systemd commands to run. After the bridge
-      # starts cleanly once, set this back to "false".
-      MIGRATE: "false"
-
-      # Optional: when "true", `docker exec bridge /entrypoint.sh aliases`
-      # emits a shell alias block (imessage-setup, imessage-logs) you
-      # can append to ~/.bashrc / ~/.zshrc on the host. Default is off
-      # because the aliases are a quality-of-life thing, not required.
-      EMIT_ALIASES: "true"
 
       # UID / GID the bridge process runs as. Defaults are 1000:1000
       # which matches the typical first Linux user. Override when the
-      # host appdata directory is owned by a different UID — common
-      # on UNRAID (often 99:100), Synology, or shared-server setups.
-      # The entrypoint chowns /data to PUID:PGID on startup as root,
-      # then drops to that UID for the bridge process itself.
+      # host appdata directory is owned by a different UID — common on
+      # UNRAID (often 99:100), Synology, or shared-server setups. The
+      # entrypoint chowns /data to PUID:PGID on startup as root, then
+      # drops to that UID for the bridge process itself.
       # PUID: "1000"
       # PGID: "1000"
 
       # Optional toggles — same env vars the bare-Linux install scripts
-      # read. Either is fine; the corresponding install-script prompt is
-      # skipped when the env var is set. Defaults match the config keys.
+      # read. The corresponding install-script prompt is skipped when
+      # the env var is set. Defaults match the config keys.
       # DISABLE_FACETIME: "false"
       # STATUSKIT_NOTIFICATIONS: "true"
