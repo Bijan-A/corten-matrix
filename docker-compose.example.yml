@@ -28,7 +28,10 @@ services:
         source: ${HOME}/.config/bbctl
         target: /home/bridge/.config/bbctl
 
-    # Must match ownership of the bind-mount sources. Set PUID/PGID in
-    # your shell or .env file for your host, e.g. UNRAID nobody:users is
-    # PUID=99 and PGID=100. Defaults match the typical first Linux user.
-    user: "${PUID:-1000}:${PGID:-1000}"
+    # Must match ownership of the bind-mount sources. Edit this directly
+    # for your host:
+    #   Standard Linux: "1000:1000"
+    #   UNRAID:         "99:100"    # nobody:users
+    #   TrueNAS Scale:  "568:568"
+    #   root:           "0:0"       # discouraged unless required
+    user: "1000:1000"
