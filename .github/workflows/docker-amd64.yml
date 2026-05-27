@@ -6,9 +6,9 @@
 # builds finish in ~5-7 min instead of ~25-30 min. Use this when you just
 # want a quick test tag against a branch fix, not a release.
 #
-# The default tag is `test` (not `latest`) so accidental runs don't bump
-# the latest pointer that production users follow. Override or clear the
-# input in the Run workflow dialog as needed.
+# No default tag — required input, so every run forces you to type the
+# tag explicitly. Prevents accidental bumps of :latest or stale :test
+# overwrites of a previous test image you still care about.
 # ============================================================================
 
 name: docker-amd64
@@ -17,9 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Extra tag to apply to the published image (in addition to :sha-<short>). Default :test to avoid bumping :latest. Leave empty for none."
-        required: false
-        default: "test"
+        description: "Extra tag to apply to the published image (in addition to :sha-<short>). Required — type a tag like `test`, `mybranch`, etc. Do NOT type `latest` unless you mean to bump production."
+        required: true
 
 permissions:
   contents: read
