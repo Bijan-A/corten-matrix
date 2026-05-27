@@ -128,6 +128,60 @@ for v in svc.get("volumes", []) or []:
 '
 }
 
+run_root_cmd() {
+    if [ "$(id -u)" = "0" ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        echo "error: need root privileges to run: $*" >&2
+        echo "  Re-run as root or install sudo." >&2
+        exit 1
+    fi
+}
+
+check_bind_mount_perms() {
+    local parsed="$1"
+    local target_user="$2"
+    local mode="${3:-auto}"
+
+    while IFS=$'\t' read -r kind src dst; do
+        [ "$kind" = "BIND" ] || continue
+        [ -n "$src" ] || continue
+
+        if [ ! -d "$src" ]; then
+            if [ "$mode" = "dry-run" ]; then
+                echo "    create $src"
+            else
+                echo "[startup] creating $src"
+                run_root_cmd mkdir -p "$src"
+            fi
+        fi
+
+        if [ -d "$src" ]; then
+            local current
+            current=$(ls -ldn "$src" 2>/dev/null | awk '{print $3":"$4}')
+            if [ "$current" != "$target_user" ]; then
+                if [ "$mode" = "dry-run" ]; then
+                    if [ "$(id -u)" = "0" ]; then
+                        echo "    chown -R $target_user $src"
+                    else
+                        echo "    sudo chown -R $target_user $src"
+                    fi
+                else
+                    echo "[startup] fixing perms: $src ($current → $target_user)"
+                    run_root_cmd chown -R "$target_user" "$src"
+                fi
+            elif [ "$mode" = "verbose" ]; then
+                echo "  ✓ $src"
+            fi
+        elif [ "$mode" != "dry-run" ]; then
+            echo "error: failed to create bind-mount source: $src" >&2
+            exit 1
+        fi
+    done <<<"$parsed"
+}
+
 # detect_rc_files() — print paths to host shell rc files that exist.
 # Same heuristic the bare-Linux installer uses (case "$SHELL"), but we
 # return all matching files because users may have both.
@@ -256,14 +310,7 @@ EOF
 
     echo ""
     echo "About to chown each bind-mount source to $user_dir (recursively):"
-    while IFS=$'\t' read -r src dst; do
-        [ -z "$src" ] && continue
-        if [ "$(id -u)" = "0" ]; then
-            echo "    chown -R $user_dir $src"
-        else
-            echo "    sudo chown -R $user_dir $src"
-        fi
-    done <<<"$binds"
+    check_bind_mount_perms "$parsed" "$user_dir" dry-run
 
     local yn
     read -r -p "Proceed? [y/N]: " yn
@@ -272,23 +319,7 @@ EOF
         *) echo "Aborted."; exit 0 ;;
     esac
 
-    while IFS=$'\t' read -r src dst; do
-        [ -z "$src" ] && continue
-        if [ ! -d "$src" ]; then
-            echo "  → creating $src"
-            if [ "$(id -u)" = "0" ]; then
-                mkdir -p "$src"
-            else
-                sudo mkdir -p "$src"
-            fi
-        fi
-        if [ "$(id -u)" = "0" ]; then
-            chown -R "$user_dir" "$src"
-        else
-            sudo chown -R "$user_dir" "$src"
-        fi
-        echo "  ✓ $src"
-    done <<<"$binds"
+    check_bind_mount_perms "$parsed" "$user_dir" auto
 
     echo ""
     echo "✓ Done. You can now run 'imessage start' (or 'imessage restart' if already up)."
@@ -318,23 +349,7 @@ EOF
         exit 1
     fi
 
-    while IFS=$'\t' read -r kind mount dst; do
-        [ "$kind" = "BIND" ] || continue
-        [ -z "$mount" ] && continue
-        if [ ! -d "$mount" ]; then
-            echo "[startup] creating $mount"
-            mkdir -p "$mount" 2>/dev/null || sudo mkdir -p "$mount" 2>/dev/null || true
-        fi
-
-        if [ -d "$mount" ]; then
-            local current
-            current=$(ls -ldn "$mount" 2>/dev/null | awk '{print $3":"$4}')
-            if [ "$current" != "$target_user" ]; then
-                echo "[startup] fixing perms: $mount ($current → $target_user)"
-                chown -R "$target_user" "$mount" 2>/dev/null || sudo chown -R "$target_user" "$mount" 2>/dev/null || true
-            fi
-        fi
-    done <<<"$parsed"
+    check_bind_mount_perms "$parsed" "$target_user" auto
 
     echo "[startup] starting container..."
     compose up -d
