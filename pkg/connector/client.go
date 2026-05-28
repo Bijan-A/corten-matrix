@@ -3757,6 +3757,15 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 			},
 			TargetMessage: makeMessageID(targetUUID),
 		})
+
+		// Scrub plaintext from cloud_message inline. bridgev2 will delete its
+		// own message row in response to the MessageRemove above; after that
+		// the periodic scrubber's EXISTS check against bridgev2 message is
+		// permanently FALSE for this guid, so the row's text/subject/sender
+		// would otherwise persist until next bridge restart.
+		if c.cloudStore != nil {
+			c.cloudStore.softDeleteMessageByGUID(context.Background(), targetUUID)
+		}
 	}
 }
 
@@ -5345,9 +5354,9 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 			canonical = lp.MatchedURL
 		}
 		log.Debug().
-			Str("matched_url", lp.MatchedURL).
-			Str("canonical_url", canonical).
-			Str("title", lp.Title).
+			Str("matched_url_host", logSafeURL(lp.MatchedURL)).
+			Str("canonical_url_host", logSafeURL(canonical)).
+			Bool("has_title", lp.Title != "").
 			Msg("Encoding Beeper link preview for iMessage")
 		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
@@ -5355,14 +5364,14 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
 	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
-		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
+		log.Debug().Str("detected_url_host", logSafeURL(detectedURL)).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
 		// Try homeserver preview first
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
 				title = lp.Title
 				desc = lp.Description
-				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
+				log.Debug().Bool("has_title", title != "").Bool("has_description", desc != "").Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
 			}
@@ -5373,7 +5382,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 			title = ogData["title"]
 			desc = ogData["description"]
 			if title != "" || desc != "" {
-				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
+				log.Debug().Bool("has_title", title != "").Bool("has_description", desc != "").Msg("Got URL preview from og: scraping for outbound")
 			}
 		}
 		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
@@ -5463,7 +5472,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 	log := c.UserLogin.Log.With().
 		Str("component", "url_preview").
 		Stringer("event_id", eventID).
-		Str("detected_url", detectedURL).
+		Str("detected_url_host", logSafeURL(detectedURL)).
 		Logger()
 	ctx := log.WithContext(context.Background())
 
@@ -5487,7 +5496,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to send outbound URL preview edit")
 	} else {
-		log.Debug().Str("title", preview.Title).Msg("Sent outbound URL preview edit")
+		log.Debug().Bool("has_title", preview.Title != "").Msg("Sent outbound URL preview edit")
 	}
 }
 
@@ -9851,10 +9860,10 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 		}
 
 		log.Debug().
-			Str("original_url", originalURL).
-			Str("canonical_url", canonicalURL).
-			Str("title", title).
-			Str("description", description).
+			Str("original_url_host", logSafeURL(originalURL)).
+			Str("canonical_url_host", logSafeURL(canonicalURL)).
+			Bool("has_title", title != "").
+			Bool("has_description", description != "").
 			Str("image_mime", imageMime).
 			Msg("Parsed rich link sideband data from iMessage")
 
@@ -9895,13 +9904,13 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 			}
 		}
 
-		log.Debug().Str("matched_url", matchedURL).Str("title", title).Msg("Inbound rich link preview ready")
+		log.Debug().Str("matched_url_host", logSafeURL(matchedURL)).Bool("has_title", title != "").Msg("Inbound rich link preview ready")
 		return []*event.BeeperLinkPreview{preview}
 	}
 
 	// No rich link from iMessage — auto-detect URL and fetch og: metadata + image
 	if detectedURL := urlRegex.FindString(bodyText); detectedURL != "" {
-		log.Debug().Str("detected_url", detectedURL).Msg("No iMessage rich link, fetching URL preview")
+		log.Debug().Str("detected_url_host", logSafeURL(detectedURL)).Msg("No iMessage rich link, fetching URL preview")
 		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL)}
 	}
 

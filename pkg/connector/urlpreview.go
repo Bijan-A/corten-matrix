@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -17,6 +18,29 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
+
+// sanitizeURLError returns err with every occurrence of the given URLs in
+// the error message replaced by their scheme+host form. Go's net/http wraps
+// transport failures in *url.Error whose Error() embeds the full URL
+// (e.g. `Get "https://x.com/secret/path": dial tcp …`), so .Err(err) re-leaks
+// the path/query that logSafeURL was meant to strip from the same log line.
+func sanitizeURLError(err error, urls ...string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	original := msg
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, u, logSafeURL(u))
+	}
+	if msg == original {
+		return err
+	}
+	return errors.New(msg)
+}
 
 // logSafeURL returns a scheme+host representation of a URL for log fields, so
 // the path and query (which carry user-content references like article slugs
@@ -71,7 +95,7 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 	if mc, ok := bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 		lp, err := mc.GetURLPreview(ctx, fetchURL)
 		if err != nil {
-			log.Debug().Err(err).Str("url_host", logSafeURL(fetchURL)).Msg("Homeserver URL preview failed, falling back to meta scraping")
+			log.Debug().Err(sanitizeURLError(err, fetchURL, targetURL)).Str("url_host", logSafeURL(fetchURL)).Msg("Homeserver URL preview failed, falling back to meta scraping")
 		}
 		if err == nil && lp != nil {
 			preview.LinkPreview = *lp
@@ -128,7 +152,7 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 				log.Debug().Err(err).Msg("Failed to upload URL preview image")
 			}
 		} else if err != nil {
-			log.Debug().Err(err).Str("image_url_host", logSafeURL(imageURL)).Msg("Failed to download URL preview image")
+			log.Debug().Err(sanitizeURLError(err, imageURL)).Str("image_url_host", logSafeURL(imageURL)).Msg("Failed to download URL preview image")
 		}
 	}
 
@@ -211,7 +235,7 @@ func fetchPageMetadataWithUA(ctx context.Context, targetURL string, ua string) m
 
 	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
-		log.Debug().Err(err).Str("url_host", logSafeURL(targetURL)).Str("ua", ua).Msg("HTTP request failed for meta scraping")
+		log.Debug().Err(sanitizeURLError(err, targetURL)).Str("url_host", logSafeURL(targetURL)).Str("ua", ua).Msg("HTTP request failed for meta scraping")
 		return result
 	}
 	defer resp.Body.Close()
