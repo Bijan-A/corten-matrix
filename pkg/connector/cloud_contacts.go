@@ -119,7 +119,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		log.Warn().Err(err).Msg("CardDAV: failed to discover principal URL")
 		return err
 	}
-	log.Debug().Str("principal", principalURL).Msg("CardDAV: discovered principal URL")
+	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("CardDAV: discovered principal URL")
 
 	// Step 2: Get the address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
@@ -127,7 +127,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		log.Warn().Err(err).Msg("CardDAV: failed to discover address book home")
 		return err
 	}
-	log.Debug().Str("home_set", homeSetURL).Msg("CardDAV: discovered address book home")
+	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("CardDAV: discovered address book home")
 
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
@@ -142,7 +142,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("CardDAV: failed to fetch vCards")
+			log.Warn().Err(fetchErr).Str("address_book_host", logSafeURL(abURL)).Msg("CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -492,7 +492,7 @@ func (c *cloudContactsClient) parseAddressBookList(data []byte, homeSetURL strin
 	// try the default Apple path
 	if len(addressBooks) == 0 {
 		defaultURL := c.baseURL + "/" + c.dsid + "/carddavhome/card/"
-		log.Debug().Str("url", defaultURL).Msg("CardDAV: no address books found via PROPFIND, trying default path")
+		log.Debug().Str("url_host", logSafeURL(defaultURL)).Msg("CardDAV: no address books found via PROPFIND, trying default path")
 		addressBooks = append(addressBooks, defaultURL)
 	}
 

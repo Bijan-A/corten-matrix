@@ -98,14 +98,14 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("discover principal: %w", err)
 	}
-	log.Debug().Str("principal", principalURL).Msg("External CardDAV: discovered principal")
+	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("External CardDAV: discovered principal")
 
 	// Step 2: Get address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
 		return fmt.Errorf("discover address book home: %w", err)
 	}
-	log.Debug().Str("home_set", homeSetURL).Msg("External CardDAV: discovered address book home")
+	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("External CardDAV: discovered address book home")
 
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
@@ -119,7 +119,7 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("External CardDAV: failed to fetch vCards")
+			log.Warn().Err(fetchErr).Str("address_book_host", logSafeURL(abURL)).Msg("External CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -328,7 +328,7 @@ func (c *externalCardDAVClient) fetchAllVCards(log zerolog.Logger, addressBookUR
 
 	log.Debug().
 		Int("response_bytes", len(data)).
-		Str("address_book", addressBookURL).
+		Str("address_book_host", logSafeURL(addressBookURL)).
 		Msg("External CardDAV: REPORT response received")
 
 	return parseVCardMultistatusStandalone(data, log), nil

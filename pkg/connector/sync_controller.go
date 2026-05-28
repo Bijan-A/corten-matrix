@@ -1518,7 +1518,7 @@ const (
 // lifetime of the IMClient. Bootstrap-time scrubbing is handled by
 // runPostSyncHousekeeping; this loop covers steady-state ongoing operation
 // (the bridge runs for days at a time).
-func (c *IMClient) runBodyScrubLoop(log zerolog.Logger) {
+func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}) {
 	if c.cloudStore == nil {
 		return
 	}
@@ -1526,7 +1526,7 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.stopChan:
+		case <-stopChan:
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -2600,8 +2600,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		// for cloud_chat, but catches cloud_message rows too). UUIDs are preserved
 		// so hasMessageUUID can still detect stale APNs echoes.
 		for recordName, portalID := range portalMap {
+			// Fail-closed: if scrub fails we skip the in-memory tombstone +
+			// ChatDelete emit so plaintext isn't stranded after bridgev2 wipes
+			// its message rows. The next housekeeping pass will retry.
 			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete messages for tombstoned chat")
+				log.Error().Err(err).Str("portal_id", portalID).Str("record_name", recordName).
+					Msg("Skipping CloudKit tombstone ChatDelete because cloud_message scrub failed — will retry next sync")
+				continue
 			}
 
 			// Mark as deleted in memory so createPortalsFromCloudSync skips

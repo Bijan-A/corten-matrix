@@ -78,6 +78,19 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
+	// Privacy: secure_delete = ON forces SQLite to zero out freed pages
+	// during DELETE/UPDATE rather than leave the prior content readable in
+	// unallocated space. Persistent in the DB header — set once, applies
+	// to every subsequent write. Without this, NULLing text/subject/sender
+	// in scrubBridgedBodies leaves the original strings recoverable by file
+	// inspection until VACUUM (which we don't run automatically because it
+	// rewrites the entire DB and would block writes for the duration on a
+	// large backlog). Self-hosters who want immediate page reclamation can
+	// run `sqlite3 bridge.db "VACUUM;"` manually after first-boot scrub.
+	// Non-fatal: older SQLite versions or non-SQLite backends (if ever added)
+	// may not support it; the schema setup must still proceed.
+	_, _ = s.db.Exec(ctx, `PRAGMA secure_delete = ON`)
+
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
 			login_id TEXT NOT NULL,
@@ -1773,18 +1786,25 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 // softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
 // be re-bridged on backfill, while preserving the UUID for echo detection.
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
+	// UPPER() on both sides: APNs delivers UUIDs uppercase while CloudKit
+	// can store them lower/mixed; a case-sensitive = miss would silently
+	// no-op and let the fail-closed delete path proceed thinking it scrubbed.
+	// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
 	_, err := s.db.Exec(ctx,
 		`UPDATE cloud_message
 		 SET deleted=TRUE,
 		     text=NULL, subject=NULL, sender='',
 		     tapback_emoji=NULL,
 		     body_scrubbed=TRUE
-		 WHERE login_id=$1 AND guid=$2`,
+		 WHERE login_id=$1 AND UPPER(guid)=UPPER($2)`,
 		s.loginID, guid,
 	)
 	if err != nil {
 		return fmt.Errorf("soft-delete message %s: %w", guid, err)
 	}
+	// Note: zero rows affected is NOT an error — the caller's contract is
+	// "ensure plaintext for guid is scrubbed". If the row never existed
+	// (filtered chat, never-bridged guid), the postcondition holds.
 	return nil
 }
 
@@ -1930,7 +1950,12 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 			return fmt.Errorf("failed to soft-delete cloud_chat records by group_id %s: %w", uuid, err)
 		}
 		if _, err := s.db.Exec(ctx,
-			`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3
+			`UPDATE cloud_message
+			 SET deleted=TRUE,
+			     text=NULL, subject=NULL, sender='',
+			     tapback_emoji=NULL,
+			     body_scrubbed=TRUE,
+			     updated_ts=$3
 			 WHERE login_id=$1 AND deleted=FALSE
 			   AND portal_id IN (SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2)))`,
 			s.loginID, uuid, nowMS,
@@ -3266,7 +3291,10 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND EXISTS (
 		        SELECT 1 FROM message
 		        WHERE bridge_id=$3
-		          AND id=cloud_message.guid
+		          AND (
+		            id=cloud_message.guid
+		            OR id LIKE cloud_message.guid || '\_%' ESCAPE '\'
+		          )
 		          AND (room_receiver=$1 OR room_receiver='')
 		      )` + exclusionSQL + `
 		    LIMIT ` + limitPlaceholder + `

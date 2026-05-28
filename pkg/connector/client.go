@@ -263,7 +263,6 @@ type IMClient struct {
 	// attachment_retrier.go.
 	pendingAttachments *pendingAttachmentStore
 	retrierOnce        sync.Once
-	bodyScrubOnce      sync.Once
 
 	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
 	// deduplication fix in Go. Populated aggressively during CloudKit
@@ -1336,12 +1335,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
 		c.startCloudSyncController(log)
-		// sync.Once mirrors the retrierOnce pattern above — Connect can be
-		// re-invoked (reconnect, relogin, session restore) and two scrubber
-		// goroutines on the same table would chunk-interleave wastefully.
-		c.bodyScrubOnce.Do(func() {
-			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger())
-		})
+		// Pass c.stopChan by value so the goroutine captures the current
+		// channel at launch — Disconnect closes that channel and the loop
+		// exits deterministically. The next Connect launches a fresh
+		// goroutine against the new stopChan; an idempotent scrubber UPDATE
+		// means overlapping ticks during transient reconnect are harmless.
+		// sync.Once is wrong here because it never re-fires post-Disconnect.
+		go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -3001,6 +3001,22 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	}
 
+	// Scrub-before-emit, fail-closed: same pattern as handleMessageDelete.
+	// QueueRemoteEvent will (eventually) cause bridgev2 to delete its message
+	// row; once gone, the periodic scrubber's EXISTS predicate is permanently
+	// FALSE for this guid. Skip the emit on scrub error so the Matrix event
+	// stays visible rather than leaking plaintext.
+	if c.cloudStore != nil {
+		scrubCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetGUID)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Str("target_uuid", targetGUID).
+				Msg("Skipping unsend MessageRemove emit because cloud_message scrub failed — preserving privacy at the cost of a stale Matrix event")
+			return
+		}
+	}
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessageRemove,
@@ -3817,12 +3833,21 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	c.trackDeletedChat(portalID)
 
 	// Soft-delete local DB records (preserves UUIDs for echo detection).
+	// Fail-closed: if soft-delete (which scrubs plaintext) fails, skip the
+	// ChatDelete emit. Once bridgev2 wipes its message rows via
+	// Message.DeleteInChunks, the scrubber's EXISTS predicate is forever
+	// FALSE for those guids — a scrub failure here would leak the entire
+	// chat's plaintext until next restart.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.clearRestoreOverride(context.Background(), portalID); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := c.cloudStore.clearRestoreOverride(ctx, portalID); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear restore override for Apple-deleted chat")
 		}
-		if err := c.cloudStore.deleteLocalChatByPortalID(context.Background(), portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local records for Apple-deleted chat")
+		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+			log.Error().Err(err).Str("portal_id", portalID).
+				Msg("Skipping ChatDelete emit because cloud_message scrub failed — preserving privacy at the cost of a stale Beeper portal")
+			return
 		}
 	}
 
@@ -6044,11 +6069,15 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		// Soft-delete local records for both portal_id and group_id.
+		// Fail-closed: same pattern as handleChatDelete — scrub failure must
+		// not be followed by Matrix-side deletion that would forever strand
+		// the cloud_message plaintext via the EXISTS predicate going FALSE.
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local cloud records")
-		} else {
-			log.Info().Str("portal_id", portalID).Msg("Soft-deleted local cloud_chat and cloud_message records")
+			log.Error().Err(err).Str("portal_id", portalID).
+				Msg("Aborting Matrix-initiated chat delete because cloud_message scrub failed — preserving privacy")
+			return fmt.Errorf("failed to scrub cloud_message for chat delete: %w", err)
 		}
+		log.Info().Str("portal_id", portalID).Msg("Soft-deleted local cloud_chat and cloud_message records")
 		if groupID != "" {
 			if err := c.cloudStore.deleteLocalChatByGroupID(ctx, groupID); err != nil {
 				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to soft-delete local cloud records by group_id")
