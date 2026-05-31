@@ -3442,14 +3442,29 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         return;
     }
 
-    let targets = ft
+    // Exclude the bridge's OWN active endpoint from the suppress targets.
+    // For a bridge user with no separate Apple devices, the only target IDS
+    // returns for the own handle is this bridge's own FaceTime registration.
+    // Sending it a session-scoped RespondedElsewhere (disconnected_reason=4)
+    // makes the callee see the session originator "respond elsewhere" and
+    // cancels their ring (outbound) or tears down the call the user just
+    // joined (inbound) — breaking FaceTime in both directions while iMessage
+    // is unaffected. Filtering out our own push token restores the intended
+    // no-op when there are no genuine sibling Apple devices to suppress, while
+    // still suppressing real ones. Mirrors upstream's own-token filter
+    // (identity_manager.rs:925).
+    let my_token = ft.conn.get_token().await;
+    let targets: Vec<_> = ft
         .identity
         .cache
         .lock()
         .await
-        .get_participants_targets(topic, &handle, &relevant_people);
+        .get_participants_targets(topic, &handle, &relevant_people)
+        .into_iter()
+        .filter(|t| t.delivery_data.push_token != my_token)
+        .collect();
     if targets.is_empty() {
-        // No other own-devices registered — nothing to suppress.
+        // No genuine sibling own-devices registered — nothing to suppress.
         return;
     }
 
