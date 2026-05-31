@@ -6674,21 +6674,29 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 
 		memberMap := make(map[networkid.UserID]bridgev2.ChatMember)
 		for _, member := range memberList {
-			userID := makeUserID(member)
-			if c.isMyHandle(member) {
-				memberMap[userID] = bridgev2.ChatMember{
-					EventSender: bridgev2.EventSender{
-						IsFromMe:    true,
-						SenderLogin: c.UserLogin.ID,
-						Sender:      userID,
-					},
-					Membership: event.MembershipJoin,
-				}
-			} else {
-				memberMap[userID] = bridgev2.ChatMember{
-					EventSender: bridgev2.EventSender{Sender: userID},
-					Membership:  event.MembershipJoin,
-				}
+			// Normalize every roster entry to the SAME canonical form a message
+			// sender is keyed in (makeEventSender → makeUserID(normalize(...))).
+			// participants_json can hold raw Apple handles (CloudKit ingest
+			// stores them verbatim: mixed-case email, bare "+1…" without a tel:
+			// prefix), while the actual ghost for that person is keyed by the
+			// normalized handle. Without normalizing here, makeUserID(rawForm)
+			// produces a DIFFERENT key than the real ghost, so the member list
+			// carries a duplicate phantom that joins the room ("X joined the
+			// conversation") even though X is already present. Normalizing makes
+			// the member key match the ghost for both the user and the others.
+			normalized := normalizeIdentifierForPortalID(member)
+			if normalized == "" {
+				continue
+			}
+			// Self is re-added explicitly (canonical IsFromMe entry) after this
+			// loop, so drop any self handle/alias here to avoid a foreign ghost.
+			if c.isMyHandle(normalized) {
+				continue
+			}
+			userID := makeUserID(normalized)
+			memberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{Sender: userID},
+				Membership:  event.MembershipJoin,
 			}
 		}
 
@@ -10187,11 +10195,21 @@ func (c *IMClient) persistGroupParticipantsIfChanged(portalID string, participan
 	}
 	// A real group roster always has at least two members. Guard against a
 	// fluke partial/control-message list shrinking the stored roster.
+	//
+	// Strip our own handle(s): participants_json is the OTHER-party roster
+	// (resolveGroupMembers reads it back; GetChatInfo re-adds self explicitly).
+	// msg.Participants includes whichever of our handles the message was
+	// addressed to — often a secondary alias (e.g. the mailto: address) that
+	// isn't c.handle — so persisting it unfiltered let that alias come back as
+	// a foreign ghost member. The legacy insert-once path
+	// (buildCanonicalParticipantList) stripped self for exactly this reason.
 	normalized := make([]string, 0, len(participants))
 	for _, p := range participants {
-		if n := normalizeIdentifierForPortalID(p); n != "" {
-			normalized = append(normalized, n)
+		n := normalizeIdentifierForPortalID(p)
+		if n == "" || c.isMyHandle(n) {
+			continue
 		}
+		normalized = append(normalized, n)
 	}
 	if len(normalized) < 2 {
 		return
