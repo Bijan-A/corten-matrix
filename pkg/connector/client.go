@@ -179,6 +179,12 @@ type IMClient struct {
 	// same key so the dedup survives a bridge restart.
 	statusKitLastNotice sync.Map // map[string]id.EventID
 
+	// statusKitNoticeLocks serializes the send→redact→store sequence per peer
+	// (keyed by portal ID) so rapid consecutive toggles can't race — without it
+	// two goroutines can both read an empty "previous notice" before either
+	// stores its event ID, leaving two notices in the room. Values *sync.Mutex.
+	statusKitNoticeLocks sync.Map // map[networkid.PortalID]*sync.Mutex
+
 	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
 	// driven by StatusKit alias resolution. Per-handle 6h negative cache
 	// (statusKitIDSAttemptKeyPrefix) prevents re-querying the same handle;
@@ -2086,6 +2092,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		noticeKVKey := func(roomMXID id.RoomID) database.Key {
 			return database.Key("statuskit.lastnotice." + noticeKey(roomMXID))
 		}
+		// Redact via the canonical /redact endpoint (the bot's raw client).
+		// Bot.SendMessage(EventRedaction) routes through Hungry's send-as-event
+		// path (MSC4169), which did NOT reliably clear our batch-inserted
+		// notices; /redact works by event ID regardless of how the target was
+		// inserted.
 		redactPrevNotice := func(roomMXID id.RoomID) {
 			var prevID id.EventID
 			if v, ok := c.statusKitLastNotice.Load(noticeKey(roomMXID)); ok {
@@ -2096,13 +2107,30 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			if prevID == "" {
 				return
 			}
-			if _, err := c.Main.Bridge.Bot.SendMessage(ctx, roomMXID, event.EventRedaction, &event.Content{
-				Parsed: &event.RedactionEventContent{Redacts: prevID},
-			}, nil); err != nil {
-				log.Warn().Err(err).Str("portal_mxid", string(roomMXID)).Str("redacts", string(prevID)).
+			var rErr error
+			if bi, ok := c.Main.Bridge.Bot.(*matrixfmt.ASIntent); ok && bi.Matrix != nil {
+				_, rErr = bi.Matrix.RedactEvent(ctx, roomMXID, prevID)
+			} else {
+				_, rErr = c.Main.Bridge.Bot.SendMessage(ctx, roomMXID, event.EventRedaction, &event.Content{
+					Parsed: &event.RedactionEventContent{Redacts: prevID},
+				}, nil)
+			}
+			if rErr != nil {
+				log.Warn().Err(rErr).Str("portal_mxid", string(roomMXID)).Str("redacts", string(prevID)).
 					Msg("StatusKit: failed to redact previous presence notice")
+			} else {
+				log.Info().Str("portal_mxid", string(roomMXID)).Str("redacted", string(prevID)).
+					Msg("StatusKit: redacted previous presence notice")
 			}
 		}
+
+		// Serialize the send→redact→store sequence per peer so rapid toggles
+		// don't race (two goroutines both seeing no "previous" notice and each
+		// leaving its own line). Held only across this peer's sends.
+		lockVal, _ := c.statusKitNoticeLocks.LoadOrStore(portal.ID, &sync.Mutex{})
+		noticeLock := lockVal.(*sync.Mutex)
+		noticeLock.Lock()
+		defer noticeLock.Unlock()
 
 		sent := 0
 		for _, targetPortal := range targetPortals {
@@ -2112,7 +2140,12 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				continue
 			}
 			sent++
-			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: sent silent presence notice")
+			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Str("event_id", string(newID)).
+				Msg("StatusKit: sent silent presence notice")
+			if newID == "" {
+				log.Warn().Str("portal_mxid", string(targetPortal.MXID)).
+					Msg("StatusKit: send returned no event ID — cannot redact this notice on the next change")
+			}
 
 			// Redact the prior notice for THIS (peer, room) — sent first so a
 			// failed redaction leaves the correct new line rather than a gap —
