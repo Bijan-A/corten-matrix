@@ -1206,8 +1206,31 @@ func (c *IMClient) Connect(ctx context.Context) {
 					if err := c.safeRefreshPetTokenThrottled(); err != nil {
 						log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
 					}
-					if err := sk.ShareStatus(true, nil); err != nil {
-						log.Warn().Err(err).Msg("StatusKit startup share_status failed")
+					shareErr := sk.ShareStatus(true, nil)
+					if shareErr != nil && strings.Contains(shareErr.Error(), "Auth Missing") &&
+						c.tokenProvider != nil && *c.tokenProvider != nil {
+						// Warm-restore (restore_token_provider) injects ONLY the PET;
+						// the full GSA token map — including com.apple.gs.sharedchannels.auth
+						// that share_status needs — is repopulated only by a full
+						// login_email_pass. The GSA-announce prime that used to do that
+						// is disabled, and upstream get_token won't lazily fetch an
+						// *absent* token (it only re-logs-in for an expired-but-present
+						// one), so the map can lack sharedchannels.auth → "Auth Missing".
+						// The proactive refresh above is throttle-skipped on a quick
+						// restart, so force a full refresh here (unthrottled: this is a
+						// genuine missing-auth, not a redundant refresh) to rebuild the
+						// map, then retry once. Mirrors the CloudKit TokenMissing
+						// recovery; one prime fixes the whole process.
+						log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
+						if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
+							log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+						} else {
+							c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
+							shareErr = sk.ShareStatus(true, nil)
+						}
+					}
+					if shareErr != nil {
+						log.Warn().Err(shareErr).Msg("StatusKit startup share_status failed")
 						return
 					}
 					// Stamp the post-invite cooldown key so the sweep's
