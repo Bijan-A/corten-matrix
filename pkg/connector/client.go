@@ -169,22 +169,6 @@ type IMClient struct {
 	// per unresolved handle per session. Values are networkid.PortalID.
 	statusKitPortalCache sync.Map // map[string]networkid.PortalID
 
-	// statusKitLastNotice tracks the event ID of the last presence notice the
-	// bridge sent, so the next change can redact it and leave exactly ONE
-	// status notice in the room instead of a growing wall. Keyed by
-	// "<peer portal ID>|<room MXID>" — the peer's canonical portal ID AND the
-	// target room, NOT the room alone: in a shared group two people
-	// each get their own tracked notice, so one toggling never redacts the
-	// other's line. Values are id.EventID. Mirrored to the KV store under the
-	// same key so the dedup survives a bridge restart.
-	statusKitLastNotice sync.Map // map[string]id.EventID
-
-	// statusKitNoticeLocks serializes the send→redact→store sequence per peer
-	// (keyed by portal ID) so rapid consecutive toggles can't race — without it
-	// two goroutines can both read an empty "previous notice" before either
-	// stores its event ID, leaving two notices in the room. Values *sync.Mutex.
-	statusKitNoticeLocks sync.Map // map[networkid.PortalID]*sync.Mutex
-
 	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
 	// driven by StatusKit alias resolution. Per-handle 6h negative cache
 	// (statusKitIDSAttemptKeyPrefix) prevents re-querying the same handle;
@@ -1610,27 +1594,6 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // Callbacks from rustpush
 // ============================================================================
 
-// statusKitModeLabel converts a Focus/DND mode identifier to a human-readable
-// label for use in bridge bot notices.
-func statusKitModeLabel(mode *string) string {
-	if mode == nil || *mode == "" {
-		return ""
-	}
-	switch *mode {
-	case "com.apple.donotdisturb.mode.default":
-		return "Do Not Disturb"
-	case "com.apple.donotdisturb.mode.sleep":
-		return "Sleep"
-	default:
-		// Focus modes use identifiers like "com.apple.focus.mode.personal"
-		// or user-defined UUIDs. Humanise what we can; fall back to a generic label.
-		if strings.Contains(*mode, "focus") {
-			return "Focus"
-		}
-		return "Do Not Disturb"
-	}
-}
-
 // OnStatusUpdate is called by StatusKit when a contact's presence changes.
 // Posts an m.notice in the contact DM and the last active shared group so the
 // user sees status inline where they're actively chatting, similar to Apple's
@@ -1948,216 +1911,100 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			}
 		}
 
-		log.Info().
-			Str("normalized_user", normalizedUser).
-			Str("portal_id", string(portal.ID)).
-			Str("ghost_handle", ghostHandle).
-			Msg("StatusKit: sending presence notice to active conversations")
-
-		name := ghost.Name
-		if name == "" {
-			name = ghostHandle
-		}
-		var notice string
-		if silenced {
-			label := statusKitModeLabel(modeCopy)
-			if label != "" {
-				notice = "🔕 " + name + " has notifications silenced (" + label + ")."
-			} else {
-				notice = "🔕 " + name + " has notifications silenced."
-			}
-		} else {
-			notice = name + " has notifications turned on."
-		}
-
-		targetPortals := map[networkid.PortalID]*bridgev2.Portal{
-			portal.ID: portal,
-		}
-		candidateHandles := map[string]bool{
-			normalizedUser: true,
-			ghostHandle:    true,
-		}
-		if contact := c.lookupContact(user); contact != nil {
-			for _, altID := range contactPortalIDs(contact) {
-				candidateHandles[altID] = true
-			}
-		}
-		for handleID := range candidateHandles {
-			if handleID == "" {
-				continue
-			}
-			c.lastGroupForMemberMu.RLock()
-			groupKey, ok := c.lastGroupForMember[handleID]
-			c.lastGroupForMemberMu.RUnlock()
-			if !ok || groupKey.ID == "" {
-				continue
-			}
-			groupPortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
-			if err == nil && groupPortal != nil && groupPortal.MXID != "" {
-				targetPortals[groupPortal.ID] = groupPortal
-			}
-		}
-
-		sendStatusNotice := func(targetPortal *bridgev2.Portal) (id.EventID, error) {
-			if targetPortal == nil || targetPortal.MXID == "" {
-				return "", fmt.Errorf("invalid target portal")
-			}
-
-			// Stamp each notice at exactly the previous message's timestamp
-			// so room ordering doesn't change. The m.notice +
-			// com.beeper.action_message=presence_update extension already
-			// signals "do not reorder" at the client level; matching the
-			// last message's timestamp is the bridge-side belt that
-			// doesn't depend on every client honoring the extension.
-			//
-			// A portal without any prior message shouldn't exist in
-			// practice (no messages = nothing to backfill = no portal),
-			// so the fallback below is defensive — keep the original
-			// now-1ms shape for that path.
-			noticeTS := time.Now().Add(-1 * time.Millisecond)
-			if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
-				ctx, targetPortal.PortalKey, time.Now(),
-			); dbErr != nil {
-				log.Warn().Err(dbErr).Str("portal_id", string(targetPortal.ID)).
-					Msg("StatusKit: failed to query last message timestamp, using now-1ms")
-			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() {
-				noticeTS = lastMsg.Timestamp
-			}
-
-			if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-				batchEvt := &event.Event{
-					Type:      event.EventMessage,
-					Sender:    c.Main.Bridge.Bot.GetMXID(),
-					RoomID:    targetPortal.MXID,
-					Timestamp: noticeTS.UnixMilli(),
-					Content: event.Content{
-						Parsed: &event.MessageEventContent{
-							MsgType:  event.MsgNotice,
-							Body:     notice,
-							Mentions: &event.Mentions{},
-						},
-						Raw: map[string]any{
-							"com.beeper.action_message": map[string]any{
-								"type": "presence_update",
-							},
-						},
+		// Reflect the focus state in the DM TITLE (room name) instead of
+		// posting a timeline notice: the contact's name normally, the name
+		// plus a trailing 🌙 while their Focus/DND is on. The title is
+		// persistent in the header and the chat-list row, never buried, and is
+		// updated in place with ExcludeChangesFromTimeline — so no wall, no
+		// tombstones, no inbox churn. DMs only: a group has a single shared
+		// title, so per-member focus can't ride on it (groups no longer
+		// surface focus at all).
+		//
+		// Routed through computeDMTitle so this live path and the periodic
+		// refreshDMPortalNamesFromContacts loop ALWAYS agree — the refresh
+		// re-applies the identical title every contact-sync tick (covering
+		// restarts and any toggle missed while the bridge was down), and a
+		// live change updates it immediately. The portal-keyed presence state
+		// was stored just above, so computeDMTitle sees the new state.
+		//
+		// Logs carry only the opaque room MXID + a boolean — never the
+		// contact name or handle.
+		if portal.RoomType == database.RoomTypeDM {
+			title := c.computeDMTitle(ctx, portal)
+			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+				EventMeta: simplevent.EventMeta{
+					Type: bridgev2.RemoteEventChatInfoChange,
+					PortalKey: networkid.PortalKey{
+						ID:       portal.ID,
+						Receiver: c.UserLogin.ID,
 					},
-				}
-				batchReq := &mautrix.ReqBeeperBatchSend{
-					Forward:          true,
-					SendNotification: false,
-					Events:           []*event.Event{batchEvt},
-				}
-				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-					batchReq.MarkReadBy = dp.GetMXID()
-				}
-				resp, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
-				if sendErr != nil {
-					return "", sendErr
-				}
-				if resp == nil || len(resp.EventIDs) == 0 {
-					return "", nil
-				}
-				return resp.EventIDs[0], nil
-			}
-
-			resp, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
-				Parsed: &event.MessageEventContent{
-					MsgType:  event.MsgNotice,
-					Body:     notice,
-					Mentions: &event.Mentions{},
-				},
-				Raw: map[string]any{
-					"com.beeper.action_message": map[string]any{
-						"type": "presence_update",
+					LogContext: func(lc zerolog.Context) zerolog.Context {
+						return lc.Str("portal_mxid", string(portal.MXID)).
+							Str("source", "focus_status").
+							Bool("silenced", silenced)
 					},
 				},
-			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
-			if sendErr != nil {
-				return "", sendErr
-			}
-			if resp == nil {
-				return "", nil
-			}
-			return resp.EventID, nil
-		}
-
-		// Per-(peer, room) tracking so each new notice can redact the prior
-		// one, leaving exactly ONE status notice in the room. Keyed by the
-		// canonical peer portal ID + room MXID (see statusKitLastNotice doc)
-		// and mirrored to the KV store so it survives a bridge restart.
-		noticeKey := func(roomMXID id.RoomID) string {
-			return string(portal.ID) + "|" + string(roomMXID)
-		}
-		noticeKVKey := func(roomMXID id.RoomID) database.Key {
-			return database.Key("statuskit.lastnotice." + noticeKey(roomMXID))
-		}
-		// Redact via the canonical /redact endpoint (the bot's raw client).
-		// Bot.SendMessage(EventRedaction) routes through Hungry's send-as-event
-		// path (MSC4169), which did NOT reliably clear our batch-inserted
-		// notices; /redact works by event ID regardless of how the target was
-		// inserted.
-		redactPrevNotice := func(roomMXID id.RoomID) {
-			var prevID id.EventID
-			if v, ok := c.statusKitLastNotice.Load(noticeKey(roomMXID)); ok {
-				prevID = v.(id.EventID)
-			} else if s := c.Main.Bridge.DB.KV.Get(ctx, noticeKVKey(roomMXID)); s != "" {
-				prevID = id.EventID(s)
-			}
-			if prevID == "" {
-				return
-			}
-			var rErr error
-			if bi, ok := c.Main.Bridge.Bot.(*matrixfmt.ASIntent); ok && bi.Matrix != nil {
-				_, rErr = bi.Matrix.RedactEvent(ctx, roomMXID, prevID)
-			} else {
-				_, rErr = c.Main.Bridge.Bot.SendMessage(ctx, roomMXID, event.EventRedaction, &event.Content{
-					Parsed: &event.RedactionEventContent{Redacts: prevID},
-				}, nil)
-			}
-			if rErr != nil {
-				log.Warn().Err(rErr).Str("portal_mxid", string(roomMXID)).Str("redacts", string(prevID)).
-					Msg("StatusKit: failed to redact previous presence notice")
-			} else {
-				log.Info().Str("portal_mxid", string(roomMXID)).Str("redacted", string(prevID)).
-					Msg("StatusKit: redacted previous presence notice")
-			}
-		}
-
-		// Serialize the send→redact→store sequence per peer so rapid toggles
-		// don't race (two goroutines both seeing no "previous" notice and each
-		// leaving its own line). Held only across this peer's sends.
-		lockVal, _ := c.statusKitNoticeLocks.LoadOrStore(portal.ID, &sync.Mutex{})
-		noticeLock := lockVal.(*sync.Mutex)
-		noticeLock.Lock()
-		defer noticeLock.Unlock()
-
-		sent := 0
-		for _, targetPortal := range targetPortals {
-			newID, err := sendStatusNotice(targetPortal)
-			if err != nil {
-				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
-				continue
-			}
-			sent++
-			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Str("event_id", string(newID)).
-				Msg("StatusKit: sent silent presence notice")
-			if newID == "" {
-				log.Warn().Str("portal_mxid", string(targetPortal.MXID)).
-					Msg("StatusKit: send returned no event ID — cannot redact this notice on the next change")
-			}
-
-			// Redact the prior notice for THIS (peer, room) — sent first so a
-			// failed redaction leaves the correct new line rather than a gap —
-			// then record the new one as the line to redact next time.
-			redactPrevNotice(targetPortal.MXID)
-			c.statusKitLastNotice.Store(noticeKey(targetPortal.MXID), newID)
-			c.Main.Bridge.DB.KV.Set(ctx, noticeKVKey(targetPortal.MXID), string(newID))
-		}
-		if sent == 0 {
-			log.Warn().Msg("StatusKit: failed to send presence notice to any conversation")
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					ChatInfo: &bridgev2.ChatInfo{
+						Name:                       &title,
+						ExcludeChangesFromTimeline: true,
+					},
+				},
+			})
+			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
+				Msg("StatusKit: updated DM title for focus change")
 		}
 	}()
+}
+
+// isPortalSilenced reports whether the peer of the given DM portal currently
+// has iMessage Focus/DND on. Map-first (statusKitPresenceByPortal), KV-fallback:
+// the in-memory map is cold after a restart, but the per-portal presence state
+// is persisted, so the fallback lets the periodic title refresh PRESERVE the 🌙
+// across restarts instead of stripping it until the next live toggle. A stored
+// value of "available" (or absent) = not silenced; any focus mode = silenced.
+//
+// Note: depends on StatusKitNotifications being enabled — when it's off,
+// OnStatusUpdate early-returns before recording presence, so this is always
+// false and no moon appears (intended).
+func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
+	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
+		s, _ := v.(string)
+		return s != "" && s != "available"
+	}
+	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
+	return s != "" && s != "available"
+}
+
+// computeDMTitle returns a DM's room title: the peer's current display name,
+// plus a trailing " 🌙" while their iMessage Focus/DND is on. This is the SINGLE
+// source of truth for the title — both the live focus path (OnStatusUpdate) and
+// the periodic refresh (refreshDMPortalNamesFromContacts) call it, so they can
+// never disagree (the refresh must not drop the moon, and a focus change must
+// not be lost between refreshes).
+//
+// The base name is the GHOST name — exactly what the DM title shows today — so a
+// non-silenced DM dedups cleanly against the existing portal name (no custom-
+// name seizure, no avatar freeze, no regression). It falls back to the
+// contact-derived name only when no ghost name is available yet.
+func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) string {
+	base := ""
+	for _, uid := range []networkid.UserID{portal.OtherUserID, networkid.UserID(portal.ID)} {
+		if uid == "" {
+			continue
+		}
+		if ghost, err := c.Main.Bridge.GetGhostByID(ctx, uid); err == nil && ghost != nil && ghost.Name != "" {
+			base = ghost.Name
+			break
+		}
+	}
+	if base == "" {
+		base = c.resolveContactDisplayname(string(portal.ID))
+	}
+	if c.isPortalSilenced(ctx, portal.ID) {
+		base += " 🌙"
+	}
+	return base
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so
