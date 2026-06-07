@@ -1658,9 +1658,9 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		if portal.Receiver != c.UserLogin.ID || portal.MXID == "" {
 			continue
 		}
-		// DMs only — groups have one shared title (handled elsewhere); self-
-		// chats are already custom-named, leave them alone.
-		if portal.RoomType != database.RoomTypeDM || c.isMyHandle(string(portal.ID)) {
+		// DMs only — groups have one shared title (handled elsewhere). Self-chat
+		// is included: it's a DM and gets the moon like any other.
+		if portal.RoomType != database.RoomTypeDM {
 			continue
 		}
 		total++

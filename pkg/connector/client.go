@@ -1935,12 +1935,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// on implicit naming so we never mass-seize NameIsCustom (which would
 		// also freeze ghost avatar updates) across DMs. portal.Name may be
 		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
-		//
-		// Skip the self-chat (Note to Self): your own Focus status on your own
-		// note is meaningless, and the connector already owns the self-chat name
-		// (so the moon would fight it — "David Brustein 🌙" vs the self-chat's
-		// "David"). The periodic refresh loop already skips self-chats too.
-		if portal.RoomType == database.RoomTypeDM && !c.isMyHandle(string(portal.ID)) && (silenced || portal.NameIsCustom) {
+		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
 			nameField := c.dmFocusName(ctx, portal)
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
@@ -1987,31 +1982,37 @@ func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.Port
 	return s != "" && s != "available"
 }
 
-// computeDMTitle returns a DM's room title: the peer's current display name,
-// plus a trailing " 🌙" while their iMessage Focus/DND is on. This is the SINGLE
-// source of truth for the title — both the live focus path (OnStatusUpdate) and
-// the periodic refresh (refreshDMPortalNamesFromContacts) call it, so they can
-// never disagree (the refresh must not drop the moon, and a focus change must
-// not be lost between refreshes).
-//
-// The base name is the GHOST name — exactly what the DM title shows today — so a
-// non-silenced DM dedups cleanly against the existing portal name (no custom-
-// name seizure, no avatar freeze, no regression). It falls back to the
-// contact-derived name only when no ghost name is available yet.
-func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) string {
-	base := ""
+// dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the
+// authority that NORMALLY names that chat — so adding/removing 🌙 only ever
+// toggles the suffix and never swaps the underlying name (which is what caused
+// the "David Brustein" ↔ "David" flip):
+//   - self-chat (Note to Self): resolveContactDisplayname — exactly what the
+//     connector itself sets for the self-chat (GetChatInfo). Using ghost.Name
+//     here would disagree with the connector and flip the title on every toggle.
+//   - regular DM: ghost.Name — what the framework derives (and what
+//     DefaultChatName restores), and it carries shared-profile names that
+//     resolveContactDisplayname would miss.
+func (c *IMClient) dmBaseName(ctx context.Context, portal *bridgev2.Portal) string {
+	if c.isMyHandle(string(portal.ID)) {
+		return c.resolveContactDisplayname(string(portal.ID))
+	}
 	for _, uid := range []networkid.UserID{portal.OtherUserID, networkid.UserID(portal.ID)} {
 		if uid == "" {
 			continue
 		}
 		if ghost, err := c.Main.Bridge.GetGhostByID(ctx, uid); err == nil && ghost != nil && ghost.Name != "" {
-			base = ghost.Name
-			break
+			return ghost.Name
 		}
 	}
-	if base == "" {
-		base = c.resolveContactDisplayname(string(portal.ID))
-	}
+	return c.resolveContactDisplayname(string(portal.ID))
+}
+
+// computeDMTitle returns a DM's room title: dmBaseName plus a trailing " 🌙"
+// while the peer's iMessage Focus/DND is on. SINGLE source of truth for the
+// title — both the live focus path (OnStatusUpdate) and the periodic refresh
+// (refreshDMPortalNamesFromContacts) call it, so they can never disagree.
+func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) string {
+	base := c.dmBaseName(ctx, portal)
 	if base != "" && c.isPortalSilenced(ctx, portal.ID) {
 		base += " 🌙"
 	}
@@ -2021,20 +2022,27 @@ func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) 
 // dmFocusName returns the ChatInfo.Name to set for a DM given the peer's focus
 // state:
 //   - silenced  → the moon title ("<name> 🌙"), which we own (NameIsCustom=true).
-//   - available → bridgev2.DefaultChatName, which RELEASES ownership
+//   - available, regular DM → bridgev2.DefaultChatName, which RELEASES ownership
 //     (NameIsCustom=false) so the framework restores the bare ghost name AND
-//     re-enables ghost name+avatar sync. Re-stamping the bare name on un-silence
-//     would instead keep NameIsCustom=true forever and permanently freeze ghost
-//     avatar updates for any DM that was ever silenced.
+//     re-enables ghost name+avatar sync. (Re-stamping the bare name would keep
+//     NameIsCustom=true forever and freeze the ghost avatar.)
+//   - available, self-chat → the bare connector name. The connector permanently
+//     owns the self-chat name (NameIsCustom is always set by GetChatInfo), so
+//     releasing would just fight GetChatInfo and flip; restore the same bare
+//     name dmBaseName uses, keeping it stable.
 //
 // Returns the DefaultChatName package sentinel by identity (the framework
 // matches it by pointer at portal.go:4983) — never a copy of "".
 func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *string {
-	if !c.isPortalSilenced(ctx, portal.ID) {
-		return bridgev2.DefaultChatName
+	if c.isPortalSilenced(ctx, portal.ID) {
+		title := c.computeDMTitle(ctx, portal)
+		return &title
 	}
-	title := c.computeDMTitle(ctx, portal)
-	return &title
+	if c.isMyHandle(string(portal.ID)) {
+		base := c.dmBaseName(ctx, portal)
+		return &base
+	}
+	return bridgev2.DefaultChatName
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so
