@@ -1929,8 +1929,14 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		//
 		// Logs carry only the opaque room MXID + a boolean — never the
 		// contact name or handle.
-		if portal.RoomType == database.RoomTypeDM {
-			title := c.computeDMTitle(ctx, portal)
+		// Only touch the title when there's something to own: the peer is
+		// silenced (add 🌙), or we already own the name (NameIsCustom — to
+		// maintain it or clear the moon). A pristine, never-silenced DM is left
+		// on implicit naming so we never mass-seize NameIsCustom (which would
+		// also freeze ghost avatar updates) across DMs. portal.Name may be
+		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
+		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
+			nameField := c.dmFocusName(ctx, portal)
 			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 				EventMeta: simplevent.EventMeta{
 					Type: bridgev2.RemoteEventChatInfoChange,
@@ -1946,7 +1952,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				},
 				ChatInfoChange: &bridgev2.ChatInfoChange{
 					ChatInfo: &bridgev2.ChatInfo{
-						Name:                       &title,
+						Name:                       nameField,
 						ExcludeChangesFromTimeline: true,
 					},
 				},
@@ -2001,10 +2007,29 @@ func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) 
 	if base == "" {
 		base = c.resolveContactDisplayname(string(portal.ID))
 	}
-	if c.isPortalSilenced(ctx, portal.ID) {
+	if base != "" && c.isPortalSilenced(ctx, portal.ID) {
 		base += " 🌙"
 	}
 	return base
+}
+
+// dmFocusName returns the ChatInfo.Name to set for a DM given the peer's focus
+// state:
+//   - silenced  → the moon title ("<name> 🌙"), which we own (NameIsCustom=true).
+//   - available → bridgev2.DefaultChatName, which RELEASES ownership
+//     (NameIsCustom=false) so the framework restores the bare ghost name AND
+//     re-enables ghost name+avatar sync. Re-stamping the bare name on un-silence
+//     would instead keep NameIsCustom=true forever and permanently freeze ghost
+//     avatar updates for any DM that was ever silenced.
+//
+// Returns the DefaultChatName package sentinel by identity (the framework
+// matches it by pointer at portal.go:4983) — never a copy of "".
+func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *string {
+	if !c.isPortalSilenced(ctx, portal.ID) {
+		return bridgev2.DefaultChatName
+	}
+	title := c.computeDMTitle(ctx, portal)
+	return &title
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so

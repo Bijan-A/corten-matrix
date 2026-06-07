@@ -771,11 +771,18 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	} else {
 		log.Info().Msg("Re-syncing contact names for ghosts and group portals")
 	}
-	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
-	// Re-apply DM titles too, so the iMessage Focus/DND moon (computeDMTitle)
-	// is preserved across restarts and never dropped by a bare-name refresh.
-	go c.refreshDMPortalNamesFromContacts(log)
+	// Ghost names first, THEN DM titles — in one sequence so they go hand in
+	// hand: refreshGhostNamesFromContacts updates ghost.Name synchronously, then
+	// refreshDMPortalNamesFromContacts recomputes each DM title from the FRESH
+	// name plus the current focus state (contact name + 🌙, or DefaultChatName to
+	// release when available). This keeps the moon preserved across restarts and
+	// ensures a contact-name change and the status indicator update together,
+	// never in two racing loops.
+	go func() {
+		c.refreshGhostNamesFromContacts(log)
+		c.refreshDMPortalNamesFromContacts(log)
+	}()
 	// Presence subscription only needs to run on first-ready and whenever new
 	// StatusKit keys arrive (via OnKeysReceived). The ghost set doesn't change
 	// per periodic contact-sync tick; re-subscribing every 15 minutes just
@@ -1658,12 +1665,22 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		// Gate on the composed title (incl. the moon), NOT the bare name, so a
-		// focus change with an unchanged contact name still applies. updateName
-		// no-ops an identical title, so an unchanged DM emits nothing and never
-		// seizes the custom-name flag. Log only the opaque room MXID — no PII.
-		title := c.computeDMTitle(ctx, portal)
-		if title == "" || title == portal.Name {
+		// Only touch DMs we should: silenced (apply 🌙) or already owned
+		// (NameIsCustom — maintain it or clear the moon). Leave pristine,
+		// never-silenced DMs on implicit naming — portal.Name may be empty for
+		// them, so stamping would mass-seize NameIsCustom (and freeze ghost
+		// avatars) across every DM on the first tick.
+		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom {
+			continue
+		}
+		// Recompute the title (contact name + 🌙 when silenced) or, when
+		// available-but-still-owned, DefaultChatName to release the title back
+		// to the framework. Because this runs right after the ghost-name pass
+		// (see dispatch), the contact name is fresh — name change and status
+		// check go hand in hand. Skip no-op moon-title rewrites; DefaultChatName
+		// must proceed so it releases ownership and restores name + avatar.
+		nameField := c.dmFocusName(ctx, portal)
+		if nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name) {
 			continue
 		}
 
@@ -1680,7 +1697,7 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{
 				ChatInfo: &bridgev2.ChatInfo{
-					Name:                       &title,
+					Name:                       nameField,
 					ExcludeChangesFromTimeline: true,
 				},
 			},
