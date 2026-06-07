@@ -1499,7 +1499,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 
 	// Use bridge_id-scoped query and fetch the current name for diff-gating.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id, COALESCE(name, ''), COALESCE(identifiers, '[]') FROM ghost WHERE bridge_id=$1",
+		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -1509,18 +1509,17 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	defer rows.Close()
 
 	type ghostEntry struct {
-		id          networkid.UserID
-		name        string
-		identifiers string
+		id   networkid.UserID
+		name string
 	}
 	var ghosts []ghostEntry
 	for rows.Next() {
-		var id, name, identifiers string
-		if err := rows.Scan(&id, &name, &identifiers); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			log.Err(err).Msg("Failed to scan ghost ID")
 			continue
 		}
-		ghosts = append(ghosts, ghostEntry{networkid.UserID(id), name, identifiers})
+		ghosts = append(ghosts, ghostEntry{networkid.UserID(id), name})
 	}
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
@@ -1549,14 +1548,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 			Nickname:  contact.Nickname,
 			ID:        localID,
 		})
-		// Also refresh when the stored identifiers are stale — specifically when
-		// they're missing the ghost's OWN handle (e.g. a tel: contact whose
-		// identifiers ended up email-only from older code). Email-only
-		// identifiers make the contact look un-callable to the client, hiding
-		// the call button. GetUserInfo always seeds the ghost's own id, so a
-		// ghost lacking it has never been refreshed by current code; refreshing
-		// repopulates it, and this gate skips it again next cycle.
-		if g.name == expectedName && strings.Contains(g.identifiers, string(g.id)) {
+		if g.name == expectedName {
 			continue
 		}
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
