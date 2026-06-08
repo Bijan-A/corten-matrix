@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,8 +109,24 @@ func (c *cloudContactsClient) doRequest(method, url, body string, depth string) 
 	if depth != "" {
 		req.Header.Set("Depth", depth)
 	}
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// Apple throttle: a 403/429 means we're hitting iCloud too hard. Surface it
+	// as an error so the sync loops back off instead of retrying at their fixed
+	// cadence (which compounds the throttle and risks escalation to a clique
+	// kick). Close the body since the caller won't.
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: iCloud CardDAV returned HTTP %d", errICloudContactsThrottled, resp.StatusCode)
+	}
+	return resp, nil
 }
+
+// errICloudContactsThrottled marks an Apple rate-limit (403/429) on the
+// CardDAV contacts endpoint, so the sync loops can back off hard.
+var errICloudContactsThrottled = errors.New("icloud contacts throttled")
 
 // SyncContacts fetches all contacts from iCloud via CardDAV and rebuilds the cache.
 func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
@@ -148,7 +165,16 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		allContacts = append(allContacts, contacts...)
 	}
 
-	// Step 4.5: Download any photo URLs — use authenticated fetcher for iCloud URLs
+	// Step 4.5: Carry over avatars already downloaded in a previous sync, then
+	// download only the genuinely-new ones. SyncContacts rebuilds allContacts
+	// fresh from vCards every time (Avatar==nil), so without this every photo
+	// is re-fetched from iCloud on every sync — hundreds of requests per cycle
+	// that hammer Apple and trip a 403. Reuse is keyed on an unchanged
+	// AvatarURL, so a contact who changes their photo is still re-downloaded.
+	reused := c.carryOverAvatars(allContacts)
+	if reused > 0 {
+		log.Debug().Int("reused", reused).Msg("CardDAV: reused cached contact avatars (skipped re-download)")
+	}
 	downloadContactPhotos(allContacts, log, c.downloadAuthURL)
 
 	// Step 5: Build lookup caches
@@ -177,6 +203,50 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		Int("email_keys", len(c.byEmail)).
 		Msg("Contact cache synced from iCloud CardDAV")
 	return nil
+}
+
+// carryOverAvatars fills in each fresh contact's Avatar from the previous
+// sync's cache when the AvatarURL is unchanged, so downloadContactPhotos only
+// fetches new/changed photos instead of re-downloading every one from iCloud.
+// Returns the number reused. Reads the old cache under RLock; the caller has
+// not yet rebuilt it.
+func (c *cloudContactsClient) carryOverAvatars(fresh []*imessage.Contact) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.byPhone) == 0 && len(c.byEmail) == 0 {
+		return 0
+	}
+	reused := 0
+	for _, ct := range fresh {
+		if ct.AvatarURL == "" || ct.Avatar != nil {
+			continue
+		}
+		var old *imessage.Contact
+		for _, phone := range ct.Phones {
+			for _, suffix := range phoneSuffixes(phone) {
+				if o, ok := c.byPhone[suffix]; ok {
+					old = o
+					break
+				}
+			}
+			if old != nil {
+				break
+			}
+		}
+		if old == nil {
+			for _, email := range ct.Emails {
+				if o, ok := c.byEmail[strings.ToLower(email)]; ok {
+					old = o
+					break
+				}
+			}
+		}
+		if old != nil && old.Avatar != nil && old.AvatarURL == ct.AvatarURL {
+			ct.Avatar = old.Avatar
+			reused++
+		}
+	}
+	return reused
 }
 
 // GetContactInfo looks up a contact by phone number or email.

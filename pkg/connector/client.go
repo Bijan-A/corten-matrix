@@ -9342,22 +9342,57 @@ func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
 // behind CardDAV success — refreshAllSharedProfiles only needs CloudKit
 // (ProfilesClient) and runs independently even if SyncContacts errors.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
+	const (
+		base = 15 * time.Minute
+		max  = 6 * time.Hour
+	)
+	interval := base
+	failures := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if err := c.contacts.SyncContacts(log); err != nil {
-				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
+				failures++
+				interval = contactSyncBackoff(base, max, failures)
+				ev := log.Warn().Err(err).Int("failures", failures).Dur("next_in", interval)
+				if errors.Is(err, errICloudContactsThrottled) {
+					ev = ev.Bool("throttled", true)
+				}
+				ev.Msg("Periodic CardDAV sync failed — backing off to avoid hammering iCloud")
 			} else {
+				if failures > 0 {
+					log.Info().Msg("CardDAV sync recovered — resetting to base interval")
+				}
+				failures = 0
+				interval = base
 				c.setContactsReady(log)
 				c.persistMmeDelegate(log)
 			}
 			c.refreshAllSharedProfiles(log)
+			timer.Reset(interval)
 		case <-c.stopChan:
 			return
 		}
 	}
+}
+
+// contactSyncBackoff returns base doubled per consecutive failure, capped at
+// max: 15m → 30m → 1h → 2h → 4h → 6h. Keeps a throttled (403) contacts sync
+// from retrying at its fixed cadence and compounding the rate limit.
+func contactSyncBackoff(base, max time.Duration, failures int) time.Duration {
+	if failures <= 1 {
+		return base
+	}
+	d := base
+	for i := 1; i < failures && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 // persistMmeDelegate saves the current MobileMe delegate to user_login metadata
@@ -9391,16 +9426,28 @@ func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
 // when it fails on startup (e.g., expired MobileMe delegate). Once contacts
 // succeed, the readiness gate opens and cloud sync begins.
 func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
+	const (
+		base = 2 * time.Minute
+		max  = 1 * time.Hour
+	)
+	interval := base
+	failures := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
 			c.contacts = newCloudContactsClient(c.client, log)
 			if c.contacts != nil {
 				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
-					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
+					failures++
+					interval = contactSyncBackoff(base, max, failures)
+					ev := log.Warn().Err(syncErr).Int("failures", failures).Dur("next_in", interval)
+					if errors.Is(syncErr, errICloudContactsThrottled) {
+						ev = ev.Bool("throttled", true)
+					}
+					ev.Msg("Cloud contacts retry: sync failed — backing off to avoid hammering iCloud")
 				} else {
 					c.setContactsReady(log)
 					c.persistMmeDelegate(log)
@@ -9409,8 +9456,11 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 					return
 				}
 			} else {
-				log.Warn().Msg("Cloud contacts retry: still unavailable")
+				failures++
+				interval = contactSyncBackoff(base, max, failures)
+				log.Warn().Int("failures", failures).Dur("next_in", interval).Msg("Cloud contacts retry: still unavailable — backing off")
 			}
+			timer.Reset(interval)
 		case <-c.stopChan:
 			return
 		}
