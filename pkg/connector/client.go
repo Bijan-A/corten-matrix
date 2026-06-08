@@ -8211,16 +8211,13 @@ const maxFFIReturnableBytes = 2_000_000_000 // ~1.86 GiB, < i32::MAX
 // in-memory path's 90s.
 const oversizedDownloadTimeout = 10 * time.Minute
 
-// attachmentExceedsFFILimit reports whether an attachment's reported size means
-// its bytes can't be returned over the FFI and must be streamed via a temp file
-// instead. CloudKit reports a blob ≥ 2 GiB with a NEGATIVE (i32-wrapped)
-// file_size (e.g. -1,676,737,818 ≈ a 2.6 GB file), so a negative value is the
-// tell; a value above the gate (if stored un-wrapped) counts too. A file_size
-// of 0 (unknown) is NOT treated as oversized — most such attachments are small,
-// and the in-memory path's panic-recovery still catches a surprise.
-func attachmentExceedsFFILimit(fileSize int64) bool {
-	return fileSize < 0 || fileSize > maxFFIReturnableBytes
-}
+// minFreeDiskBytes is the free-space floor for downloading attachments to disk.
+// Below this, downloadAttachmentToTempFile defers the attachment (records a
+// retriable failure) instead of writing — so a burst of large concurrent
+// downloads can never fill the disk; it paces itself as in-flight temp files
+// finish uploading and get cleaned up. Sized to comfortably hold one worst-case
+// download plus its transcode output (input + MP4) with room to spare.
+const minFreeDiskBytes int64 = 6 << 30 // 6 GiB
 
 // safeCloudDownloadAttachmentToFile wraps the to-file FFI download with the same
 // panic recovery as safeCloudDownloadAttachment and a generous timeout. rustpush
@@ -8263,7 +8260,7 @@ func safeCloudDownloadAttachmentToFile(client *rustpushgo.Client, recordName, de
 // to an MP4 FILE on disk. Unlike transcodeToMP4's ConvertBytes — which loads the
 // whole input and output into memory — this streams input→output through ffmpeg
 // on disk, so it's safe for the multi-GB attachments handled by
-// streamOversizedAttachment. Serialized against all other transcodes via
+// streamAttachmentFromFile. Serialized against all other transcodes via
 // transcodeSem (one ffmpeg at a time → bounded CPU/memory on small or
 // single-core hosts). The remux pass is near-free when the source is already
 // H.264/HEVC in a non-MP4 container — the common case — sparing a slow re-encode
@@ -8296,18 +8293,46 @@ func transcodeFileToMP4(ctx context.Context, log *zerolog.Logger, inputPath stri
 	return outPath, nil
 }
 
-// streamOversizedAttachment handles an attachment too large to return over the
-// FFI. rustpush writes it to a temp file, then UploadMediaStream streams it from
-// disk straight to Matrix (via its ReplacementFile path) — so neither Go nor the
-// homeserver upload ever holds the multi-GB blob in memory. When video
-// transcoding is enabled the file is transcoded disk→disk first (remux when
-// possible, else re-encode) — we power through it without buffering, just slowly
-// on a small host. HEIC/thumbnail are still skipped (those need the bytes
-// resident and are meaningless for a multi-GB video). The homeserver's own media
-// size limit then applies inside UploadMediaStream (so a blob bigger than the
-// server allows fails cleanly, not as a lazy skip). Returns nil on any failure
-// so the caller drops the item.
-func (c *IMClient) streamOversizedAttachment(
+// downloadAttachmentToTempFile downloads an attachment to a fresh temp file via
+// the to-file FFI. This is the single, uniform download path: it never lowers a
+// Vec over uniffi's i32-capped RustBuffer (so no "buffer too large" panic), it
+// doesn't rely on the unreliable wrapped-i32 file_size to predict size, and peak
+// memory is one copy rather than the Rust Vec and a Go []byte at once. Returns
+// the path and real byte count; the caller owns the file and must remove it.
+// Defers (returns an error) when free disk is below minFreeDiskBytes so a burst
+// of concurrent large downloads can't fill the disk — it paces itself as
+// in-flight temp files finish uploading and get cleaned up.
+func (c *IMClient) downloadAttachmentToTempFile(recordName string) (string, int64, error) {
+	if free, ok := freeDiskBytes(os.TempDir()); ok && free < uint64(minFreeDiskBytes) {
+		return "", 0, fmt.Errorf("low disk space (%d MiB free < %d MiB floor), deferring attachment",
+			free>>20, minFreeDiskBytes>>20)
+	}
+	tmp, err := os.CreateTemp("", "mautrix-cloud-att-*")
+	if err != nil {
+		return "", 0, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	n, err := safeCloudDownloadAttachmentToFile(c.client, recordName, tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return "", 0, err
+	}
+	return tmpPath, int64(n), nil
+}
+
+// streamAttachmentFromFile uploads an already-downloaded attachment from disk
+// straight to Matrix (via UploadMediaStream's ReplacementFile) — so neither Go
+// nor the homeserver upload holds the blob in memory. When video transcoding is
+// enabled the file is transcoded disk→disk first (remux when possible, else
+// re-encode). HEIC/thumbnail are skipped (those need the bytes resident and are
+// meaningless for a multi-GB video). The homeserver's own media size limit then
+// applies inside UploadMediaStream (so a blob bigger than the server allows
+// fails cleanly, not as a lazy skip). The caller owns tmpPath; this never
+// deletes it (though UploadMediaStream may consume it as the ReplacementFile
+// when no transcode happens). Returns nil on any failure so the caller drops
+// the item.
+func (c *IMClient) streamAttachmentFromFile(
 	ctx context.Context,
 	row cloudMessageRow,
 	sender bridgev2.EventSender,
@@ -8315,6 +8340,8 @@ func (c *IMClient) streamOversizedAttachment(
 	i int,
 	att cloudAttachmentRow,
 	attID string,
+	tmpPath string,
+	n int64,
 ) []*bridgev2.BackfillMessage {
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
 	intent := c.Main.Bridge.Bot
@@ -8329,33 +8356,6 @@ func (c *IMClient) streamOversizedAttachment(
 	}
 	if fileName == "" {
 		fileName = "attachment"
-	}
-
-	tmp, err := os.CreateTemp("", "mautrix-cloud-oversized-*")
-	if err != nil {
-		log.Warn().Err(err).Str("record_name", att.RecordName).
-			Msg("Oversized attachment: failed to create temp file, skipping")
-		return nil
-	}
-	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	// Remove the temp file on every exit path. UploadMediaStream also removes
-	// the ReplacementFile once it takes ownership; a double remove is harmless.
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	n, err := safeCloudDownloadAttachmentToFile(c.client, att.RecordName, tmpPath)
-	if err != nil {
-		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
-		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int("attempt", fe.retries).
-			Msg("Failed to download oversized CloudKit attachment, skipping")
-		return nil
-	}
-	if n == 0 {
-		c.recordAttachmentFailure(att.RecordName, "empty data")
-		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Msg("Oversized CloudKit attachment returned empty data")
-		return nil
 	}
 
 	// What we'll stream up: the downloaded file as-is, unless we transcode.
@@ -8482,19 +8482,12 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	// Oversized attachments can't be returned as bytes over the FFI: uniffi
-	// lowers a returned Vec<u8> into an i32-capped RustBuffer, so a blob ≥ 2 GiB
-	// panics on the way out ("buffer capacity cannot fit into a i32.") even
-	// though the download itself succeeds. Stream those straight from disk to
-	// Matrix instead of buffering them in memory to hand across the boundary.
-	// Live Photos (HasAvid) use a separate avid path below — leave them to it;
-	// they're never multi-GB.
-	if attachmentExceedsFFILimit(att.FileSize) && !att.HasAvid {
-		return c.streamOversizedAttachment(ctx, row, sender, ts, i, att, attID)
-	}
-
-	// Download the lqa (still image) — this is always the baseline.
-	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
+	// Always download the lqa to a temp file rather than returning the bytes
+	// over the FFI. One uniform path: it never lowers a Vec across uniffi's
+	// i32-capped RustBuffer (no "buffer too large" panic), it doesn't depend on
+	// the unreliable wrapped-i32 file_size to guess size up front, and it's
+	// disk-space guarded. We learn the real size from the file, then decide.
+	tmpPath, n, err := c.downloadAttachmentToTempFile(att.RecordName)
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
@@ -8503,6 +8496,30 @@ func (c *IMClient) downloadAndUploadAttachment(
 			Str("record_name", att.RecordName).
 			Int("attempt", fe.retries).
 			Msg("Failed to download CloudKit attachment, skipping")
+		return nil
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	if n == 0 {
+		c.recordAttachmentFailure(att.RecordName, "empty data")
+		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Msg("CloudKit attachment returned empty data")
+		return nil
+	}
+
+	// Too big to safely pull into a Go []byte for the in-memory pipeline
+	// (HEIC/thumbnail/transcode) — stream it from disk straight to Matrix,
+	// transcoding video disk→disk. Live Photos keep their separate avid path.
+	if n > maxFFIReturnableBytes && !att.HasAvid {
+		return c.streamAttachmentFromFile(ctx, row, sender, ts, i, att, attID, tmpPath, n)
+	}
+
+	// Small enough: read it back for the normal in-memory pipeline.
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("attempt", fe.retries).
+			Msg("Failed to read downloaded attachment, skipping")
 		return nil
 	}
 	if len(data) == 0 {
@@ -8768,11 +8785,14 @@ const (
 	// attachmentMaxParallelDownloads caps the number of concurrent attachment
 	// pipelines during pre-upload — each goroutine runs a full CloudKit
 	// download → transcode → Matrix upload, so this bounds the upload fan-out
-	// against the homeserver as well as sockets/fds/goroutines. Kept modest
-	// (well below the old value of 32) so a backfill doesn't hammer the Matrix
-	// media repo with dozens of simultaneous uploads. The per-item memory cost
-	// is bounded separately by attachmentByteSem.
-	attachmentMaxParallelDownloads = 8
+	// against the homeserver as well as sockets/fds/goroutines. Kept low (down
+	// from 32, then 8) so a backfill doesn't hammer the Matrix media repo with
+	// simultaneous uploads and — now that downloads land on disk — can't pile up
+	// many large temp files at once. On a single-core host the downloads are
+	// I/O-bound, so fewer in flight costs little speed and is meaningfully safer
+	// on memory and disk. Per-item memory/disk is bounded separately by
+	// attachmentByteSem and the minFreeDiskBytes floor.
+	attachmentMaxParallelDownloads = 4
 	// attachmentMaxInFlightBytes caps the total attachment payload resident in
 	// memory at once across the pre-upload fan-out. Each in-flight download
 	// holds its blob (and briefly its transcoded copy ≈ 2× this budget) in RAM,
