@@ -130,6 +130,12 @@ func main() {
 	// silent until restarted. No-op on non-macOS platforms. See rlimit_*.go.
 	raiseFileLimit()
 
+	// Cap the Go heap (GOMEMLIMIT) to a fraction of system memory so an
+	// aggressive backfill can't drive the resident set past physical RAM and
+	// get OOM-killed on small, swap-less hosts. Honors an explicit operator
+	// GOMEMLIMIT and is cgroup-aware for Docker. See memlimit.go / meminfo_*.go.
+	capMemoryLimitFromSystem()
+
 	// Backfill any network config keys this build knows about but that are
 	// missing from the on-disk config (e.g. configs generated before a key was
 	// added). Runs before PreInit loads the config so the file is complete for
