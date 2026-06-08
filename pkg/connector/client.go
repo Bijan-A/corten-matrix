@@ -8199,12 +8199,19 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 	}
 }
 
-// maxFFIReturnableBytes is the largest attachment we can return as bytes over
-// the uniffi FFI. uniffi packs a returned Vec<u8> into a RustBuffer whose
-// length and capacity are i32, so a blob ≥ i32::MAX (~2.15 GB) panics on the
-// way out ("buffer capacity cannot fit into a i32."). Gate a touch under the
-// hard limit to leave headroom for Vec capacity overshoot.
-const maxFFIReturnableBytes = 2_000_000_000 // ~1.86 GiB, < i32::MAX
+// maxInMemoryAttachmentBytes is the cutoff above which an attachment is
+// transcoded and uploaded straight from disk instead of being read back into a
+// Go []byte for the in-memory pipeline. The download already lands on disk; the
+// in-memory path then reads the WHOLE file into RAM and transcodes it via
+// ConvertBytes (input AND output buffers resident at once), so a single ~1.6 GB
+// video spikes ~3–5 GB of RAM. Above this cutoff we use streamAttachmentFromFile,
+// which transcodes file→file on disk (tiny working set) and streams the upload
+// from disk — peak RAM stays flat regardless of file size. Sized at the typical
+// homeserver upload limit: a file bigger than that gets rejected on upload
+// anyway, so there's no reason to spend RAM processing it. (The i32 RustBuffer
+// panic is already prevented upstream by always downloading via the to-file FFI;
+// this threshold is purely about not pulling large blobs into memory.)
+const maxInMemoryAttachmentBytes = 100 * 1024 * 1024 // 100 MiB
 
 // oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
 // These legitimately take minutes over CloudKit, so it's far longer than the
@@ -8507,9 +8514,10 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	// Too big to safely pull into a Go []byte for the in-memory pipeline
-	// (HEIC/thumbnail/transcode) — stream it from disk straight to Matrix,
+	// (HEIC/thumbnail/transcode) — reading + transcoding a large file in memory
+	// spikes several GB per attachment. Stream it from disk straight to Matrix,
 	// transcoding video disk→disk. Live Photos keep their separate avid path.
-	if n > maxFFIReturnableBytes && !att.HasAvid {
+	if n > maxInMemoryAttachmentBytes && !att.HasAvid {
 		return c.streamAttachmentFromFile(ctx, row, sender, ts, i, att, attID, tmpPath, n)
 	}
 
