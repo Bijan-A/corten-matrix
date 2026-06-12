@@ -926,7 +926,7 @@ dev/
 
 ## Chat With Us
 
-**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#rustpush-matrix:beeper.com)
+**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#corten-matrix:beeper.com)
 
 ## License
 
