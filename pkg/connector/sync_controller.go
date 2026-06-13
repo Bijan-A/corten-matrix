@@ -273,6 +273,30 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		return overridden
 	}
 
+	// Skip the (expensive, full 256-page-per-zone) recycle-bin scan if it ran
+	// recently. Known deletions are already PERSISTED: insertDeletedChatTombstone +
+	// deleteLocalChatByPortalID soft-delete the cloud_chat rows, which survive
+	// restarts, so createPortalsFromCloudSync already honours them WITHOUT a fresh
+	// scan. Re-scanning on every startup is what makes a heavily-deleted account
+	// (James: huge recycle bin) take minutes to become send-ready —
+	// ListRecoverableChats + ListRecoverableMessageGuids each walk up to 256
+	// CloudKit pages per zone every time (the FFI resets its continuation token to
+	// None each call). The cooldown only bounds how stale a NEW delete/recovery can
+	// be (the next scan picks it up); already-known deletes are never lost.
+	// Incremental sync was rejected on purpose: the recovery pass needs the FULL
+	// recoverable-message snapshot to count per-portal recoverables, so a
+	// continuation token would break recovery.
+	const recycleBinSeedCooldown = 30 * time.Minute
+	seedKey := database.Key("recyclebin.seed.last")
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, seedKey); raw != "" {
+		if last, err := time.Parse(time.RFC3339, raw); err == nil && time.Since(last) < recycleBinSeedCooldown {
+			log.Info().Time("last_seed", last).Dur("cooldown", recycleBinSeedCooldown).
+				Msg("DELETE-SEED: skipping recycle-bin scan — ran recently; persisted soft-deletes already cover known deletions (unblocks rapid restarts)")
+			return
+		}
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, seedKey, time.Now().Format(time.RFC3339))
+
 	log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
 	recoverableChats, chatErr := c.client.ListRecoverableChats()
 	if chatErr != nil {
