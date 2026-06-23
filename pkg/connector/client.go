@@ -6000,6 +6000,12 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		return nil, bridgev2.ErrNotLoggedIn
 	}
 
+	// Verify outbound delivery identity before sending. Placed ahead of the
+	// file branch so it covers both text and attachment messages.
+	if r, err := c.ensureIdentityKeys(ctx, msg); r != nil || err != nil {
+		return r, err
+	}
+
 	conv := c.portalToConversation(msg.Portal)
 
 	// File/image messages

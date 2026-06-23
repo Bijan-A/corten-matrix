@@ -51,6 +51,10 @@ type PersistedSessionState struct {
 
 	// Cached MobileMe delegate for seeding on restore
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// Opaque IDS delivery-key cache (base64). Bookkeeping that rides alongside
+	// the registration data and is preserved across saves (see saveSessionState).
+	IDSKeyCache string `json:"ids_key_cache,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:
@@ -127,6 +131,18 @@ func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("Failed to create session file directory")
 		return
+	}
+	// Preserve the opaque IDS key cache across saves. Callers that rebuild the
+	// struct from login metadata don't carry it, so re-read it from the existing
+	// file when the incoming state doesn't set it — otherwise every metadata-
+	// driven save would drop the cached blob.
+	if state.IDSKeyCache == "" {
+		if existing, rerr := os.ReadFile(path); rerr == nil && len(existing) > 0 {
+			var prev PersistedSessionState
+			if json.Unmarshal(existing, &prev) == nil {
+				state.IDSKeyCache = prev.IDSKeyCache
+			}
+		}
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
