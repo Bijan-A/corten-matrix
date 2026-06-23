@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/rs/zerolog"
 
@@ -120,9 +121,22 @@ func hasKeychainCliqueState(log zerolog.Logger) bool {
 	return false
 }
 
-// saveSessionState writes the full session state to the JSON file.
-// Creates parent directories if needed. Errors are logged but not fatal.
+// sessionStateMu serializes read-modify-write of session.json across the bridge.
+// Several code paths persist it (login, registration/auth events, periodic state
+// updates). os.WriteFile is not atomic across concurrent writers, so without this
+// two saves could interleave into corrupt JSON or clobber each other's fields.
+var sessionStateMu sync.Mutex
+
+// saveSessionState writes the full session state to the JSON file (locked).
 func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	saveSessionStateLocked(log, state)
+}
+
+// saveSessionStateLocked is saveSessionState without the lock; callers must hold
+// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
+func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 	path, err := sessionFilePath()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
@@ -164,6 +178,14 @@ func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
 // Falls back to the legacy identity.plist file (v1 format) if the new file
 // doesn't exist. Returns a zero-value struct if nothing is found.
 func loadSessionState(log zerolog.Logger) PersistedSessionState {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	return loadSessionStateLocked(log)
+}
+
+// loadSessionStateLocked is loadSessionState without the lock; callers must hold
+// sessionStateMu.
+func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
 	// Try new JSON format first
 	path, err := sessionFilePath()
 	if err != nil {
@@ -198,8 +220,8 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	state := PersistedSessionState{
 		IDSIdentity: string(legacyData),
 	}
-	// Migrate: save in new format and remove old file
-	saveSessionState(log, state)
+	// Migrate: save in new format and remove old file (already under the lock)
+	saveSessionStateLocked(log, state)
 	_ = os.Remove(legacyPath)
 	return state
 }
