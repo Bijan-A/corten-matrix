@@ -40,6 +40,11 @@ func cortenDataDir() string {
 	return filepath.Join(home, ".local", "share", "corten-matrix")
 }
 
+// DataDir returns the bridge data directory (~/.local/share/corten-matrix, or
+// $XDG_DATA_HOME/corten-matrix) where config.yaml lives. Exported so the login
+// subcommand resolves the same path as the rest of the CLI.
+func DataDir() string { return cortenDataDir() }
+
 // selfPath returns the absolute path of this binary (resolving symlinks).
 func selfPath() string {
 	p, err := os.Executable()

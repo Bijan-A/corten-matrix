@@ -82,6 +82,12 @@ func main() {
 		case "login":
 			// Remove "login" from args so flag parsing in PreInit works.
 			os.Args = append(os.Args[:1], os.Args[2:]...)
+			// A bare `corten-matrix login` (no -c, run from an arbitrary cwd)
+			// otherwise makes PreInit look for ./config.yaml and abort with a
+			// config error before the login flow runs. Default -c to the real
+			// data-dir config (and chdir there so relative paths resolve), the
+			// same way the service / install scripts launch the bridge.
+			resolveLoginConfig()
 			runInteractiveLogin(&m)
 			return
 		case "check-restore":
@@ -204,6 +210,29 @@ func ensureSecureDeleteDSN(br *mxmain.BridgeMain) {
 		sep = "&"
 	}
 	br.Config.Database.URI = uri + sep + "_secure_delete=on"
+}
+
+// resolveLoginConfig makes a bare `corten-matrix login` find the bridge config
+// from any working directory. mxmain's PreInit defaults -c to ./config.yaml, so
+// without this a login run from anywhere but the data dir aborts with a
+// config.yaml error before the login flow ever starts. We replicate what the
+// service and install scripts do (`cd $DATADIR && ... -c $DATADIR/config.yaml`):
+// chdir into the data dir (so relative paths in the config resolve) and inject
+// -c. It is a no-op when the caller already passed -c/--config or no config
+// exists in the data dir, so existing invocations are unaffected.
+func resolveLoginConfig() {
+	for _, a := range os.Args[1:] {
+		if a == "-c" || a == "--config" ||
+			strings.HasPrefix(a, "-c=") || strings.HasPrefix(a, "--config=") {
+			return
+		}
+	}
+	dir := cli.DataDir()
+	cfg := filepath.Join(dir, "config.yaml")
+	if _, err := os.Stat(cfg); err == nil {
+		_ = os.Chdir(dir)
+		os.Args = append(os.Args, "-c", cfg)
+	}
 }
 
 // repairPermissions detects and fixes broken bridge.permissions before the
