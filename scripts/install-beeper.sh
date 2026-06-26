@@ -285,14 +285,14 @@ CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed '
 if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
     CHATDB_PATH="$HOME/Library/Messages/chat.db"
     if [ -f "$CHATDB_PATH" ]; then
-        if ! sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+        if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
             echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
             echo "  Grant access to the bridge binary, then press Enter to continue."
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
             read -p "Press Enter when Full Disk Access has been granted..."
-            if sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+            if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else
                 echo "⚠ chat.db still not accessible — the bridge will prompt again on startup"
