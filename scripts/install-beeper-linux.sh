@@ -1235,7 +1235,13 @@ EOF
     systemctl enable "$SERVICE_NAME"
 }
 
-if [ "$SYSTEMD_MODE" = "user" ]; then
+if [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): install/enable the unit (hard dep) but don't
+    # start — the Go CLI starts every account together after the 2nd-account prompt.
+    [ "$SYSTEMD_MODE" = "user" ] && install_systemd_user
+    [ "$SYSTEMD_MODE" = "system" ] && install_systemd_system
+    echo "✓ Account configured (service installed)"
+elif [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
         install_systemd_user
         systemctl --user restart "$SERVICE_NAME"

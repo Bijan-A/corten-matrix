@@ -251,15 +251,17 @@ func setupAccount(beeper bool, idx int) error {
 	bbctlPath := filepath.Join(filepath.Dir(self), "bbctl")
 	dataDir := cortenDataDir()
 	bundleID := cortenBundleID
-	var env []string
+	// The orchestrator (runSetup) starts every account together AFTER the optional
+	// second account is configured, so each script only INSTALLS its service here.
+	env := []string{"CORTEN_DEFER_START=1"}
 	if idx == 1 {
 		dataDir = secondDataDir()
 		bundleID = cortenBundleID + "-1"
-		env = []string{
+		env = append(env,
 			"BRIDGE_NAME=sh-imessage1",     // Beeper appservice name for the 2nd account
 			"SERVICE_NAME=corten-matrix-1", // local systemd unit / launchd suffix
-			"XDG_DATA_HOME=" + dataDir,     // 2nd account's own login/session dir
-		}
+			"XDG_DATA_HOME="+dataDir,       // 2nd account's own login/session dir
+		)
 	}
 	var name string
 	var args []string
@@ -302,7 +304,49 @@ func runSetup(beeper bool) {
 			}
 		}
 	}
+	// Now that every account is configured, start them together — this is why the
+	// scripts defer starting: the second-account prompt comes BEFORE any start.
+	startAfterSetup()
 	os.Exit(0)
+}
+
+// startAfterSetup prompts once (default Yes) and starts every configured account.
+// The install scripts only install each service; starting is centralized here so
+// the "add a second account?" prompt is never preceded by a "bridge started".
+func startAfterSetup() {
+	if isInteractive() {
+		fmt.Print("\nStart the bridge now (and automatically at login)? [Y/n]: ")
+		var ans string
+		fmt.Scanln(&ans)
+		switch ans {
+		case "n", "N", "no", "No":
+			fmt.Printf("\n%s✓%s Installed. Start any time with: corten-matrix start\n", cGreen, cReset)
+			return
+		}
+	}
+	idxs := []int{0}
+	if hasSecondAccount() {
+		idxs = append(idxs, 1)
+	}
+	for _, idx := range idxs {
+		startOneNow(idx)
+	}
+	fmt.Printf("\n%s✓%s Bridge started — view logs with: corten-matrix logs\n", cGreen, cReset)
+}
+
+// startOneNow loads (and force-starts) one account's already-installed service.
+func startOneNow(idx int) {
+	label := serviceLabel(idx)
+	if runtime.GOOS == "darwin" {
+		uid := strconv.Itoa(os.Getuid())
+		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", label+".plist")
+		if exec.Command("launchctl", "bootstrap", "gui/"+uid, plist).Run() != nil {
+			_ = exec.Command("launchctl", "load", "-w", plist).Run()
+		}
+		_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
+		return
+	}
+	_ = exec.Command("systemctl", "--user", "start", label+".service").Run()
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`

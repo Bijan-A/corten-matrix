@@ -903,6 +903,10 @@ cat > "$PLIST" << PLIST_EOF
 </plist>
 PLIST_EOF
 
+if [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): started centrally after the optional 2nd account.
+    echo "✓ Account configured"
+else
 # The plist is installed; the prompt only decides whether to LOAD (start) it now.
 # Either way 'corten-matrix start/stop/restart' work later, since they act on it.
 if [ -t 0 ]; then
@@ -947,6 +951,7 @@ echo ""
 echo "  Logs:    tail -f $LOG_OUT"
 echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
 echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
+fi
 echo ""
 
 
