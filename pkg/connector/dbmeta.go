@@ -28,6 +28,13 @@ type MessageMetadata struct {
 	// iMessages (attachment + follow-up text). Stored on the primary DB row so
 	// redact/unsend can remove both halves together.
 	SiblingUUID string `json:"sibling_uuid,omitempty"`
+
+	// ContinuationUUIDs holds the extra iMessages produced when one oversized
+	// Matrix message had to be sent as several. Kept separate from SiblingUUID,
+	// which pairs an attachment with its caption and holds exactly one UUID.
+	// Without this a Matrix redaction would unsend only the first chunk, leaving
+	// the rest on the recipient's device while Matrix shows the message deleted.
+	ContinuationUUIDs []string `json:"continuation_uuids,omitempty"`
 }
 
 type UserLoginMetadata struct {

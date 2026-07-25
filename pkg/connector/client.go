@@ -33,6 +33,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "image/gif"
 	_ "image/png"
@@ -3537,20 +3538,45 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 		ID:            makeMessageID(msg.Uuid),
 		TargetMessage: makeMessageID(targetGUID),
 		ConvertEditFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, text string) (*bridgev2.ConvertedEdit, error) {
-			var targetPart *database.Message
-			if len(existing) > 0 {
-				targetPart = existing[0]
+			// Only the text parts of the target may be rewritten — attachment
+			// parts (att0, att1, …) belong to the same message and must not be
+			// clobbered by an edit of its text.
+			textParts := make([]*database.Message, 0, len(existing))
+			for _, part := range existing {
+				if isTextPartID(part.PartID) {
+					textParts = append(textParts, part)
+				}
 			}
-			return &bridgev2.ConvertedEdit{
-				ModifiedParts: []*bridgev2.ConvertedEditPart{{
-					Part: targetPart,
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    text,
-					},
-				}},
-			}, nil
+			// GetAllPartsByID has no ORDER BY, so the rows arrive in whatever
+			// order the covering index yields. Sort explicitly rather than
+			// relying on that — mapping new parts onto the wrong stored rows
+			// would redact the wrong events. Compare the ordinal numerically:
+			// lexical order breaks the moment the zero padding overflows
+			// ("text1000" < "text999"), and padding width should not be
+			// load-bearing.
+			sort.Slice(textParts, func(i, j int) bool {
+				return textPartIndex(textParts[i].PartID) < textPartIndex(textParts[j].PartID)
+			})
+			newParts := buildTextParts(event.MsgText, "", text, nil, true)
+			edit := &bridgev2.ConvertedEdit{}
+			for i, part := range newParts {
+				if i < len(textParts) {
+					edit.ModifiedParts = append(edit.ModifiedParts, part.ToEditPart(textParts[i]))
+					continue
+				}
+				// The edit needs more parts than the message already had.
+				// bridgev2 appends these at the end of the room rather than
+				// beside the original, but dropping them would lose text.
+				if edit.AddedParts == nil {
+					edit.AddedParts = &bridgev2.ConvertedMessage{}
+				}
+				edit.AddedParts.Parts = append(edit.AddedParts.Parts, part)
+			}
+			// The edit shrank: redact the continuation parts it no longer needs.
+			if len(textParts) > len(newParts) {
+				edit.DeletedParts = textParts[len(newParts):]
+			}
+			return edit, nil
 		},
 	})
 }
@@ -6144,10 +6170,15 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	// Bodies large enough to need splitting do reach us: 45,000 bytes of content
+	// still encrypts to well under the homeserver's 65,536-byte PDU cap, and an
+	// unencrypted room has more room still. Measured after the link-preview
+	// envelope is prepended, since that also counts against the wire size.
+	outbound := splitTextChunks(textToSend, maxOutboundTextBytes)
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
-	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -6161,6 +6192,59 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	if c.cloudStore != nil {
 		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
+		}
+	}
+
+	// Continuation chunks follow the first, once the primary UUID is persisted.
+	// The first UUID stays the bridge message ID so replies, echo dedup and
+	// unsends keep targeting one message; a failed continuation is logged rather
+	// than failing the whole send, since the first chunk has already been
+	// delivered and cannot be recalled. Every UUID that does land is recorded so
+	// a later redaction can unsend all of them — otherwise Matrix would show the
+	// message deleted while the tail stayed on the recipient's device.
+	var continuationUUIDs []string
+	for i, chunk := range outbound[1:] {
+		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.handle, nil, nil, nil)
+		if contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("uuid", uuid).
+				Int("chunk", i+1).
+				Int("chunks", len(outbound)).
+				Msg("Failed to send continuation chunk of oversized outbound message")
+			break
+		}
+		continuationUUIDs = append(continuationUUIDs, contUUID)
+		if c.cloudStore != nil {
+			if err := c.cloudStore.persistMessageUUID(ctx, contUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", contUUID).Msg("Failed to persist continuation UUID; echo may be delivered as duplicate")
+			}
+			// A continuation is a real iMessage, so CloudKit will eventually
+			// return a record for it and upsertMessageBatch will promote the
+			// stub (record_name goes non-empty), at which point the backfill
+			// list queries stop filtering it out. Its text already lives in the
+			// single Matrix event, so bridging it back would duplicate the tail.
+			// Soft-delete is the existing, race-safe way to say "never bridge
+			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
+			//
+			// Known residual, deliberately not worked around. Nothing here can
+			// lose message content: the row is a contentless stub from
+			// persistMessageUUID, and the chunk's text lives in the Matrix event.
+			// The risk is the reverse — the row coming back. The pre-existing
+			// tombstone reaper (deleteOrphanedMessages) removes rows that are
+			// already deleted=TRUE and whose portal has no cloud_chat row yet,
+			// which clears the flag this relies on; a later CloudKit sync then
+			// re-inserts the row deleted=FALSE with a record_name and the chunk
+			// becomes backfillable again, showing up as a duplicate tail under a
+			// message that already contains that text. Every flag we could set
+			// lives in cloud_message so the reap takes all of them, and a
+			// bridgev2 message row would not help because CloudKit backfill
+			// dedups on the anchor cursor rather than per row. The window needs
+			// an outbound send over maxOutboundTextBytes into a portal whose chat
+			// has not synced yet, plus a reap landing inside it.
+			if err := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); err != nil {
+				zerolog.Ctx(ctx).Error().Err(err).Str("uuid", contUUID).
+					Msg("Failed to mark continuation chunk unbridgeable; it may reappear as a duplicate after CloudKit sync")
+			}
 		}
 	}
 
@@ -6180,7 +6264,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			ID:        makeMessageID(uuid),
 			SenderID:  makeUserID(c.handle),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{},
+			Metadata:  &MessageMetadata{ContinuationUUIDs: continuationUUIDs},
 		},
 	}, nil
 }
@@ -6524,6 +6608,18 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 	targetGUID := string(msg.EditTarget.ID)
 
+	// An iMessage edit replaces one message, so a Matrix message that had to go
+	// out as several iMessages can only have its first chunk edited; the
+	// continuations keep their original text. Log it rather than inventing a
+	// mechanism — this needs an outbound body over maxOutboundTextBytes, which
+	// no ordinary client produces.
+	if meta, ok := msg.EditTarget.Metadata.(*MessageMetadata); ok && meta != nil && len(meta.ContinuationUUIDs) > 0 {
+		zerolog.Ctx(ctx).Warn().
+			Str("target_uuid", targetGUID).
+			Int("continuations", len(meta.ContinuationUUIDs)).
+			Msg("Editing only the first chunk of a message that was split across several iMessages")
+	}
+
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
 	if err == nil {
@@ -6548,8 +6644,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// so unsend it first to keep the same wire ordering — some peers ignore unsends
 	// that arrive out of timeline order for an attachment.
 	var siblingUUID string
+	var continuationUUIDs []string
 	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
 		siblingUUID = meta.SiblingUUID
+		continuationUUIDs = meta.ContinuationUUIDs
 	}
 
 	// Track scrub failures so we can fail-closed at the end after both
@@ -6568,6 +6666,26 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID); scrubErr != nil {
 				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("sibling_uuid", siblingUUID).
 					Msg("Failed to soft-delete sibling cloud_message on split image+caption redact")
+				scrubErrs = append(scrubErrs, scrubErr)
+			}
+		}
+	}
+
+	// An oversized Matrix message was sent as several iMessages. Unsend the
+	// continuations before the primary, mirroring the sibling ordering above:
+	// the tail was sent last, so retracting it first keeps the recipient from
+	// briefly seeing a message whose head is gone but whose tail remains.
+	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
+		contUUID := continuationUUIDs[i]
+		c.trackOutboundUnsend(contUUID)
+		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handle); contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("continuation_uuid", contUUID).
+				Msg("Failed to unsend continuation chunk on redact of split message")
+		} else if c.cloudStore != nil {
+			if scrubErr := c.cloudStore.softDeleteMessageByGUID(ctx, contUUID); scrubErr != nil {
+				zerolog.Ctx(ctx).Error().Err(scrubErr).Str("continuation_uuid", contUUID).
+					Msg("Failed to soft-delete continuation cloud_message on redact of split message")
 				scrubErrs = append(scrubErrs, scrubErr)
 			}
 		}
@@ -8323,28 +8441,12 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 	// Text message — trim OBJ placeholders before building body.
 	body := strings.Trim(row.Text, "\ufffc \n")
-	var formattedBody string
-	if row.Subject != "" {
-		if body != "" {
-			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(row.Subject), html.EscapeString(body))
-			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
-		} else {
-			body = row.Subject
-		}
-	}
-	hasText := strings.TrimSpace(body) != ""
+	hasText := strings.TrimSpace(body) != "" || strings.TrimSpace(row.Subject) != ""
 	if hasText {
-		textContent := &event.MessageEventContent{
-			MsgType: event.MsgText,
-			Body:    body,
-		}
-		if formattedBody != "" {
-			textContent.Format = event.FormatHTML
-			textContent.FormattedBody = formattedBody
-		}
+		var previews []*event.BeeperLinkPreview
 		if c.Main.Config.URLPreviewsInBackfill {
 			if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
-				textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				previews = []*event.BeeperLinkPreview{
 					fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
 				}
 			}
@@ -8354,10 +8456,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			ID:        makeMessageID(row.GUID),
 			Timestamp: ts,
 			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: textContent,
-				}},
+				Parts: buildTextParts(event.MsgText, row.Subject, body, previews, false),
 			},
 		})
 	}
@@ -11414,29 +11513,293 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 	return nil
 }
 
-func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
-	content := &event.MessageEventContent{
-		MsgType: event.MsgText,
-		Body:    text,
+// Matrix caps a PDU at 65,536 bytes, and mautrix encrypts every event before
+// submitting it, so the marshaled event content has to leave room for megolm
+// padding, base64 expansion (~4/3) and the PDU envelope. Measured against a real
+// megolm session the cliff sits just under 48,000 bytes of content; 40,000 keeps
+// roughly 15% margin. Text above this is split across several Matrix events
+// instead of being rejected by the server, which used to drop live messages
+// silently and wedge a portal's backfill permanently.
+const maxTextContentBytes = 40000
+
+// maxOutboundTextBytes bounds text travelling the other way, to iMessage. Bodies
+// in the 45,000-47,000 range do reach the bridge from Matrix (that much content
+// still encrypts to under 65,536), so this path is live, if narrow.
+const maxOutboundTextBytes = 45000
+
+// Fixed per-message overhead that rides on the first part and cannot be reduced
+// by splitting the text. Without a bound the shrink loop below can never reach
+// its budget, because shrinking the chunk does nothing about a 60 KB og:
+// description or subject. Neither field is meaningful at these sizes, so
+// truncating loses nothing real. Note this caps the maximum overhead, it does
+// not make the part count deterministic: fetchURLPreview does a live HTTP fetch,
+// so a preview that succeeds on one backfill pass and fails on the next shifts
+// the first chunk boundary and can change the part count.
+const (
+	maxSubjectBytes      = 2048
+	maxPreviewFieldBytes = 2048
+)
+
+// truncateBytes cuts s to at most max bytes on a rune boundary.
+func truncateBytes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
 	}
-	if msg.Subject != nil && *msg.Subject != "" {
-		if text != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", *msg.Subject, text)
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// firstChunk returns the leading chunk of text that splitTextChunks would emit,
+// without building the rest of the list. The shrink loop calls this on every
+// iteration, so materialising every chunk each time would be quadratic.
+func firstChunk(text string, max int) string {
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	cut := max
+	// Never cut inside a multi-byte rune.
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if i := strings.LastIndexByte(text[:cut], '\n'); i > max*3/4 {
+		cut = i + 1
+	} else if i := strings.LastIndexByte(text[:cut], ' '); i > max*3/4 {
+		cut = i + 1
+	}
+	if cut <= 0 {
+		// Unreachable for any sane max, but the caller must always advance.
+		cut = max
+	}
+	return text[:cut]
+}
+
+// splitTextChunks cuts text into UTF-8-safe pieces of at most max bytes,
+// preferring a newline and then a space in the last quarter of the window so
+// chunks break at paragraph boundaries rather than mid-word. The chunks always
+// concatenate back to the exact input — nothing is dropped or rewritten.
+func splitTextChunks(text string, max int) []string {
+	if max <= 0 || len(text) <= max {
+		return []string{text}
+	}
+	var out []string
+	for len(text) > max {
+		chunk := firstChunk(text, max)
+		out = append(out, chunk)
+		text = text[len(chunk):]
+	}
+	if text != "" {
+		out = append(out, text)
+	}
+	return out
+}
+
+// boundPreviews returns copies of the previews with their free-text fields
+// capped. Nothing upstream bounds them: urlpreview.go takes og:title and
+// og:description verbatim from a remote page, limited only by the 512 KB body
+// read, and inbound rich links come straight off the wire.
+func boundPreviews(previews []*event.BeeperLinkPreview) []*event.BeeperLinkPreview {
+	if len(previews) == 0 {
+		return nil
+	}
+	out := make([]*event.BeeperLinkPreview, 0, len(previews))
+	for _, p := range previews {
+		if p == nil {
+			continue
+		}
+		bounded := *p
+		// Every free-text field, not just the obvious two: any one of them can
+		// exceed the whole budget on its own, and leaving one uncapped means the
+		// fit loop sheds the entire preview instead of trimming it.
+		bounded.Title = truncateBytes(bounded.Title, maxPreviewFieldBytes)
+		bounded.Description = truncateBytes(bounded.Description, maxPreviewFieldBytes)
+		bounded.SiteName = truncateBytes(bounded.SiteName, maxPreviewFieldBytes)
+		bounded.Type = truncateBytes(bounded.Type, maxPreviewFieldBytes)
+		bounded.ImageType = truncateBytes(bounded.ImageType, maxPreviewFieldBytes)
+		bounded.CanonicalURL = truncateBytes(bounded.CanonicalURL, maxPreviewFieldBytes)
+		bounded.MatchedURL = truncateBytes(bounded.MatchedURL, maxPreviewFieldBytes)
+		bounded.ImageBlurhash = truncateBytes(bounded.ImageBlurhash, maxPreviewFieldBytes)
+		bounded.ImageURL = id.ContentURIString(truncateBytes(string(bounded.ImageURL), maxPreviewFieldBytes))
+		out = append(out, &bounded)
+	}
+	return out
+}
+
+// buildTextContent builds the Matrix content for one chunk of an iMessage's text.
+// Only the first chunk carries the subject, HTML formatting and link previews,
+// so the body/formatted_body duplication is paid once rather than per part.
+func buildTextContent(msgType event.MessageType, subject, chunk string, previews []*event.BeeperLinkPreview, first bool) *event.MessageEventContent {
+	content := &event.MessageEventContent{MsgType: msgType, Body: chunk}
+	if !first {
+		return content
+	}
+	if subject != "" {
+		if chunk != "" {
+			content.Body = fmt.Sprintf("**%s**\n%s", subject, chunk)
 			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", *msg.Subject, text)
+			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s",
+				html.EscapeString(subject), html.EscapeString(chunk))
 		} else {
-			content.Body = *msg.Subject
+			content.Body = subject
 		}
 	}
+	content.BeeperLinkPreviews = previews
+	return content
+}
 
-	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
+// editProbeEventID stands in for the real target when measuring what an edit
+// will marshal to. Only its length matters.
+var editProbeEventID = id.EventID("$" + strings.Repeat("A", 43))
 
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
+// measuredSize reports what this content will marshal to on the wire. For an
+// edit that is not the content itself: sendConvertedEdit calls SetEdit after the
+// converter returns, which copies the whole content into m.new_content. SetEdit
+// only drops the duplicated fallback once the *raw* body passes 10,000 bytes,
+// which never happens for heavily escaped text, so the doubling has to be
+// measured rather than assumed away. SetEdit assigns fresh pointers for every
+// field it changes, so probing a shallow copy cannot disturb the original.
+func measuredSize(content *event.MessageEventContent, forEdit bool) int {
+	target := content
+	if forEdit {
+		probe := *content
+		probe.SetEdit(editProbeEventID)
+		target = &probe
+	}
+	encoded, err := json.Marshal(target)
+	if err != nil {
+		// Treat an unmarshalable part as over budget so it degrades rather than
+		// being emitted unmeasured.
+		return maxTextContentBytes + 1
+	}
+	return len(encoded)
+}
+
+// shedOverhead removes the per-part extras that splitting cannot shrink, in
+// increasing order of what dropping them costs the reader. Level 0 keeps
+// everything.
+func shedOverhead(content *event.MessageEventContent, level int) {
+	if level >= 1 {
+		content.Format = ""
+		content.FormattedBody = ""
+	}
+	if level >= 2 {
+		content.BeeperLinkPreviews = nil
+	}
+}
+
+// maxShedLevel is the highest level shedOverhead understands.
+const maxShedLevel = 2
+
+// fitPart returns the largest leading chunk of text whose content fits the
+// budget, together with that content. It shrinks the chunk first and sheds
+// overhead only once shrinking has bottomed out, because the excess is then
+// fixed cost — a subject or a link preview — that no amount of chunking reduces.
+//
+// It never truncates. The caller advances by len(chunk), so a byte dropped here
+// would be lost outright, which is the exact failure this change exists to
+// prevent.
+func fitPart(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, first, forEdit bool) (string, *event.MessageEventContent) {
+	for level := 0; ; level++ {
+		limit := maxTextContentBytes
+		for {
+			chunk := firstChunk(text, limit)
+			content := buildTextContent(msgType, subject, chunk, previews, first)
+			shedOverhead(content, level)
+			size := measuredSize(content, forEdit)
+			if size <= maxTextContentBytes {
+				return chunk, content
+			}
+			if limit <= 512 {
+				if level >= maxShedLevel {
+					// Unreachable rather than a silent fallthrough: with the
+					// subject bounded to maxSubjectBytes, formatting and
+					// previews shed, and the chunk down at 512 bytes, the body
+					// is at most ~2.5 KB raw. Even at JSON escaping's 6x worst
+					// case, doubled for an edit, that is far under the budget.
+					return chunk, content
+				}
+				break // shed one more level and restart the shrink
+			}
+			// Shrink in proportion to the overshoot. Halving would land the
+			// chunk at half the budget instead of just under it, roughly
+			// doubling the event count for no benefit.
+			next := limit * maxTextContentBytes / size * 98 / 100
+			if next >= limit {
+				next = limit / 2
+			}
+			limit = next
+		}
+	}
+}
+
+// buildTextParts converts one iMessage's text into the Matrix message parts for
+// it. Anything that fits in a single event produces exactly one part with the
+// empty part ID, which is what replies, tapbacks, edits and deduplication
+// already target; only oversized text produces continuation parts.
+//
+// Every emitted part is measured, never assumed, and the split is lossless: the
+// parts' text concatenates back to the input exactly.
+func buildTextParts(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, forEdit bool) []*bridgev2.ConvertedMessagePart {
+	subject = truncateBytes(subject, maxSubjectBytes)
+	previews = boundPreviews(previews)
+
+	var parts []*bridgev2.ConvertedMessagePart
+	for first := true; ; first = false {
+		chunk, content := fitPart(msgType, subject, text, previews, first, forEdit)
+		partID := networkid.PartID("")
+		if !first {
+			// Zero-padded so lexical ordering matches emission ordering:
+			// GetAllPartsByID has no ORDER BY, and the edit path maps new parts
+			// onto stored parts positionally.
+			partID = networkid.PartID(fmt.Sprintf("text%03d", len(parts)))
+		}
+		parts = append(parts, &bridgev2.ConvertedMessagePart{
+			ID:      partID,
 			Type:    event.EventMessage,
 			Content: content,
-		}},
+		})
+		text = text[len(chunk):]
+		if text == "" {
+			return parts
+		}
+	}
+}
+
+// textPartIndex returns the ordinal encoded in a text part ID: the default part
+// ("") is 0 and "textNNN" is NNN. Anything unparseable sorts last, so a
+// malformed row cannot shift the positions of the valid ones — sorting it first
+// would push every real part down by one and make the edit path rewrite and
+// redact the wrong events. No current code path emits such an ID; this is a
+// guard, not a live case.
+func textPartIndex(id networkid.PartID) int {
+	if id == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(string(id), "text"))
+	if err != nil || n < 0 {
+		return math.MaxInt
+	}
+	return n
+}
+
+// isTextPartID reports whether a stored part belongs to the text of a message
+// (the default part, or a continuation emitted by buildTextParts) rather than
+// to an attachment.
+func isTextPartID(id networkid.PartID) bool {
+	return id == "" || strings.HasPrefix(string(id), "text")
+}
+
+func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
+	subject := ""
+	if msg.Subject != nil {
+		subject = *msg.Subject
+	}
+
+	cm := &bridgev2.ConvertedMessage{
+		Parts: buildTextParts(event.MsgText, subject, text,
+			convertURLPreviewToBeeper(ctx, portal, intent, msg, text), false),
 	}
 
 	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
@@ -11467,7 +11830,18 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 	if contact == nil {
 		return nil
 	}
-	name := strings.TrimSpace(contact.Name())
+	// vCard values come straight off a peer-supplied .vcf and parseVCard applies
+	// no length or count limit, so this notice can exceed Matrix's PDU limit —
+	// the same silent-drop-and-wedge failure the text splitter exists to
+	// prevent, and reachable on the CloudKit backfill path too.
+	//
+	// A per-field cap is not enough: the notice assembles up to seven values
+	// into both body and formatted_body, and each input byte can cost 16 bytes
+	// on the wire ('&' becomes "&amp;" via html.EscapeString, then "&amp;"
+	// via encoding/json). Two escape-heavy 2 KB fields already blow the limit.
+	// The only bound that holds for every input is measuring what we built, so
+	// assemble first and then drop lines until it fits.
+	name := truncateBytes(strings.TrimSpace(contact.Name()), maxSubjectBytes)
 	if name == "" && len(contact.Phones) == 0 && len(contact.Emails) == 0 {
 		return nil
 	}
@@ -11482,7 +11856,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		phone = strings.TrimSpace(phone)
+		phone = truncateBytes(strings.TrimSpace(phone), maxSubjectBytes)
 		if phone == "" {
 			continue
 		}
@@ -11493,7 +11867,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		email = strings.TrimSpace(email)
+		email = truncateBytes(strings.TrimSpace(email), maxSubjectBytes)
 		if email == "" {
 			continue
 		}
@@ -11501,13 +11875,26 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		htmlLines = append(htmlLines, "Email: "+html.EscapeString(email))
 	}
 
-	return &event.MessageEventContent{
-		MsgType:       event.MsgNotice,
-		Body:          strings.Join(bodyLines, "\n"),
-		Format:        event.FormatHTML,
-		FormattedBody: strings.Join(htmlLines, "<br/>"),
-		Mentions:      &event.Mentions{},
+	build := func() *event.MessageEventContent {
+		return &event.MessageEventContent{
+			MsgType:       event.MsgNotice,
+			Body:          strings.Join(bodyLines, "\n"),
+			Format:        event.FormatHTML,
+			FormattedBody: strings.Join(htmlLines, "<br/>"),
+			Mentions:      &event.Mentions{},
+		}
 	}
+	content := build()
+	// Drop detail lines from the end — emails first, then phones, then the name —
+	// until the assembled event fits. The "Shared contact" header is a constant,
+	// so this always terminates with something bridgeable rather than an event
+	// the server will reject.
+	for len(bodyLines) > 1 && measuredSize(content, false) > maxTextContentBytes {
+		bodyLines = bodyLines[:len(bodyLines)-1]
+		htmlLines = htmlLines[:len(htmlLines)-1]
+		content = build()
+	}
+	return content
 }
 
 const (
