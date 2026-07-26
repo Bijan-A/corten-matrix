@@ -240,6 +240,12 @@ void* uniffi_rustpushgo_fn_method_client_get_statuskit_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_has_sms_relay(
+	void* ptr,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_init_statuskit(
 	void* ptr,
 	uint64_t callback,
@@ -1676,6 +1682,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_statuskit_client(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_has_sms_relay(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_init_statuskit(
 	RustCallStatus* out_status
 );
@@ -2189,6 +2199,10 @@ uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_keys_received(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_reshare_sender(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed(
 	RustCallStatus* out_status
 );
 

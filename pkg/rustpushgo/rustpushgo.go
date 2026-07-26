@@ -733,6 +733,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_has_sms_relay(uniffiStatus)
+		})
+		if checksum != 59634 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_has_sms_relay: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_init_statuskit(uniffiStatus)
 		})
 		if checksum != 16074 {
@@ -1894,6 +1903,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed(uniffiStatus)
+		})
+		if checksum != 56503 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_updateuserscallback_update_users(uniffiStatus)
 		})
 		if checksum != 85 {
@@ -2911,6 +2929,30 @@ func (_self *Client) GetStatuskitClient() (*WrappedStatusKitClient, error) {
 		FfiConverterWrappedStatusKitClientINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) HasSmsRelay(handle string) bool {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithResult(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_client_has_sms_relay(
+			_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_i8(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) C.int8_t {
+			// completeFunc
+			return C.ffi_rustpushgo_rust_future_complete_i8(unsafe.Pointer(handle), status)
+		},
+		FfiConverterBoolINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_i8(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -7986,6 +8028,7 @@ func (err WrappedError) Unwrap() error {
 // Err* are used for checking error type with `errors.Is`
 var ErrWrappedErrorGenericError = fmt.Errorf("WrappedErrorGenericError")
 var ErrWrappedErrorNoStatusKitTargets = fmt.Errorf("WrappedErrorNoStatusKitTargets")
+var ErrWrappedErrorNoSmsRelay = fmt.Errorf("WrappedErrorNoSmsRelay")
 
 // Variant structs
 type WrappedErrorGenericError struct {
@@ -8032,6 +8075,23 @@ func (self WrappedErrorNoStatusKitTargets) Is(target error) bool {
 	return target == ErrWrappedErrorNoStatusKitTargets
 }
 
+type WrappedErrorNoSmsRelay struct {
+}
+
+func NewWrappedErrorNoSmsRelay() *WrappedError {
+	return &WrappedError{
+		err: &WrappedErrorNoSmsRelay{},
+	}
+}
+
+func (err WrappedErrorNoSmsRelay) Error() string {
+	return fmt.Sprint("NoSmsRelay")
+}
+
+func (self WrappedErrorNoSmsRelay) Is(target error) bool {
+	return target == ErrWrappedErrorNoSmsRelay
+}
+
 type FfiConverterTypeWrappedError struct{}
 
 var FfiConverterTypeWrappedErrorINSTANCE = FfiConverterTypeWrappedError{}
@@ -8054,6 +8114,8 @@ func (c FfiConverterTypeWrappedError) Read(reader io.Reader) *WrappedError {
 		}}
 	case 2:
 		return &WrappedError{&WrappedErrorNoStatusKitTargets{}}
+	case 3:
+		return &WrappedError{&WrappedErrorNoSmsRelay{}}
 	default:
 		panic(fmt.Sprintf("Unknown error code %d in FfiConverterTypeWrappedError.Read()", errorID))
 	}
@@ -8066,6 +8128,8 @@ func (c FfiConverterTypeWrappedError) Write(writer io.Writer, value *WrappedErro
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Msg)
 	case *WrappedErrorNoStatusKitTargets:
 		writeInt32(writer, 2)
+	case *WrappedErrorNoSmsRelay:
+		writeInt32(writer, 3)
 	default:
 		_ = variantValue
 		panic(fmt.Sprintf("invalid error value `%v` in FfiConverterTypeWrappedError.Write", value))
@@ -8215,6 +8279,8 @@ type StatusCallback interface {
 	OnKeysReceived()
 
 	OnReshareSender(sender string, channelId string)
+
+	OnStatusDecryptFailed(sender *string)
 }
 
 // foreignCallbackCallbackInterfaceStatusCallback cannot be callable be a compiled function at a same time
@@ -8246,6 +8312,11 @@ func rustpushgo_cgo_StatusCallback(handle C.uint64_t, method C.int32_t, argsPtr 
 		args := unsafe.Slice((*byte)(argsPtr), argsLen)
 		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnReshareSender(cb, args, outBuf)
 		return C.int32_t(result)
+	case 4:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnStatusDecryptFailed(cb, args, outBuf)
+		return C.int32_t(result)
 
 	default:
 		// This should never happen, because an out of bounds method index won't
@@ -8269,6 +8340,12 @@ func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnKeysReceived(callb
 func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnReshareSender(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
 	reader := bytes.NewReader(args)
 	callback.OnReshareSender(FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnStatusDecryptFailed(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	reader := bytes.NewReader(args)
+	callback.OnStatusDecryptFailed(FfiConverterOptionalStringINSTANCE.Read(reader))
 
 	return uniffiCallbackResultSuccess
 }

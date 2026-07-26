@@ -1045,6 +1045,12 @@ pub enum WrappedError {
     // rename nor a wrapper refactor can silently break the anti-pound cache.
     #[error("peer not registered for the StatusKit keysharing sub-service")]
     NoStatusKitTargets,
+    // Typed signal that a send could only go over the text-message relay and no
+    // device on this account is registered to relay. Matched in Go by errors.Is
+    // on THIS variant rather than by string, so a rename cannot silently turn a
+    // visible failure back into a checkmark for a message nothing delivered.
+    #[error("no device on this account forwards text messages")]
+    NoSmsRelay,
 }
 
 impl From<rustpush::PushError> for WrappedError {
@@ -9662,6 +9668,90 @@ impl Client {
         self.get_or_init_sharedstreams_client().await
     }
 
+    /// Reports whether any device on this Apple account OTHER than us is
+    /// registered to relay text messages — Apple's Text Message Forwarding.
+    ///
+    /// This mirrors, exactly, how a carrier send resolves its targets
+    /// (aps_client.rs `send`): an SMS-flagged message is retargeted to our OWN
+    /// handle, queried on the `com.apple.private.alloy.sms` topic with the same
+    /// QueryOptions the send uses, and the resulting delivery handles then have
+    /// our own push token removed ("do not send to self",
+    /// identity_manager.rs:922-926). Whatever remains is the set of devices that
+    /// would actually carry the text. If that set is empty the send still returns
+    /// Ok with an empty target list, and the message is silently discarded — which
+    /// is the failure this predicate exists to detect.
+    ///
+    /// Deliberately NOT keyed off PrivateDeviceInfo::sub_services. That field is
+    /// populated from the dependent-registration response (user.rs:870) but is
+    /// never consulted by rustpush for routing — the only routing uses of
+    /// sub_services are on the static IDSService definition, describing which
+    /// topics we register for. Reading relay capability out of it would be our own
+    /// invention rather than what Apple actually routes on.
+    ///
+    /// Errs toward TRUE on every failure shape — lookup error, caught panic, and
+    /// an absent or stale cache entry. Claiming a relay exists only preserves
+    /// today's behaviour, whereas a wrong FALSE refuses a deliverable message.
+    /// Only a fresh IDS answer that names no other device returns false.
+    pub async fn has_sms_relay(&self, handle: String) -> bool {
+        const SMS_TOPIC: &str = "com.apple.private.alloy.sms";
+
+        // Prime the cache through the guarded seam, as validate_targets does, so a
+        // panicking lookup cannot take the process down. Same QueryOptions the send
+        // uses, so we are asking the question the send asks.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            SMS_TOPIC,
+            std::slice::from_ref(&handle),
+            &handle,
+            false,
+            &rustpush::ids::user::QueryOptions { required_for_message: true, result_expected: true },
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        )
+        .await;
+        // Both failure shapes, not just `error`. A one-element target list can
+        // never exceed MAX_QUARANTINE_PER_PASS, so a caught panic lands in
+        // `poisoned` with `error` left None (ids_guard.rs classify_and_record) —
+        // reading only `error` would take a panicked lookup as a definitive "no
+        // relay" and refuse a deliverable message.
+        if let Some(err) = &report.error {
+            info!("has_sms_relay: relay lookup failed, assuming a relay exists: {}", err);
+            return true;
+        }
+        if !report.poisoned.is_empty() {
+            info!("has_sms_relay: relay lookup panicked and was quarantined, assuming a relay exists");
+            return true;
+        }
+
+        let my_token = self.conn.get_token().await;
+        let cache = self.client.identity.cache.lock().await;
+
+        // An empty get_keys cannot tell "IDS says there are no relay devices" from
+        // "nothing was cached" — no entry, expired entry, or a response that named
+        // no URIs all read the same. Only a FRESH entry licenses a negative answer;
+        // anything else means the question went unanswered. This also closes the
+        // race where a "devices changed" APS notification invalidates the cache
+        // between the lookup and this read — which is exactly when a user has just
+        // switched text forwarding on.
+        if !cache.does_not_need_refresh(SMS_TOPIC, &handle, &handle, false) {
+            info!("has_sms_relay: no fresh relay entry cached, assuming a relay exists");
+            return true;
+        }
+
+        let relays = cache
+            .get_keys(SMS_TOPIC, &handle, &handle)
+            .into_iter()
+            .filter(|data| data.push_token != my_token)
+            .count();
+        drop(cache);
+
+        if relays == 0 {
+            info!("has_sms_relay: IDS reports no text-message relay on this account");
+            return false;
+        }
+        true
+    }
+
     pub async fn validate_targets(
         &self,
         targets: Vec<String>,
@@ -9827,7 +9917,14 @@ impl Client {
         match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
-                // iMessage failed — no IDS targets. Retry as SMS (without rich link).
+                // iMessage failed — no IDS targets. Falling back to SMS is what an
+                // iPhone does, but it only delivers if a device on this account
+                // relays text messages. Without one the retry is accepted by Apple
+                // and silently discarded, and we would return Ok for a message that
+                // never went anywhere. Fail instead so the bridge can surface it.
+                if !self.has_sms_relay(handle.clone()).await {
+                    return Err(WrappedError::NoSmsRelay);
+                }
                 info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
                 let sms_service = MessageType::SMS {
                     is_phone: false,
@@ -10594,6 +10691,11 @@ impl Client {
         match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+                // See send_message: an SMS fallback with no relay on the account is
+                // accepted by Apple and discarded, so fail rather than report Ok.
+                if !self.has_sms_relay(handle.clone()).await {
+                    return Err(WrappedError::NoSmsRelay);
+                }
                 info!("No IDS targets for attachment, falling back to SMS for {:?}", conv.participants);
                 let sms_service = MessageType::SMS {
                     is_phone: false,

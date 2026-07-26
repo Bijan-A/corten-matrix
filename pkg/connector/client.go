@@ -255,6 +255,36 @@ type IMClient struct {
 	// indistinguishable from a single user catching up on chats.
 	statusKitIDSGate idsRateGate
 
+	// carrierCheckedAt is the last time an outbound carrier-route check issued an
+	// IDS lookup for a portal that came back unreachable. It bounds Apple traffic
+	// to at most one lookup per portal per carrierCheckTTL no matter how many
+	// messages the user sends, independently of the Rust-side KeyCache — so an
+	// invalidation there (APNs "devices changed", a cache reset) cannot turn a
+	// burst of sends into a burst of lookups.
+	carrierCheckedAt map[string]time.Time
+	// carrierVerifiedAt records portals IDS has confirmed reachable on iMessage.
+	// Because the routing decision is per-send and nothing is persisted, this is
+	// what stops repeat sends to the same portal re-querying Apple.
+	carrierVerifiedAt map[string]time.Time
+	// carrierCheckLog holds the timestamps of recent carrier-route lookups so an
+	// absolute per-hour ceiling can be enforced across all portals at once.
+	carrierCheckLog []time.Time
+	// smsRelay* memoize whether this ACCOUNT has a text-message relay. Account
+	// scope, not portal scope, so one entry serves every portal.
+	smsRelayCheckedAt time.Time
+	smsRelayValue     bool
+	carrierCheckedMu  sync.Mutex
+
+	// sendPathIDSGate paces the carrier-flag re-verification lookup that
+	// checkCarrierRoute runs before an outbound send is routed to the SMS
+	// relay. Kept separate from statusKitIDSGate so a noisy background
+	// presence sweep can never stall a user-initiated send behind its
+	// backoff (or vice versa). Volume here is inherently tiny: the lookup
+	// only fires for carrier-flagged 1:1 DMs, and the Rust KeyCache absorbs
+	// repeats (an empty answer for an hour, a non-empty one until Apple's
+	// session token expires, normally much longer).
+	sendPathIDSGate idsRateGate
+
 	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
 	// album for this session. The Shared Streams watcher uses it to suppress
 	// false-positive "new content" notices from Apple's getchanges endpoint,
@@ -6162,6 +6192,40 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	conv := c.portalToConversation(msg.Portal)
 
+	// A stale carrier flag would route this into the SMS relay, where a bridge
+	// with no forwarding device silently drops it. Override for THIS send only:
+	// the evidence (the peer is registered on iMessage now) does not justify
+	// changing what retro-active operations on older messages do, so nothing here
+	// writes the portal's stored flag.
+	//
+	// The flag may still change later, by a different and better-evidenced route:
+	// the iMessage this produces becomes a CloudKit chat record, and
+	// resolvePortalIDForCloudChat keys a DM purely on the handle, so ingestCloudChats
+	// can settle the portal on iMessage via the pre-existing a96678a3 path. That is
+	// driven by "Apple accepted and recorded an iMessage", not by our lookup.
+	//
+	// Set before the file branch so it covers attachments too; handleMatrixFile
+	// takes conv as a parameter.
+	if c.checkCarrierRoute(ctx, msg.Portal) {
+		conv.IsSms = false
+	}
+
+	// Still headed for the text-message relay after the check above. If no device
+	// on this account is registered to relay, Apple accepts the push and discards
+	// it, so reporting a checkmark would be a lie — fail visibly instead. Asked of
+	// IDS rather than inferred or configured, and memoized per account in
+	// hasSMSRelay. Placed after the repair, so a portal that just routed over
+	// iMessage is unaffected, and before the file branch so it covers attachments.
+	//
+	// Deliberately has no group exclusion, unlike the repair above. A carrier
+	// GROUP send with no relay is exactly as undeliverable as a DM one, and
+	// failing it is honest; the repair excludes groups only because re-keying one
+	// is a portal re-ID rather than a flag flip. Groups have no repair path, so
+	// this is their only protection.
+	if conv.IsSms && !c.hasSMSRelay() {
+		return nil, errNoCarrierRoute
+	}
+
 	// File/image messages
 	if msg.Content.URL != "" || msg.Content.File != nil {
 		return c.handleMatrixFile(ctx, msg, conv)
@@ -6180,12 +6244,18 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
 	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
+		// rustpush retried an unreachable iMessage as SMS and found no relay to
+		// carry it. Surface the same explanation as the pre-send guard rather than
+		// a bare wrapped error, which would reach the user with no message at all.
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
 	zerolog.Ctx(ctx).Info().
 		Str("uuid", uuid).
 		Str("portal_id", string(msg.Portal.ID)).
-		Bool("is_sms", c.isPortalSMS(string(msg.Portal.ID))).
+		Bool("is_sms", conv.IsSms).
 		Msg("Message sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
@@ -6433,6 +6503,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// UUID — no Go-side retry here (would orphan delivery receipts).
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
 	// Persist UUID immediately so echo detection works even if the portal
@@ -6602,6 +6675,16 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
@@ -6634,6 +6717,16 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
@@ -6733,6 +6826,16 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		return nil, bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
 
@@ -6792,6 +6895,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check; see HandleMatrixReaction.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
 

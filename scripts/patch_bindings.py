@@ -7,10 +7,23 @@ def patch(content: str) -> str:
     # 1. Add CGO LDFLAGS (platform-specific)
     content = content.replace(
         '// #include <rustpushgo.h>\nimport "C"',
+        # NOTE: librustpushgo.a vendors OpenSSL statically (Cargo.toml: openssl
+        # features = ["vendored"]), so the linux flags intentionally omit
+        # -lssl/-lcrypto. That keeps the binary self-contained and lets it
+        # cross-link via zig, which has no Linux OpenSSL on the build host.
+        # -lunwind is required there for the same reason. This block used to be a
+        # hand-edit applied after every regen; emitting it here is what stops
+        # `make bindings` silently reverting it and breaking the Linux build.
+        '// NOTE: librustpushgo.a vendors OpenSSL statically, so the linux cgo flags below\n'
+        '// intentionally omit -lssl/-lcrypto. That keeps the binary self-contained and\n'
+        '// lets it cross-link via zig (no Linux OpenSSL on the build host). Keep this as a\n'
+        '// normal Go comment ABOVE the cgo preamble — prose inside the preamble is parsed\n'
+        '// as C source by cgo and breaks the build.\n'
+        '\n'
         '// #include <rustpushgo.h>\n'
-        '// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz\n'
-        '// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv\n'
-        '// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv\n'
+        '// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm\n'
+        '// #cgo darwin LDFLAGS: -lz -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv\n'
+        '// #cgo linux LDFLAGS: -lpthread -lresolv -lunwind\n'
         'import "C"'
     )
 
