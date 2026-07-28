@@ -8399,8 +8399,33 @@ impl Client {
                 return;
             }
         };
-        match profiles.get_record(&share_msg).await {
-            Ok(record) => {
+        // `ProfilesClient::get_record` bottoms out in rustpush's
+        // `FetchedRecords::get_record` (icloud/cloudkit.rs), which returns `R`
+        // rather than `Result<R>` and therefore can ONLY panic when the record
+        // is absent — `.expect("No record found?")`. That is a routine outcome
+        // here in two ways: the peer may have rotated or deleted their shared
+        // profile record after we cached its key, and — because the `poster`
+        // field above is SYNTHESISED as `Some(..)` purely to set the fetch
+        // flag — we additionally request the separate `{record_key}-wp`
+        // wallpaper record, which frequently does not exist at all.
+        //
+        // This runs on the APNs *process task*. An escaping panic unwinds that
+        // whole task, so the drain task's next `tx.send` fails ("Process task
+        // gone, stopping drain"), the drain task breaks, and NOTHING consumes
+        // APNs frames until the Go-side receive-wedge watchdog rebuilds the
+        // client ~10 minutes later. Every message Apple pushes in that window
+        // is lost. The panic itself was invisible because the process-wide
+        // panic hook silences everything from icloud/cloudkit.rs.
+        //
+        // Mirror the guard `fetch_profile` already uses: turn the panic into a
+        // logged failure. The keys stay on the wrapped message, so the
+        // Go-side periodic refresh can still recover the profile later.
+        let has_poster_flag = share_msg.poster.is_some();
+        use futures::FutureExt;
+        let fetch_fut = profiles.get_record(&share_msg);
+        let fetched = std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await;
+        match fetched {
+            Ok(Ok(record)) => {
                 info!(
                     "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
                     key_prefix,
@@ -8412,12 +8437,22 @@ impl Client {
                 wrapped.share_profile_last_name = Some(record.name.last);
                 wrapped.share_profile_avatar = record.image;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     "inline ShareProfile fetch failed (record_key={}…, has_poster={}): {:?}",
                     key_prefix,
-                    share_msg.poster.is_some(),
+                    has_poster_flag,
                     e
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, has_poster={}) — \
+                     likely the profile record was rotated/deleted, or the companion '-wp' poster record does \
+                     not exist; treating as a fetch error. Before this guard, the panic unwound the APNs \
+                     process task and stalled ALL message receiving until the wedge watchdog fired.",
+                    key_prefix,
+                    has_poster_flag
                 );
             }
         }
