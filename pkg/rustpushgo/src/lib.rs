@@ -6300,17 +6300,16 @@ async fn download_icon_change_photo(
 ) {
     if let Message::IconChange(change) = &msg_inst.message {
         if let Some(mmcs_file) = &change.file {
-            let att = Attachment {
-                a_type: AttachmentType::MMCS(mmcs_file.clone()),
-                part: 0,
-                uti_type: String::new(),
-                mime: String::from("image/jpeg"),
-                name: String::from("group_photo"),
-                iris: false,
-            };
-            let mut buf: Vec<u8> = Vec::new();
-            match att.get_attachment(conn, &mut buf, |_, _| {}).await {
-                Ok(()) => {
+            // Route through the manual Ford path download_mmcs_attachments
+            // already uses. Calling rustpush's get_attachment here bottoms out
+            // in get_mmcs, which panics on a Ford chunk with no key
+            // (mmcs.rs:1059) and again on a non-2xx getComplete *after* a
+            // successful transfer (mmcs.rs:1157). On the APNs process task
+            // either one unwinds the whole receive loop, invisibly — the panic
+            // hook drops mmcs.rs panics. The manual path returns an error
+            // instead, and downloads the photos get_mmcs could not.
+            match download_one_mmcs_attachment(mmcs_file, conn, "group_photo").await {
+                Ok(buf) => {
                     info!("Downloaded group photo via MMCS ({} bytes)", buf.len());
                     wrapped.icon_change_photo_data = Some(buf);
                 }
@@ -8374,18 +8373,13 @@ impl Client {
             (Some(rk), Some(dk)) => (rk.clone(), dk.clone(), wrapped.share_profile_has_poster),
             _ => return,
         };
+        // `poster` gates upstream's extra fetch of the `{record_key}-wp`
+        // wallpaper record (name_photo_sharing.rs:288). We only ever use the
+        // name and avatar, so never ask for it; `has_poster` is log-only here.
         let share_msg = rustpush::ShareProfileMessage {
             cloud_kit_record_key: record_key,
             cloud_kit_decryption_record_key: decryption_key,
-            poster: if has_poster {
-                Some(rustpush::SharedPoster {
-                    low_res_wallpaper_tag: vec![],
-                    wallpaper_tag: vec![],
-                    message_tag: vec![],
-                })
-            } else {
-                None
-            },
+            poster: None,
         };
 
         let key_prefix: String = share_msg.cloud_kit_record_key.chars().take(8).collect();
@@ -8399,32 +8393,15 @@ impl Client {
                 return;
             }
         };
-        // `ProfilesClient::get_record` bottoms out in rustpush's
-        // `FetchedRecords::get_record` (icloud/cloudkit.rs), which returns `R`
-        // rather than `Result<R>` and therefore can ONLY panic when the record
-        // is absent — `.expect("No record found?")`. That is a routine outcome
-        // here in two ways: the peer may have rotated or deleted their shared
-        // profile record after we cached its key, and — because the `poster`
-        // field above is SYNTHESISED as `Some(..)` purely to set the fetch
-        // flag — we additionally request the separate `{record_key}-wp`
-        // wallpaper record, which frequently does not exist at all.
-        //
-        // This runs on the APNs *process task*. An escaping panic unwinds that
-        // whole task, so the drain task's next `tx.send` fails ("Process task
-        // gone, stopping drain"), the drain task breaks, and NOTHING consumes
-        // APNs frames until the Go-side receive-wedge watchdog rebuilds the
-        // client ~10 minutes later. Every message Apple pushes in that window
-        // is lost. The panic itself was invisible because the process-wide
-        // panic hook silences everything from icloud/cloudkit.rs.
-        //
-        // Mirror the guard `fetch_profile` already uses: turn the panic into a
-        // logged failure. The keys stay on the wrapped message, so the
-        // Go-side periodic refresh can still recover the profile later.
-        let has_poster_flag = share_msg.poster.is_some();
+        // The same `.expect("No record found?")` fetch_profile guards below,
+        // but on the APNs process task: an escaping panic unwinds it, the
+        // drain task dies with "Process task gone", and nothing consumes APNs
+        // frames until the Go wedge watchdog rebuilds ~10 min later — with no
+        // trace, since the panic hook drops cloudkit.rs panics. Keys stay on
+        // the wrapped message for the Go-side fallback.
         use futures::FutureExt;
         let fetch_fut = profiles.get_record(&share_msg);
-        let fetched = std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await;
-        match fetched {
+        match std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await {
             Ok(Ok(record)) => {
                 info!(
                     "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
@@ -8440,19 +8417,13 @@ impl Client {
             Ok(Err(e)) => {
                 warn!(
                     "inline ShareProfile fetch failed (record_key={}…, has_poster={}): {:?}",
-                    key_prefix,
-                    has_poster_flag,
-                    e
+                    key_prefix, has_poster, e
                 );
             }
             Err(_) => {
                 warn!(
-                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, has_poster={}) — \
-                     likely the profile record was rotated/deleted, or the companion '-wp' poster record does \
-                     not exist; treating as a fetch error. Before this guard, the panic unwound the APNs \
-                     process task and stalled ALL message receiving until the wedge watchdog fired.",
-                    key_prefix,
-                    has_poster_flag
+                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, has_poster={}) — record rotated/deleted; treating as a fetch error",
+                    key_prefix, has_poster
                 );
             }
         }
@@ -9592,18 +9563,9 @@ impl Client {
         let share_msg = rustpush::ShareProfileMessage {
             cloud_kit_record_key: record_key,
             cloud_kit_decryption_record_key: decryption_key,
-            poster: if has_poster {
-                // Minimal poster struct — the fetch path only checks
-                // `poster.is_some()` to decide whether to pull the wallpaper
-                // record alongside the profile record.
-                Some(rustpush::SharedPoster {
-                    low_res_wallpaper_tag: vec![],
-                    wallpaper_tag: vec![],
-                    message_tag: vec![],
-                })
-            } else {
-                None
-            },
+            // Always None — see populate_inline_share_profile. `has_poster`
+            // stays in the signature (uniffi export) but is now log-only.
+            poster: None,
         };
         // The cloudkit.rs `FetchedRecords::get_record` does
         // `.expect("No record found?")` when CloudKit returns a response
