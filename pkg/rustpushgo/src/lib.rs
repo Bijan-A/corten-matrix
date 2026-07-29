@@ -6300,21 +6300,38 @@ async fn download_icon_change_photo(
 ) {
     if let Message::IconChange(change) = &msg_inst.message {
         if let Some(mmcs_file) = &change.file {
-            // Route through the manual Ford path download_mmcs_attachments
-            // already uses. Calling rustpush's get_attachment here bottoms out
-            // in get_mmcs, which panics on a Ford chunk with no key
-            // (mmcs.rs:1059) and again on a non-2xx getComplete *after* a
-            // successful transfer (mmcs.rs:1157). On the APNs process task
-            // either one unwinds the whole receive loop, invisibly — the panic
-            // hook drops mmcs.rs panics. The manual path returns an error
-            // instead, and downloads the photos get_mmcs could not.
-            match download_one_mmcs_attachment(mmcs_file, conn, "group_photo").await {
-                Ok(buf) => {
+            let att = Attachment {
+                a_type: AttachmentType::MMCS(mmcs_file.clone()),
+                part: 0,
+                uti_type: String::new(),
+                mime: String::from("image/jpeg"),
+                name: String::from("group_photo"),
+                iris: false,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            // rustpush's get_mmcs panics on a Ford chunk with no key
+            // (mmcs.rs:1059) and on a non-2xx getComplete *after* a successful
+            // transfer (:1157). On the APNs process task either one unwinds
+            // the receive loop, and the panic hook hides it. Catch and drop
+            // the photo: buf may well hold a complete image in the getComplete
+            // case, but IMessageContainer decrypts progressively, so a
+            // truncated buf is indistinguishable from a whole one and
+            // salvaging it would ship corrupt avatars to Matrix.
+            let result = {
+                use futures::FutureExt;
+                let fut = att.get_attachment(conn, &mut buf, |_, _| {});
+                std::panic::AssertUnwindSafe(fut).catch_unwind().await
+            };
+            match result {
+                Ok(Ok(())) => {
                     info!("Downloaded group photo via MMCS ({} bytes)", buf.len());
                     wrapped.icon_change_photo_data = Some(buf);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("Failed to download group photo via MMCS: {}", e);
+                }
+                Err(_) => {
+                    error!("Group photo MMCS download panicked in upstream rustpush — dropping the photo to keep the receive loop alive");
                 }
             }
         }
@@ -8422,7 +8439,7 @@ impl Client {
             }
             Err(_) => {
                 warn!(
-                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, has_poster={}) — record rotated/deleted; treating as a fetch error",
+                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, has_poster={}) — record likely rotated/deleted; treating as a fetch error",
                     key_prefix, has_poster
                 );
             }
