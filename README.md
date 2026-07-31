@@ -1,13 +1,12 @@
 # Corten-Matrix
 
-> **This is a fork** of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix), tracking upstream release **1.1.0**, and it is **macOS-only** — see [Linux is not supported here](#linux-is-not-supported-here).
+> **A community-maintained continuation of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)**, tracking upstream release **1.1.0**.
 >
-> It adds two things:
+> Upstream is a hobby project and has paused incoming pull requests. This fork exists so patches have somewhere to go — **issues and pull requests are welcome here**. See [Contributing](#contributing).
 >
-> - **A CloudKit panic guard.** An unguarded `get_record` in the inline ShareProfile path could panic on the APNs process task. That killed the drain task (`Process task gone, stopping drain`), and nothing consumed APNs frames until the receive-wedge watchdog rebuilt the client ~10 minutes later — every message Apple pushed in that window was lost. From [upstream PR #70](https://github.com/lrhodin/corten-matrix/pull/70), which was not merged.
-> - **`update` for source builds.** Upstream's `update` exists only in its official prebuilt binaries. Here it works either way: it rebuilds your checkout if you have one, and downloads the newest release if you don't. See [Updating](#updating).
+> **macOS only.** Upstream's Linux support depends on components that aren't in the public source tree, so this fork can't build or ship it — see [Linux is not supported here](#linux-is-not-supported-here).
 >
-> Upstream is not accepting pull requests and its own tooling recommends forking — that is what this is. Everything below is upstream's documentation, corrected where this fork differs.
+> [Differences from upstream](#differences-from-upstream) lists what has changed since 1.1.0.
 
 A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
 
@@ -16,6 +15,16 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, **FaceTime calls** (web join links — works from non-Apple platforms), **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
 
 **Platforms**: **macOS 13+ only** in this fork. Upstream also supports Linux via a hardware key extracted from a Mac; this fork cannot build or ship that — see [Linux is not supported here](#linux-is-not-supported-here). Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
+
+## Differences from upstream
+
+This tree is upstream **1.1.0** plus the changes below. Everything else — features, configuration, behaviour — is upstream's, and so is most of this README.
+
+| Change | What it does |
+|---|---|
+| `update` works in source builds | Upstream ships `update` only in its official prebuilt binaries. Here it works either way: it rebuilds your checkout if you have one, and downloads the newest release if you don't. See [Updating](#updating). |
+| Inline ShareProfile CloudKit panic guard | An unguarded `get_record` could panic on the APNs process task, killing the drain task (`Process task gone, stopping drain`) so nothing consumed APNs frames until the receive-wedge watchdog rebuilt the client ~10 minutes later. Messages Apple pushed in that window were lost. From [upstream PR #70](https://github.com/lrhodin/corten-matrix/pull/70), which was not merged. |
+| macOS-only releases | Universal binaries (arm64 + x86_64) built in CI. Linux is not buildable from this tree — see [Linux is not supported here](#linux-is-not-supported-here). |
 
 ## How it's distributed
 
@@ -666,6 +675,33 @@ scripts/                                    # Setup scripts, embedded into the b
 - **A downloaded binary won't launch ("killed").** Releases are ad-hoc signed and not notarized, so macOS quarantines them: run `xattr -cr corten-matrix-macos` before the first launch. If you replaced an existing binary in place, see the `rm`-before-`cp` warning under [Coming from upstream](#coming-from-upstream-corten-matrix) — a `CODESIGNING` crash looks identical.
 - **Reading logs.** `corten-matrix logs` (or `logs 1` for the second account) pretty-prints the live log. On disk, `logs/bridge.log` is structured JSON (rotated), and raw process stdout / crash output lands in `logs/bridge.stdout.log` — per account under `~/.local/share/corten-matrix/` and `~/.local/share/corten-matrix-1/`.
 - **Is it running at all?** `corten-matrix status`, then `corten-matrix restart` if needed — raw `launchctl` / `systemctl` equivalents are under [Management](#management).
+
+## Contributing
+
+Pull requests and issues are welcome — that is the point of this repository. There is no CLA, no required issue-before-PR, and no fixed review cadence; small, focused patches get looked at fastest.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full version. The short one:
+
+**You need a Mac.** macOS 13+, Xcode Command Line Tools, and a checkout path without spaces. The bridge builds only on macOS because NAC validation data comes from Apple's `AAAbsintheContext`.
+
+```bash
+git clone https://github.com/Bijan-A/corten-matrix.git
+cd corten-matrix
+make
+go test ./pkg/... ./imessage/...
+```
+
+On Intel Macs add `CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"` — the Makefile hardcodes the Apple Silicon Homebrew prefix.
+
+**Before opening a PR**
+
+- Build it and run the tests. CI builds arm64 on every tagged release, but it won't catch a broken build before then.
+- Keep Rust changes in `pkg/rustpushgo/src/lib.rs` as small as you can. It is the FFI surface, a panic there can take down the APNs receive loop, and it is the hardest part to review.
+- Never hand-edit `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h` — they are generated. See [AGENTS.md](AGENTS.md).
+- Network config options must change in lockstep across `pkg/imconfig/example-config.yaml`, the `IMConfig` struct, and `upgradeConfig` — again, [AGENTS.md](AGENTS.md).
+- Say what you tested. "Ran it on my bridge for a day" is genuinely useful here; much of this code only misbehaves against live Apple servers.
+
+**Good first contributions**: anything you have already patched locally to make your own bridge work. That is how this fork started.
 
 ## Chat With Us
 
