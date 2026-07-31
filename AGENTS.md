@@ -4,12 +4,15 @@
 
 **Never hand-edit** `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h`. Always regenerate.
 
-### Linux / macOS
+### macOS
 
 ```bash
 make bindings   # requires uniffi-bindgen-go on PATH
 make build
 ```
+
+macOS only — see [the README](README.md#linux-is-not-supported-here) for why Linux cannot
+be built from this tree.
 
 Install `uniffi-bindgen-go` (must match UniFFI 0.25.0 as pinned in `pkg/rustpushgo/Cargo.toml`):
 ```bash
@@ -18,27 +21,15 @@ cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bin
 
 ### Windows
 
-The Makefile's `bindings` target hardcodes UNIX static-lib naming
-(`librustpushgo.a`). MSVC Rust emits `rustpushgo.lib` instead, so `make
-bindings` on Windows can't find the artifact. Use the Windows-native helper
-scripts under `dev/` instead:
+Not supported. The helper scripts this section used to describe (`dev\windows-dev-env.bat`,
+`dev\windows-bindings.bat`) are **not present in this tree**, and the Makefile hard-errors on
+any non-Darwin host anyway:
 
-```cmd
-dev\windows-dev-env.bat && dev\windows-bindings.bat
+```
+This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework.
 ```
 
-- `dev\windows-dev-env.bat` — one-shot environment bootstrap: vcvarsall,
-  LIB/INCLUDE, PATH (cargo, Strawberry Perl, CMake, Python, protoc, LLVM),
-  LIBCLANG_PATH, `python3` shim, and a first-run `cargo install` for
-  `uniffi-bindgen-go`. Idempotent — safe to re-run.
-- `dev\windows-bindings.bat` — mirrors `make bindings`: builds the crate if
-  the `.lib` is missing, runs `uniffi-bindgen-go` against `rustpushgo.lib`,
-  then runs `python3 scripts/patch_bindings.py`. Respects `CARGO_TARGET_DIR`
-  if set (so users with cloud-sync folders can redirect cargo output
-  elsewhere to avoid file-lock races on openssl-sys intermediates).
-
-The one-time winget installs needed for the dev-env script to work are
-documented at the top of `dev\windows-dev-env.bat`.
+Regenerate bindings on macOS with `make bindings`.
 
 ## Config
 

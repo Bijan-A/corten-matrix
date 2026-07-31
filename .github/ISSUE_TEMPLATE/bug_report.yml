@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in the bridge is not working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        **Please scrub logs before pasting.** The bridge scrubs message bodies by
+        default, but phone numbers, Apple IDs, and Matrix room IDs are *not*
+        scrubbed. Replace them with `+1555…` / `@you:example.com` as needed.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can it be reproduced?
+      description: >
+        Steps if you have them. If it is intermittent, say so and describe how
+        often — a lot of bugs here only show up against live Apple servers and
+        cannot be triggered on demand. "I could not reproduce it deliberately"
+        is a useful answer.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `corten-matrix --version`
+      placeholder: corten-matrix v0.1.0+dev... (built at ... with go...)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install it?
+      options:
+        - Downloaded a release binary
+        - Built from source
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and architecture
+      description: Output of `sw_vers -productVersion` and `uname -m`
+      placeholder: "14.5 / arm64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        Go-side logs are in `~/.local/share/corten-matrix/logs/bridge.log`
+        (structured JSON — `corten-matrix logs` renders it readably). Rust-side
+        logs, including panics and APNs receive-loop messages, are in
+        `logs/bridge.stdout.log`. Include both if you are unsure which matters.
+
+
+        If the bridge stopped receiving messages, please include what these return:
+
+        ```
+        grep -c "Process task gone" ~/.local/share/corten-matrix/logs/bridge.stdout.log
+        grep -c "receive_wedge_watchdog" ~/.local/share/corten-matrix/logs/bridge.log
+        ```
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I scrubbed phone numbers, Apple IDs, and room IDs from anything I pasted
+          required: true
+        - label: I am running macOS 13 or later (Linux is not supported here)
+          required: true
