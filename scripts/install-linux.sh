@@ -365,13 +365,21 @@ open('$CONFIG', 'w').write(text)
                 echo "ERROR: Password is required." >&2
                 exit 1
             fi
+            # Providers (Google, Fastmail, ...) display app passwords in
+            # space-separated groups for readability, but the actual secret
+            # has no spaces. Strip them so a verbatim copy-paste still works.
+            CARDDAV_PASSWORD="${CARDDAV_PASSWORD// /}"
 
-            # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            # Encrypt password and patch config. Args are built as an array
+            # (not a plain string) so the password is passed as a single
+            # argument even though it may contain shell-special characters —
+            # a plain "$CARDDAV_ARGS" expansion word-splits on whitespace and
+            # silently truncates the password at its first space/tab.
+            CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+                CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$("$BINARY" carddav-setup "${CARDDAV_ARGS[@]}" 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
