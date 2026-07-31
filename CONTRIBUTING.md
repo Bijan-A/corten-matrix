@@ -1,7 +1,7 @@
 # Contributing
 
-Pull requests and issues are welcome. This fork exists because upstream paused
-incoming PRs, so the whole point is that patches have somewhere to go.
+Pull requests and issues are welcome. This project continues from upstream, which
+has paused incoming PRs — the whole point here is that patches have somewhere to go.
 
 No CLA. No issue required before a PR. No fixed review cadence — small, focused
 changes get looked at fastest.
@@ -12,17 +12,17 @@ A Matrix ↔ iMessage bridge: Go (bridgev2) on top of a Rust core
 (`pkg/rustpushgo`) that wraps [rustpush](https://github.com/OpenBubbles/rustpush),
 joined by a UniFFI FFI boundary.
 
-Upstream is [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix).
-This tree tracks upstream **1.1.0**; see *Differences from upstream* in the
+It continues from [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)
+and tracks upstream **1.1.0**; see *Differences from upstream* in the
 [README](README.md#differences-from-upstream).
 
 ## You need a Mac
 
 **macOS 13+ (Ventura or later).** There is no way around this: NAC validation
 data is produced by Apple's `AAAbsintheContext` framework, which exists only on
-macOS. The Makefile refuses to run anywhere else. Linux support in upstream
-relies on closed-source crates that are not in this tree, so a Linux build is
-not possible here regardless of toolchain.
+macOS. The Makefile refuses to run anywhere else. Upstream's Linux support relies on
+closed-source crates that are not in this tree, so a Linux build is not possible
+here regardless of toolchain.
 
 You also need:
 
@@ -93,7 +93,7 @@ SHA at build time.
   than an overstated claim.
 
 Good first contributions: **anything you have already patched locally to make
-your own bridge work.** That is exactly how this fork started.
+your own bridge work.** That is exactly how this project started.
 
 ## Reporting bugs
 

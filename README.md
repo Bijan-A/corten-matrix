@@ -2,9 +2,9 @@
 
 > **A community-maintained continuation of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)**, tracking upstream release **1.1.0**.
 >
-> Upstream is a hobby project and has paused incoming pull requests. This fork exists so patches have somewhere to go — **issues and pull requests are welcome here**. See [Contributing](#contributing).
+> Upstream is a hobby project and has paused incoming pull requests. This project exists so patches have somewhere to go — **issues and pull requests are welcome here**. See [Contributing](#contributing).
 >
-> **macOS only.** Upstream's Linux support depends on components that aren't in the public source tree, so this fork can't build or ship it — see [Linux is not supported here](#linux-is-not-supported-here).
+> **macOS only.** Upstream's Linux support depends on components that aren't in the public source tree, so it can't be built or shipped here — see [Linux is not supported here](#linux-is-not-supported-here).
 >
 > [Differences from upstream](#differences-from-upstream) lists what has changed since 1.1.0.
 
@@ -14,7 +14,7 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, **FaceTime calls** (web join links — works from non-Apple platforms), **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
 
-**Platforms**: **macOS 13+ only** in this fork. Upstream also supports Linux via a hardware key extracted from a Mac; this fork cannot build or ship that — see [Linux is not supported here](#linux-is-not-supported-here). Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
+**Platforms**: **macOS 13+ only**. Upstream also supports Linux via a hardware key extracted from a Mac, which cannot be built from this tree — see [Linux is not supported here](#linux-is-not-supported-here). Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
 
 ## Differences from upstream
 
@@ -28,9 +28,9 @@ This tree is upstream **1.1.0** plus the changes below. Everything else — feat
 
 ## How it's distributed
 
-There are two ways to run this fork, and both are fully supported.
+There are two ways to run Corten-Matrix, and both are fully supported.
 
-**1. Download the binary** from [this fork's Releases page](https://github.com/Bijan-A/corten-matrix/releases). It is a self-contained universal macOS binary (`corten-matrix-macos`, arm64 + x86_64) that is both the bridge and its management CLI — nothing to compile.
+**1. Download the binary** from the [Releases page](https://github.com/Bijan-A/corten-matrix/releases). It is a self-contained universal macOS binary (`corten-matrix-macos`, arm64 + x86_64) that is both the bridge and its management CLI — nothing to compile.
 
 ```bash
 chmod +x corten-matrix-macos
@@ -48,7 +48,7 @@ After downloading the binary you run `corten-matrix setup` (self-hosted) or `cor
 
 ## Coming from upstream corten-matrix
 
-Already running an official corten-matrix build? Switching to this fork **keeps your data** — same config, same database, same login, **no re-backfill**. It is a binary swap, not a reinstall.
+Already running an upstream corten-matrix build? Switching **keeps your data** — same config, same database, same login, **no re-backfill**. It is a binary swap, not a reinstall.
 
 **1. Back up first.**
 
@@ -89,9 +89,9 @@ corten-matrix start && corten-matrix status
 
 macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
 
-> **Registering on a real Mac.** On macOS the bridge registers itself **natively** — validation data is generated on the spot by Apple's own frameworks, so there's **no key to extract**; just sign in. (Upstream's hardware-key extraction exists only to run the bridge on Linux, which this fork does not support.)
+> **Registering on a real Mac.** On macOS the bridge registers itself **natively** — validation data is generated on the spot by Apple's own frameworks, so there's **no key to extract**; just sign in. (Upstream's hardware-key extraction exists only to run the bridge on Linux, which is not supported here.)
 
-1. Download `corten-matrix-macos` from [this fork's Releases page](https://github.com/Bijan-A/corten-matrix/releases), make it executable (`chmod +x corten-matrix-macos`), and clear the quarantine flag (`xattr -cr corten-matrix-macos`). Rename it if you like — it is a universal binary (arm64 + x86_64). Or [build it yourself](#build-from-source-macos).
+1. Download `corten-matrix-macos` from the [Releases page](https://github.com/Bijan-A/corten-matrix/releases), make it executable (`chmod +x corten-matrix-macos`), and clear the quarantine flag (`xattr -cr corten-matrix-macos`). Rename it if you like — it is a universal binary (arm64 + x86_64). Or [build it yourself](#build-from-source-macos).
 2. Run setup:
 
    ```bash
@@ -108,7 +108,7 @@ macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the b
 
 ## Linux is not supported here
 
-Upstream ships Linux binaries. **This fork cannot**, and it is not a packaging problem — the code is not public.
+Upstream ships Linux binaries. **This project cannot**, and it is not a packaging problem — the code is not public.
 
 Linux needs the `cleanroom-registration` feature (`open-absinthe/native-nac-rust` + `remote-clearadi`) to produce NAC validation data without a Mac. Those crates are closed-source and are not vendored in this repository, so the public build selects `--no-default-features --features nac-apple-framework` instead, which uses Apple's native `AAAbsintheContext` — and that exists only on macOS. The Makefile refuses to even start on anything else:
 
@@ -118,7 +118,7 @@ This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext fram
 
 So there is no way to build or release a Linux binary from this tree, and the hardware-key extraction flow upstream documents does not apply here either.
 
-**If you need Linux**, use [upstream's releases](https://github.com/lrhodin/corten-matrix/releases). Those are built from code this fork does not have. The panic guard in this fork is a single Rust change; if you are comfortable maintaining your own build, it can be applied on top of upstream's private tree by whoever has access to it.
+**If you need Linux**, use [upstream's releases](https://github.com/lrhodin/corten-matrix/releases). Those are built from code this project does not have. The panic guard here is a single Rust change; if you are comfortable maintaining your own build, it can be applied on top of upstream's private tree by whoever has access to it.
 
 ## The `corten-matrix` CLI
 
@@ -140,7 +140,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
 | `corten-matrix help` | Show the command list. |
 
-> Unlike upstream, `update` is present in **source builds too** in this fork. Every subcommand also accepts a `--flag` spelling (`--check`, `--force`, …).
+> Unlike upstream, `update` is present in **source builds too**. Every subcommand also accepts a `--flag` spelling (`--check`, `--force`, …).
 
 The raw `launchctl` equivalents are in [Management](#management) if you'd rather wire your own tooling.
 
@@ -167,10 +167,10 @@ So **at most one** account can use chat.db backfill — the Apple ID signed into
 
 ## Updating
 
-`corten-matrix update` works in this fork **whether or not you built from source**. It has two modes and picks automatically:
+`corten-matrix update` works **whether or not you built from source**. It has two modes and picks automatically:
 
 - **A source checkout is present** → it rebuilds it: `git pull --ff-only`, `make`, then stop → swap → start.
-- **No checkout** (you downloaded a release binary) → it downloads the newest release from this fork, verifies the published SHA-256, and swaps it in.
+- **No checkout** (you downloaded a release binary) → it downloads the newest release from this repository, verifies the published SHA-256, and swaps it in.
 
 ```bash
 corten-matrix update           # auto: rebuild if a checkout exists, else download
@@ -187,7 +187,7 @@ Every word also accepts a `--flag` spelling (`--check`, `--force`, …), so both
 
 **Installing is atomic.** The new binary is staged alongside the target and renamed over it, which both avoids `ETXTBSY` and sidesteps the code-signature caching problem described under [Coming from upstream](#coming-from-upstream-corten-matrix). Your config, login, and data are untouched.
 
-Set `$CORTEN_RELEASE_REPO` to download releases from somewhere other than this fork.
+Set `$CORTEN_RELEASE_REPO` to download releases from a different repository.
 
 ## Login
 
@@ -210,7 +210,7 @@ To bridge SMS (green bubble) messages, enable forwarding on your iPhone:
 
 Incoming iMessages automatically create Matrix rooms. History backfill uses **CloudKit** by default — that's the modern, supported path and what almost everyone should pick.
 
-**Local chat.db** (`backfill_source: chatdb`) is a last-resort fallback for older macOS versions that can't run CloudKit backfill at all. Upstream's suggested workaround is to run the bridge on Linux instead, which this fork cannot do — so on a legacy Mac, `chatdb` is your only option here. It requires **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → add the bridge binary or Terminal) to read `~/Library/Messages/chat.db`. Without FDA the bridge can't read the file and chat.db backfill silently does nothing.
+**Local chat.db** (`backfill_source: chatdb`) is a last-resort fallback for older macOS versions that can't run CloudKit backfill at all. Upstream's suggested workaround is to run the bridge on Linux instead, which is not possible here — so on a legacy Mac, `chatdb` is your only option. It requires **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → add the bridge binary or Terminal) to read `~/Library/Messages/chat.db`. Without FDA the bridge can't read the file and chat.db backfill silently does nothing.
 
 ## Bridge commands
 
@@ -377,7 +377,7 @@ The bridge connects directly to Apple's iMessage servers using [rustpush](https:
 
 NAC validation runs entirely in-process on the host running the bridge:
 
-- **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework. This is the only path available in this fork.
+- **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework. This is the only path available here.
 - **Linux** (upstream only): validation data is generated locally from a hardware key extracted once from a Mac. That path needs closed-source crates absent from this tree — see [Linux is not supported here](#linux-is-not-supported-here).
 
 ```mermaid
@@ -466,7 +466,7 @@ corten-matrix uninstall
 
 ### Linux
 
-Not supported in this fork — see [Linux is not supported here](#linux-is-not-supported-here). Upstream's systemd instructions apply to [upstream's releases](https://github.com/lrhodin/corten-matrix/releases).
+Not supported — see [Linux is not supported here](#linux-is-not-supported-here). Upstream's systemd instructions apply to [upstream's releases](https://github.com/lrhodin/corten-matrix/releases).
 
 ## Configuration
 
@@ -701,7 +701,7 @@ On Intel Macs add `CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew
 - Network config options must change in lockstep across `pkg/imconfig/example-config.yaml`, the `IMConfig` struct, and `upgradeConfig` — again, [AGENTS.md](AGENTS.md).
 - Say what you tested. "Ran it on my bridge for a day" is genuinely useful here; much of this code only misbehaves against live Apple servers.
 
-**Good first contributions**: anything you have already patched locally to make your own bridge work. That is how this fork started.
+**Good first contributions**: anything you have already patched locally to make your own bridge work. That is how this project started.
 
 ## Chat With Us
 
