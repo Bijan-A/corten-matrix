@@ -33,7 +33,7 @@ This tree is upstream **1.1.0** plus the changes below. Everything else — feat
 | CardDAV app-password handling | The setup scripts now strip spaces from the CardDAV password and quote arguments properly — a password containing a space was previously truncated at the first one. See [External CardDAV](#external-carddav). |
 | Continuous integration | Every pull request and push to `master` builds the whole tree on macOS and runs `go vet` plus the test suite. It also greps the compiled binary for the panic guard strings, so a change that silently drops them fails CI instead of surfacing months later as a wedged receive loop. Upstream's public tree has no CI workflows. |
 | Open to contributions | Upstream closes external pull requests automatically. Issues and PRs are accepted here — see [Contributing](#contributing). |
-| Automated macOS releases | Pushing a `v*` tag builds and publishes a universal binary (arm64 + x86_64) with a SHA-256 checksum, which `update` verifies before installing. Linux is not buildable from this tree — see [Linux is not supported here](#linux-is-not-supported-here). |
+| macOS release pipeline | Pushing a `v*` tag builds the arm64 slice in CI; a maintainer combines it with a locally built x86_64 slice into a universal binary with a SHA-256 checksum, which `update` verifies before installing. GitHub never assigns this repo an Intel runner, so the second slice is built by hand — see Releases in [CONTRIBUTING.md](CONTRIBUTING.md). Linux is not buildable from this tree at all — see [Linux is not supported here](#linux-is-not-supported-here). |
 
 ## How it's distributed
 

@@ -114,6 +114,93 @@ If the bridge stopped receiving, `grep` for `Process task gone` and
 
 ## Releases
 
-Tagging `v*` builds a universal macOS binary in CI and publishes it. Linux is
-not built — see the README. Only maintainers can tag; you do not need to think
-about this for a normal PR.
+Maintainers only — you do not need this for a normal PR.
+
+A release is a **universal macOS binary** (arm64 + x86_64) plus a SHA-256
+checksum. It is built in two halves, for a reason worth stating plainly:
+
+- **arm64** is built in CI, on the `macos-14` runner.
+- **x86_64** is built by hand on an Intel Mac.
+
+GitHub's `macos-13` image is the only Intel runner, and it has **never once been
+assigned to this repository** — six consecutive attempts, each queued
+indefinitely without starting. So CI builds the slice it can and hands over. A
+job that hangs forever is worse than one that doesn't exist.
+
+Cross-compiling the second slice isn't an option either: this is a CGO project
+linking `libolm` and `libheif` from Homebrew, which is single-arch, so an
+x86_64 link on an arm64 host fails at the linker.
+
+### Cutting a release
+
+**1. Tag it.** This starts the arm64 build.
+
+```bash
+git tag -a v1.1.2 -m "corten-matrix 1.1.2" && git push origin v1.1.2
+```
+
+Wait for *Release (arm64 slice)* to finish (~9 minutes warm). Its run summary
+prints the exact commands for the rest, with the run ID already filled in.
+
+**2. Build the x86_64 slice** on an Intel Mac, at the same tag:
+
+```bash
+cd ~/src/corten-matrix
+git fetch origin --tags && git checkout v1.1.2
+make VERSION=1.1.2 CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"
+file corten-matrix        # must say x86_64
+```
+
+`VERSION` is not optional. Without it the binary reports the Makefile's
+hardcoded default and `corten-matrix update` cannot tell releases apart. The
+CGO overrides matter on Intel because the Makefile hardcodes `/opt/homebrew`,
+which only exists on Apple Silicon.
+
+**3. Combine, sign, checksum:**
+
+```bash
+cd ~ && rm -rf ~/ci-arm64
+gh run download <RUN_ID> --repo <owner>/corten-matrix --name corten-matrix-arm64 --dir ~/ci-arm64
+lipo -create -output corten-matrix-macos ~/ci-arm64/corten-matrix ~/src/corten-matrix/corten-matrix
+codesign --force --sign - --identifier com.lrhodin.corten-matrix corten-matrix-macos
+codesign --verify --verbose=2 corten-matrix-macos
+lipo -info corten-matrix-macos          # must list BOTH x86_64 and arm64
+chmod +x corten-matrix-macos && ./corten-matrix-macos --version
+shasum -a 256 corten-matrix-macos > corten-matrix-macos.sha256
+```
+
+> **The re-sign is mandatory.** `lipo` rewrites the Mach-O container, which
+> invalidates the ad-hoc signatures on both input slices. Skip it and every
+> user gets `zsh: killed` on first launch. Keep the identifier exactly
+> `com.lrhodin.corten-matrix` — macOS/TCC tracks Full Disk Access by it, and
+> changing it makes users re-grant permission.
+
+**4. Publish:**
+
+```bash
+gh release create v1.1.2 corten-matrix-macos corten-matrix-macos.sha256 \
+  --repo <owner>/corten-matrix --title "v1.1.2" --generate-notes
+```
+
+The asset **must** be named `corten-matrix-macos` — that is the name
+`corten-matrix update` looks for. The `.sha256` companion is optional but
+`update` verifies against it when present and refuses to install on a mismatch.
+
+**5. Put the checkout back:**
+
+```bash
+cd ~/src/corten-matrix && git checkout master
+```
+
+Left on a detached tag, `corten-matrix update` would rebuild from that tag, and
+its `git pull --ff-only` fails on a detached HEAD.
+
+### Verifying a release
+
+Worth doing once from an installed binary, since it exercises the download path
+users take:
+
+```bash
+corten-matrix update release check    # should offer the new version
+corten-matrix update release          # downloads, verifies sha256, swaps, restarts
+```
