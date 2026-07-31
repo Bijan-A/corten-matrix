@@ -38,7 +38,10 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     strategy:
-      fail-fast: true
+      # Don't let a failing Intel slice kill the arm64 one: an arm64-only
+      # release still works for Apple Silicon, and the package job below
+      # degrades to a thin binary rather than publishing nothing.
+      fail-fast: false
       matrix:
         include:
           # macos-14+ runners are Apple Silicon; macos-13 is the last Intel
@@ -80,10 +83,20 @@ jobs:
           restore-keys: cargo-${{ matrix.arch }}-
 
       - name: Build
-        # VERSION is a simple `:=` assignment, so a command-line override wins.
-        # Without it every release would report the Makefile's hardcoded 0.1.0
-        # and `update` could never tell versions apart.
-        run: make VERSION="${RAW_TAG#v}"
+        run: |
+          set -euo pipefail
+          # The Makefile hardcodes /opt/homebrew (Apple Silicon). On the Intel
+          # runner Homebrew lives at /usr/local, so the default CGO flags would
+          # miss olm/olm.h and the x86_64 slice would never link. All three are
+          # simple `:=` assignments, so command-line overrides win.
+          #
+          # VERSION matters too: without it every release reports the
+          # Makefile's hardcoded 0.1.0 and `update` cannot tell versions apart.
+          BREW="$(brew --prefix)"
+          echo "homebrew prefix: $BREW"
+          make VERSION="${RAW_TAG#v}" \
+            CGO_CFLAGS="-I${BREW}/include" \
+            CGO_LDFLAGS="-L${BREW}/lib -L${PWD}"
 
       - name: Verify the binary
         run: |
@@ -104,7 +117,14 @@ jobs:
             echo "::error::update subcommand not advertised in help"; exit 1; }
 
       - name: Run Go tests
-        run: go test ./pkg/connector/... ./imessage/...
+        run: |
+          set -euo pipefail
+          # pkg/connector links librustpushgo.a (left in the repo root by
+          # `make`), so its tests need the same CGO flags the build used —
+          # without them the test binary won't link.
+          BREW="$(brew --prefix)"
+          CGO_CFLAGS="-I${BREW}/include" CGO_LDFLAGS="-L${BREW}/lib -L${PWD}" \
+            go test ./pkg/connector/... ./imessage/...
 
       - uses: actions/upload-artifact@v4
         with:
@@ -116,6 +136,9 @@ jobs:
   package:
     name: Universal binary
     needs: build
+    # Run even if one matrix slice failed, so a dead Intel runner degrades to
+    # an arm64-only release instead of blocking the whole thing.
+    if: ${{ !cancelled() }}
     runs-on: macos-14
     steps:
       - uses: actions/download-artifact@v4
@@ -126,7 +149,18 @@ jobs:
         run: |
           set -euo pipefail
           slices=$(find slices -name corten-matrix -type f | sort)
-          echo "slices found:"; echo "$slices"
+          echo "slices found:"; echo "${slices:-none}"
+
+          # arm64 is non-negotiable: it's what current Macs run. Losing only
+          # the Intel slice is a degraded-but-useful release; losing arm64 is not.
+          if [ ! -f slices/corten-matrix-arm64/corten-matrix ]; then
+            echo "::error::arm64 slice missing — refusing to publish"
+            exit 1
+          fi
+          if [ ! -f slices/corten-matrix-x86_64/corten-matrix ]; then
+            echo "::warning::x86_64 slice missing — publishing an arm64-only binary (Intel Macs unsupported by this release)"
+          fi
+
           # shellcheck disable=SC2086
           lipo -create -output corten-matrix-macos $slices
           # lipo rewrites the Mach-O container, which invalidates the ad-hoc
