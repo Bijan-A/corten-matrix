@@ -24,6 +24,8 @@ This tree is upstream **1.1.0** plus the changes below. Everything else — feat
 |---|---|
 | `update` works in source builds | Upstream ships `update` only in its official prebuilt binaries. Here it works either way: it rebuilds your checkout if you have one, and downloads the newest release if you don't. See [Updating](#updating). |
 | Inline ShareProfile CloudKit panic guard | An unguarded `get_record` could panic on the APNs process task, killing the drain task (`Process task gone, stopping drain`) so nothing consumed APNs frames until the receive-wedge watchdog rebuilt the client ~10 minutes later. Messages Apple pushed in that window were lost. From [upstream PR #70](https://github.com/lrhodin/corten-matrix/pull/70), which was not merged. |
+| Postgres-compatible SQL | Several stores in `pkg/connector` used SQLite-only SQL that is invalid on Postgres. `BLOB` columns aborted `ensureSchema` on every startup with `type "blob" does not exist`, so **CloudKit backfill never ran at all** on a Postgres-backed bridge. Also fixes `pragma_table_info()`, `INSERT OR IGNORE`, `INSTR`, `rowid` ordering and `?` placeholders. From [#1](https://github.com/Bijan-A/corten-matrix/pull/1) by [@ajkessel](https://github.com/ajkessel), ported from upstream PR #71. |
+| CardDAV app-password handling | The setup scripts now strip spaces from the CardDAV password and quote arguments properly — a password containing a space was previously truncated at the first one. See [External CardDAV](#external-carddav). |
 | macOS-only releases | Universal binaries (arm64 + x86_64) built in CI. Linux is not buildable from this tree — see [Linux is not supported here](#linux-is-not-supported-here). |
 
 ## How it's distributed
@@ -528,6 +530,23 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `heic_jpeg_quality` | `95` | JPEG output quality (1–100) when HEIC conversion is enabled. |
 | `max_attachment_size_mb` | `100` | Skip attachments larger than this many MB — they're never downloaded, transcoded, or uploaded. The default matches Beeper's upload limit; the homeserver rejects anything larger, so bridging it just wastes bandwidth, CPU, and memory for a guaranteed rejection (and a multi-GB attachment can exhaust RAM on a small host, since attachments buffer in memory while downloading). Raise it **only** if your homeserver accepts bigger uploads — e.g. a self-hosted Synapse with a higher `max_upload_size` — **and** the host has the RAM to spare. On Beeper, raising it has no effect: the homeserver still rejects anything over 100 MB. |
 | `carddav.email` / `carddav.url` / `carddav.username` / `carddav.password_encrypted` | *(unset)* | External CardDAV server for contact name resolution (Google with app passwords, Nextcloud, Radicale, Fastmail, etc.). Set up via the setup flow's CardDAV prompt. When configured, used instead of iCloud contacts. |
+
+### External CardDAV
+
+The setup flow prompts for an app password and encrypts it into `carddav.password_encrypted`.
+
+> **Spaces are stripped from the password.** Providers like Google and Fastmail *display* app passwords in groups of four for readability (`abcd efgh ijkl mnop`) while the actual secret has no spaces, so the scripts remove them and a verbatim copy-paste works. The trade-off: a self-hosted CardDAV account whose password genuinely contains a space cannot be configured through the prompt — it would be silently altered, and the failure looks like a wrong password.
+
+If your password contains spaces, skip the prompt and run the helper directly. It takes the password as a single argument, so nothing is stripped or word-split:
+
+```bash
+corten-matrix carddav-setup \
+  --email you@example.com \
+  --password 'pass with spaces' \
+  --url https://carddav.example.com/  # optional; auto-discovered when omitted
+```
+
+Quote the password so your shell passes it through intact. The command discovers the CardDAV URL (unless `--url` is given), verifies the credentials, encrypts the password, and prints JSON containing `url`, `username` and `password_encrypted` — copy those into the `carddav.*` keys in your `config.yaml`, then `corten-matrix restart`. `--username` defaults to the email address if omitted.
 | `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). Setup writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
 | `database.type` | `postgres` | bridgev2 framework option. `postgres` or `sqlite3-fk-wal`; setup asks during first run and defaults to `postgres`. |
