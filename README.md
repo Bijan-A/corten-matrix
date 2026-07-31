@@ -1,6 +1,9 @@
 # Corten-Matrix
 
 [![CI](https://github.com/Bijan-A/corten-matrix/actions/workflows/ci.yml/badge.svg)](https://github.com/Bijan-A/corten-matrix/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Bijan-A/corten-matrix)](https://github.com/Bijan-A/corten-matrix/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#linux-is-not-supported-here)
+[![License](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
 
 > **A community-maintained continuation of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)**, tracking upstream release **1.1.0**.
 >
