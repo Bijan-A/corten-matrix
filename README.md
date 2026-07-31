@@ -1,6 +1,13 @@
 # Corten-Matrix
 
-> **NEW** This branch has breaking changes! Corten-Matrix now ships as **prebuilt binaries**, and moving to them requires a clean reinstall and a fresh backfill, and on Linux, a new key [extraction](#step-1-extract-hardware-key-one-time-on-a-mac) with a new [tool](https://github.com/lrhodin/corten-matrix/tree/2d3e3f5ac7fd312a23993c9083df2d6dba2495ef/tools) — see [Upgrading to binary releases](#upgrading-to-binary-releases) before you update.
+> **This is a fork** of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix), tracking upstream release **1.1.0**, and it is **macOS-only** — see [Linux is not supported here](#linux-is-not-supported-here).
+>
+> It adds two things:
+>
+> - **A CloudKit panic guard.** An unguarded `get_record` in the inline ShareProfile path could panic on the APNs process task. That killed the drain task (`Process task gone, stopping drain`), and nothing consumed APNs frames until the receive-wedge watchdog rebuilt the client ~10 minutes later — every message Apple pushed in that window was lost. From [upstream PR #70](https://github.com/lrhodin/corten-matrix/pull/70), which was not merged.
+> - **`update` for source builds.** Upstream's `update` exists only in its official prebuilt binaries. Here it works either way: it rebuilds your checkout if you have one, and downloads the newest release if you don't. See [Updating](#updating).
+>
+> Upstream is not accepting pull requests and its own tooling recommends forking — that is what this is. Everything below is upstream's documentation, corrected where this fork differs.
 
 A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
 
@@ -8,35 +15,74 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, contact name resolution, **FaceTime calls** (web join links — works from non-Apple platforms), **iOS 18 Focus / Do Not Disturb status** for contacts, **iCloud Shared Albums**, and **Name & Photo Sharing** fallback for unknown senders.
 
-**Platforms**: macOS (full features) and Linux (via a hardware key extracted from a Mac once). On Linux, the Mac is needed **only** for the one-time key extraction — there is no relay or background process running on the Mac at runtime. Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
+**Platforms**: **macOS 13+ only** in this fork. Upstream also supports Linux via a hardware key extracted from a Mac; this fork cannot build or ship that — see [Linux is not supported here](#linux-is-not-supported-here). Please note, Contact Key Verification must be disabled for the bridge to function — see [Troubleshooting](#troubleshooting).
 
 ## How it's distributed
 
-Corten-Matrix ships as a **prebuilt, self-contained binary** called `corten-matrix`, downloaded from the [Releases page](https://github.com/lrhodin/corten-matrix/releases). The binary *is* the bridge **and** its management CLI — there is **nothing to compile** and no first-run build step. The native pieces the bridge needs are already baked into the release, so you download one file, mark it executable, and run it.
+There are two ways to run this fork, and both are fully supported.
 
-**Building from source is supported on macOS.** On a Mac the bridge generates its own validation data through Apple's native `AAAbsintheContext` framework, so it builds and runs entirely from this repository — see [Build from source (macOS)](#build-from-source-macos). The prebuilt binary releases remain the easy path (no toolchain to set up) and are the only way to run on **Linux**.
+**1. Download the binary** from [this fork's Releases page](https://github.com/Bijan-A/corten-matrix/releases). It is a self-contained universal macOS binary (`corten-matrix-macos`, arm64 + x86_64) that is both the bridge and its management CLI — nothing to compile.
+
+```bash
+chmod +x corten-matrix-macos
+xattr -cr corten-matrix-macos
+./corten-matrix-macos setup-beeper
+```
+
+The `xattr` line matters. Releases are ad-hoc signed but **not notarized** (notarization needs a paid Apple Developer account), so macOS quarantines the download and it dies with `killed` on first launch until that flag is cleared. Verify the download with `shasum -a 256 -c corten-matrix-macos.sha256`.
+
+**2. Build from source** — see [Build from source (macOS)](#build-from-source-macos). On a Mac the bridge generates its own validation data through Apple's native `AAAbsintheContext` framework, so it builds and runs entirely from this repository. This is the better option on Intel Macs: it produces a native binary, and it lets `corten-matrix update` rebuild in place instead of downloading.
 
 > **Docker is deprecated for the time being.** While we move to binary distribution there is no maintained Docker image; run the native binary directly via `corten-matrix setup` / `setup-beeper`. Docker support may return in a later release.
 
 After downloading the binary you run `corten-matrix setup` (self-hosted) or `corten-matrix setup-beeper` (Beeper), which installs the runtime dependencies, walks you through configuration, logs you in, and installs the background service. See [The `corten-matrix` CLI](#the-corten-matrix-cli) for the full command list.
 
-## Upgrading to binary releases
+## Coming from upstream corten-matrix
 
-Corten-Matrix previously expected you to build from source. The binary releases are a clean break and rebrand to the corten-matrix name, so an in-place upgrade is **not** supported — you need to reinstall:
+Already running an official corten-matrix build? Switching to this fork **keeps your data** — same config, same database, same login, **no re-backfill**. It is a binary swap, not a reinstall.
 
-1. **Reinstall from the binary.** Download `corten-matrix` from the [Releases page](https://github.com/lrhodin/corten-matrix/releases), rename it if desired, make it executable: `chmod +x corten-matrix`, and run `corten-matrix setup` (or `setup-beeper`). Treat this as a fresh install rather than an upgrade of an existing source checkout.
-2. **Re-run backfill.** History must be re-backfilled on the new install; your previous database is not carried forward. CloudKit backfill runs from the binary the same way it did before — see [Receiving messages](#receiving-messages).
-3. **Linux only — re-extract your hardware key.** The legacy NAC relay is gone (see [Quick Start (Linux)](#quick-start-linux)); the binary releases require a **new** key extraction done with the current extractor tool. Old keys and any relay setup will not work — extract fresh.
+**1. Back up first.**
 
-If you're a brand-new user, ignore this section and follow the Quick Start for your platform.
+```bash
+corten-matrix stop
+tar -czf ~/corten-backup.tar.gz -C ~/.local/share corten-matrix
+sqlite3 ~/.local/share/corten-matrix/corten-matrix.db ".backup '$HOME/corten-matrix.db.bak'"
+cp "$(readlink -f "$(which corten-matrix)")" ~/corten-matrix-previous.bin
+sqlite3 ~/.local/share/corten-matrix/corten-matrix.db \
+  "select 'message',count(*) from message union all select 'portal',count(*) from portal;"
+```
+
+Stop the bridge *before* the `tar` — a clean shutdown checkpoints the WAL into the database, so the archive is a consistent snapshot. Keep that row count; it is how you prove afterwards that nothing was lost.
+
+**2. Replace the binary the service actually runs.**
+
+`/usr/local/bin/corten-matrix` is a symlink and the LaunchAgent runs its *target*. Replace the target, not the symlink — and **delete it first**:
+
+```bash
+TARGET="$(readlink -f "$(which corten-matrix)")"
+corten-matrix stop
+rm -f "$TARGET"
+cp ./corten-matrix-macos "$TARGET"
+chmod +x "$TARGET"
+"$TARGET" --version
+corten-matrix start && corten-matrix status
+```
+
+> **The `rm` is not optional.** A plain `cp` overwrites in place and reuses the inode. macOS caches code-signature state per vnode, so the new bytes land on an inode still carrying the previous binary's cached signature, and every invocation dies with `zsh: killed` — the crash report in `~/Library/Logs/DiagnosticReports/` reads `CODESIGNING` / `Taskgated Invalid Signature`. Deleting first forces a fresh inode and the problem disappears. Note that `codesign --verify` reports the file as `valid on disk` throughout: verification passing is **not** evidence the binary will run.
+
+**3. Verify.** Re-run the row-count query — it should be equal or higher (new messages only). In the log you want `Connected to iMessage`, and backfill lines reading `imported: 0` and `skipped_already_done`, meaning it recognised your existing history instead of redoing it.
+
+> **Do not run `corten-matrix setup` to switch.** It is idempotent for feature toggles, but it also contains a trust-circle check that can delete the database, `session.json`, `identity.plist` and `trustedpeers.plist` — forcing a full re-backfill. `stop` / `start` / `restart` are safe; `setup` and `reset` are not.
+
+**Going back** is the same swap in reverse, with the same `rm` first, using the binary you saved in step 1.
 
 ## Quick Start (macOS)
 
 macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
 
-> **Registering on a real Mac vs. Linux.** On macOS the bridge registers itself **natively** — validation data is generated on the spot by Apple's own frameworks, so there's **no key to extract**; just sign in. Extracting a hardware key (with an Intel or Apple Silicon Mac — same tool) is only for running the bridge on **Linux**; see [Quick Start (Linux)](#quick-start-linux).
+> **Registering on a real Mac.** On macOS the bridge registers itself **natively** — validation data is generated on the spot by Apple's own frameworks, so there's **no key to extract**; just sign in. (Upstream's hardware-key extraction exists only to run the bridge on Linux, which this fork does not support.)
 
-1. Download the `corten-matrix` binary for macOS from the [Releases page](https://github.com/lrhodin/corten-matrix/releases) and make it executable (`chmod +x corten-matrix`). Rename said binary if desired. The platform and architecture name is appended to distinguish between releases. macOS is a universal binary.
+1. Download `corten-matrix-macos` from [this fork's Releases page](https://github.com/Bijan-A/corten-matrix/releases), make it executable (`chmod +x corten-matrix-macos`), and clear the quarantine flag (`xattr -cr corten-matrix-macos`). Rename it if you like — it is a universal binary (arm64 + x86_64). Or [build it yourself](#build-from-source-macos).
 2. Run setup:
 
    ```bash
@@ -51,68 +97,19 @@ macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the b
 
 `setup` also offers to symlink `corten-matrix` into `/usr/local/bin` so it's on your `PATH`; after that you can drop the `./` and run `corten-matrix <command>` from anywhere.
 
-## Quick Start (Linux)
+## Linux is not supported here
 
-The bridge runs on Linux using a hardware key extracted once from a real Mac. **No Mac is needed at runtime** — a Mac (Intel or Apple Silicon, same tool either way) is used only for the one-time key extraction in Step 1, after which it can go back to normal use.
+Upstream ships Linux binaries. **This fork cannot**, and it is not a packaging problem — the code is not public.
 
-> **The NAC relay is deprecated.** Earlier versions could keep a relay process running on a Mac to answer validation requests. The binary releases drop that entirely: the key is **fully enriched at extraction time**, so nothing runs on the Mac afterward. If you previously used the relay, it no longer applies — perform a **fresh extraction** with the current tool (below). Old keys from the pre-binary era **must** be re-extracted.
+Linux needs the `cleanroom-registration` feature (`open-absinthe/native-nac-rust` + `remote-clearadi`) to produce NAC validation data without a Mac. Those crates are closed-source and are not vendored in this repository, so the public build selects `--no-default-features --features nac-apple-framework` instead, which uses Apple's native `AAAbsintheContext` — and that exists only on macOS. The Makefile refuses to even start on anything else:
 
-### Prerequisites
-
-Ubuntu 22.04+ (or equivalent). The setup step installs the runtime dependencies for you across the common package managers (apt / dnf / pacman / zypper / apk). Nothing is compiled on your machine — the bridge binary is prebuilt.
-
-Containers are supported: in an LXC container (or anywhere `systemctl --user` has no session bus — e.g. running as root, or SSH without lingering), setup automatically installs the service as a **system** unit instead of a user unit. See the note under [Management → Linux](#linux).
-
-### Step 1: Extract hardware key (one-time, on a Mac)
-
-Run the extractor on **any** Mac — Intel or Apple Silicon, it's the same tool and both produce an equivalent key. The key is fully enriched at extraction time, so there's nothing to post-process and **no relay to keep running** afterwards. The Mac is not modified and can continue to be used normally.
-
-> Use the extractor tools linked below — extractors from before the binary switch are not compatible.
-
-**Option A — GUI app (recommended).** Download the hardware-key [extractor app](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/ExtractKey.app.zip), copy it to the Mac, and launch it. It reads the hardware identifiers, displays them, and lets you **Copy** or **Save** the base64 key.
-
-> **Gatekeeper**: The app is ad-hoc signed (not notarized — just a fact of macOS), so a downloaded copy is blocked on first launch:
->
-> - **macOS 13+ (Ventura)**: Double-click it, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
-> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu, then **Open** in the dialog.
-> - **Terminal**: Run `xattr -cr <AppName>.app` to strip the quarantine flag, then double-click normally.
-
-**Option B — CLI (fallback).** If you'd rather not use the GUI, download the [command-line extractor](https://github.com/lrhodin/corten-matrix/blob/d9fed308b33a03019fd4273a6921a0a5bf818564/tools/extract-key-cli.zip), run it on the Mac, and copy the base64 key it prints:
-
-```bash
-chmod +x extract-key
-./extract-key
+```
+This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework.
 ```
 
-Either option produces the same base64 hardware key. Keep it handy for Step 3.
+So there is no way to build or release a Linux binary from this tree, and the hardware-key extraction flow upstream documents does not apply here either.
 
-### Step 2: Install the bridge (on Linux)
-
-Download the `corten-matrix` binary for your architecture (`linux-amd64` or `linux-arm64`) from the [Releases page](https://github.com/lrhodin/corten-matrix/releases), rename it if desired, and make it executable, and run setup:
-
-```bash
-chmod +x corten-matrix
-
-# Beeper
-./corten-matrix setup-beeper
-
-# …or a self-hosted homeserver
-./corten-matrix setup
-```
-
-For self-hosted, setup walks you through homeserver URL → domain → Matrix ID → database choice, then the iMessage login. Nothing compiles — the binary is ready to run immediately.
-
-### Step 3: Login
-
-`setup` detects that no login exists and runs the iMessage login flow inline at the end. You're prompted right there in the terminal for:
-
-1. Your hardware key (paste the base64 from Step 1)
-2. Your Apple ID and password
-3. The 2FA code sent to your trusted devices
-
-When the script finishes you're already logged in and the bridge is up.
-
-**Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the setup flow, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result. You can also re-run the terminal flow at any time with `corten-matrix login`.
+**If you need Linux**, use [upstream's releases](https://github.com/lrhodin/corten-matrix/releases). Those are built from code this fork does not have. The panic guard in this fork is a single Rust change; if you are comfortable maintaining your own build, it can be applied on top of upstream's private tree by whoever has access to it.
 
 ## The `corten-matrix` CLI
 
@@ -123,20 +120,20 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix setup` | Configure and start the bridge against a self-hosted homeserver. Idempotent — re-run to flip feature toggles. |
 | `corten-matrix setup-beeper` | Same, but configured for Beeper. |
 | `corten-matrix setup 1` / `setup-beeper 1` | Add a **second** iMessage account (a different Apple ID), or reconfigure an existing one later — the same prompts as `setup`, scoped to the second bridge. |
-| `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd on macOS, systemd on Linux). One service runs both accounts. |
+| `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
-| `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
+| `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
 | `corten-matrix reset` | Reset bridge state — prompts for confirmation (`--yes` to skip); see the warning under [Configuration](#configuration). |
-| `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
-| `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
+| `corten-matrix update` | Update and restart. Rebuilds your source checkout if you have one, otherwise downloads the newest release — see [Updating](#updating). |
+| `corten-matrix update check` / `update force` | `check` reports what would happen without changing anything; `force` reinstalls even if already current. |
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
 | `corten-matrix help` | Show the command list. |
 
-> `update` is shown by `corten-matrix help` **only on the official prebuilt binaries**. If you built from source it isn't there — update by pulling this repo and rebuilding (see [Updating](#updating)).
+> Unlike upstream, `update` is present in **source builds too** in this fork. Every subcommand also accepts a `--flag` spelling (`--check`, `--force`, …).
 
-The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.
+The raw `launchctl` equivalents are in [Management](#management) if you'd rather wire your own tooling.
 
 ### Dual accounts (two Apple IDs)
 
@@ -157,23 +154,31 @@ corten-matrix can bridge **two Apple IDs** on the same machine (max two), each a
 | chat.db | CloudKit | ✅ |
 | chat.db | chat.db | ❌ — only one local Messages database exists |
 
-So **at most one** account can use chat.db backfill — the Apple ID signed into Messages on the Mac — and the other must use CloudKit. This only limits *history backfill*; real-time messaging works for both accounts regardless. (Linux has no chat.db, so both accounts always use CloudKit.)
+So **at most one** account can use chat.db backfill — the Apple ID signed into Messages on the Mac — and the other must use CloudKit. This only limits *history backfill*; real-time messaging works for both accounts regardless.
 
 ## Updating
 
-How you update depends on how you're running corten-matrix:
+`corten-matrix update` works in this fork **whether or not you built from source**. It has two modes and picks automatically:
 
-- **Official prebuilt binaries (macOS & Linux)** — run `corten-matrix update`. It pulls the latest [release](https://github.com/lrhodin/corten-matrix/releases) for your platform (macOS universal, Linux amd64, or Linux arm64), replaces the installed binary in place, prints the release notes, and restarts the bridge. Your config, login, and data are untouched.
+- **A source checkout is present** → it rebuilds it: `git pull --ff-only`, `make`, then stop → swap → start.
+- **No checkout** (you downloaded a release binary) → it downloads the newest release from this fork, verifies the published SHA-256, and swaps it in.
 
-  ```bash
-  corten-matrix update          # update & restart
-  corten-matrix update check    # show what's available + release notes, change nothing
-  corten-matrix update force    # re-download & reinstall the current release
-  ```
+```bash
+corten-matrix update           # auto: rebuild if a checkout exists, else download
+corten-matrix update check     # report what would happen, change nothing
+corten-matrix update force     # reinstall even if already current
+corten-matrix update source    # force the rebuild path
+corten-matrix update release   # force the download path
+corten-matrix update no-pull   # rebuild without git pull
+```
 
-  **The service must be installed first.** `update` doesn't take a path or guess where your binary lives — it locates it through the `corten-matrix` entry on your `PATH`. That entry is a symlink into `/usr/local/bin` that `corten-matrix setup` (and `install-service`) creates, pointing at wherever you actually keep the binary; `update` follows the symlink to that real file and replaces it in place, leaving the symlink intact. So you must have run `setup` / `install-service` (and added it to `PATH` when prompted) before `update` will work. If `corten-matrix` isn't on your `PATH`, `update` stops and tells you to install the service first rather than guessing. (If the binary lives somewhere only root can write, it uses `sudo` for the swap.)
+Every word also accepts a `--flag` spelling (`--check`, `--force`, …), so both habits work.
 
-- **Built from source (macOS)** — the `update` command isn't included in source builds. Update the normal way: `git pull` and rebuild (see [Build from source (macOS)](#build-from-source-macos)), then `corten-matrix restart`.
+**How the checkout is found**, in order: `$CORTEN_SRC`, then upward from the running binary (which covers the default layout, since `make` leaves the binary in the checkout root), then the usual spots under `$HOME` — `~/src/corten-matrix`, `~/corten-matrix`, `~/Developer/corten-matrix`, and similar. A directory only qualifies if it has `.git`, a `Makefile`, **and** a `go.mod` declaring the corten-matrix module, so a directory that merely holds the binary is never mistaken for a checkout.
+
+**Installing is atomic.** The new binary is staged alongside the target and renamed over it, which both avoids `ETXTBSY` and sidesteps the code-signature caching problem described under [Coming from upstream](#coming-from-upstream-corten-matrix). Your config, login, and data are untouched.
+
+Set `$CORTEN_RELEASE_REPO` to download releases from somewhere other than this fork.
 
 ## Login
 
@@ -182,7 +187,7 @@ There are two ways to log in:
 - **Through the setup flow (default).** `corten-matrix setup` and `corten-matrix setup-beeper` detect a missing login and run the iMessage login inline at the end. This is the path almost everyone uses — answer the prompts in the terminal and you're done.
 - **Through the bridge bot (alternative).** DM the bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow. Useful if you skipped the setup login step, want to switch handles, or are re-logging without re-running setup. `corten-matrix login` re-runs the terminal flow.
 
-Either path follows the same prompts: Apple ID → password → 2FA (if needed) → handle selection. On macOS, if the Mac is signed into iCloud with the same Apple ID, login completes without 2FA. On Linux, you additionally paste the hardware key from [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac).
+Either path follows the same prompts: Apple ID → password → 2FA (if needed) → handle selection. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA.
 
 If your Apple ID has multiple identities registered (e.g. a phone number and an email address), you'll be asked which one to use for outgoing messages. This is what recipients see your messages "from". To change it later, set `preferred_handle` in the config (see [Configuration](#configuration)) or log in again.
 
@@ -196,7 +201,7 @@ To bridge SMS (green bubble) messages, enable forwarding on your iPhone:
 
 Incoming iMessages automatically create Matrix rooms. History backfill uses **CloudKit** by default — that's the modern, supported path and what almost everyone should pick.
 
-**Local chat.db** (`backfill_source: chatdb`) is a last-resort fallback for older macOS versions that can't run CloudKit backfill at all. If your Mac is in that bucket, the **preferred workaround is to run the bridge on Linux instead** (extract the hardware key once via [Quick Start (Linux)](#quick-start-linux), then let the Linux bridge do CloudKit backfill normally). Only choose `chatdb` if you actually have to run the bridge on a legacy Mac and Linux isn't an option — it's macOS-only and requires **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → add the bridge binary or Terminal) to read `~/Library/Messages/chat.db`. Without FDA the bridge can't read the file and chat.db backfill silently does nothing.
+**Local chat.db** (`backfill_source: chatdb`) is a last-resort fallback for older macOS versions that can't run CloudKit backfill at all. Upstream's suggested workaround is to run the bridge on Linux instead, which this fork cannot do — so on a legacy Mac, `chatdb` is your only option here. It requires **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → add the bridge binary or Terminal) to read `~/Library/Messages/chat.db`. Without FDA the bridge can't read the file and chat.db backfill silently does nothing.
 
 ## Bridge commands
 
@@ -354,7 +359,7 @@ Attachments larger than `max_attachment_size_mb` (default `100`) are **skipped e
 
 ### Dependencies
 
-- **`libheif`** is a runtime dependency the bridge links against. `corten-matrix setup` installs it via Homebrew (macOS) or `apt`/`dnf`/`pacman`/`zypper`/`apk` (Linux), regardless of whether `heic_conversion` is enabled.
+- **`libheif`** is a runtime dependency the bridge links against. `corten-matrix setup` installs it via Homebrew, regardless of whether `heic_conversion` is enabled.
 - **`ffmpeg`** is required at runtime only when `video_transcoding` is enabled. The setup flow installs it via the same package manager when you turn the toggle on during the interactive prompts.
 
 ## How It Works
@@ -363,8 +368,8 @@ The bridge connects directly to Apple's iMessage servers using [rustpush](https:
 
 NAC validation runs entirely in-process on the host running the bridge:
 
-- **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework.
-- **Linux**: validation data is generated locally from the hardware key extracted once from a Mac. The key carries everything needed, so no Mac is involved at runtime — Intel and Apple Silicon keys both work the same way, with no relay.
+- **macOS**: validation data is generated natively through Apple's own `AAAbsintheContext` framework. This is the only path available in this fork.
+- **Linux** (upstream only): validation data is generated locally from a hardware key extracted once from a Mac. That path needs closed-source crates absent from this tree — see [Linux is not supported here](#linux-is-not-supported-here).
 
 ```mermaid
 flowchart TB
@@ -373,21 +378,12 @@ flowchart TB
         Bridge1 -- FFI --> RP1[rustpush]
         RP1 -- AAAbsintheContext --> NAC1[Local NAC]
     end
-    subgraph linux["Linux"]
-        HS2[Homeserver] -- appservice --> Bridge2[corten-matrix]
-        Bridge2 -- FFI --> RP2[rustpush]
-        RP2 -- hardware key --> NAC2[Local NAC]
-    end
     Client1[Matrix client] <--> HS1
-    Client2[Matrix client] <--> HS2
     RP1 <--> Apple[Apple IDS / APNs]
-    RP2 <--> Apple
 
     style macos fill:#f0f4ff,stroke:#4a6fa5,stroke-width:2px,color:#1a1a2e
-    style linux fill:#f0fff4,stroke:#4aa56f,stroke-width:2px,color:#1a1a2e
     style Apple fill:#1a1a2e,stroke:#1a1a2e,color:#fff
     style Client1 fill:#fff,stroke:#999,color:#333
-    style Client2 fill:#fff,stroke:#999,color:#333
 ```
 
 ### Real-time and backfill
@@ -461,27 +457,7 @@ corten-matrix uninstall
 
 ### Linux
 
-```bash
-# If using systemd (from corten-matrix setup / setup-beeper)
-systemctl --user status corten-matrix
-journalctl --user -u corten-matrix -f
-systemctl --user restart corten-matrix
-
-# In containers (LXC) — or anywhere `systemctl --user` can't reach a session bus —
-# setup installs a SYSTEM unit (/etc/systemd/system/corten-matrix.service) instead; drop `--user`:
-systemctl status corten-matrix
-journalctl -u corten-matrix -f
-systemctl restart corten-matrix
-
-# File logs (per account; bridge.log is structured JSON — `corten-matrix logs` renders it readably)
-tail -f ~/.local/share/corten-matrix/logs/bridge.log      # first account
-tail -f ~/.local/share/corten-matrix-1/logs/bridge.log    # second account, if configured
-
-# If running directly (debugging or non-systemd hosts)
-./corten-matrix -c ~/.local/share/corten-matrix/config.yaml
-```
-
-You don't have to know which mode you're in: `corten-matrix start` / `stop` / `restart` / `status` detect it — they drive the user unit when a session bus is reachable and fall back to the system unit otherwise (using `sudo` when you're not root). The raw commands above are only for wiring your own tooling.
+Not supported in this fork — see [Linux is not supported here](#linux-is-not-supported-here). Upstream's systemd instructions apply to [upstream's releases](https://github.com/lrhodin/corten-matrix/releases).
 
 ## Configuration
 
@@ -518,11 +494,6 @@ rm -f ~/Library/LaunchAgents/com.lrhodin.corten-matrix.plist
 rm -rf ~/.local/share/corten-matrix
 rm -rf ~/.local/share/corten-matrix-1   # second account, if you added one
 
-# Linux
-systemctl --user stop corten-matrix 2>/dev/null
-rm -rf ~/.local/share/corten-matrix
-rm -rf ~/.local/share/corten-matrix-1   # second account, if you added one
-
 corten-matrix setup
 ```
 
@@ -533,7 +504,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | Field | Default | What it does |
 |-------|---------|-------------|
 | `cloudkit_backfill` | `false` | Master switch for message history backfill. Requires device PIN during login to join the iCloud Keychain. |
-| `backfill_source` | `cloudkit` | `cloudkit` (default) or `chatdb` (legacy macOS fallback only — macOS-only, requires Full Disk Access). For legacy Macs prefer running the bridge on Linux with CloudKit instead. Only relevant when `cloudkit_backfill` is true. |
+| `backfill_source` | `cloudkit` | `cloudkit` (default) or `chatdb` (legacy macOS fallback only — requires Full Disk Access). Only relevant when `cloudkit_backfill` is true. |
 | `url_previews_in_backfill` | `true` | Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing messages during backfill. Each URL costs up to three HTTP round-trips inline with conversion — set `false` to skip previews during backfill only (live inbound messages and outbound edits still build them). |
 | `displayname_template` | *(see [example-config.yaml](pkg/imconfig/example-config.yaml))* | Go template controlling how iMessage contacts appear in Matrix. Falls through `FirstName → LastName → Nickname → Phone → Email → ID`. Variables: `{{.FirstName}}`, `{{.LastName}}`, `{{.Nickname}}`, `{{.Phone}}`, `{{.Email}}`, `{{.ID}}`. |
 | `preferred_handle` | *(from login)* | Outgoing iMessage identity in URI form (`tel:+15551234567` or `mailto:user@example.com`). |
@@ -569,10 +540,18 @@ Everything else (Homebrew, Go, Rust, protobuf, libolm, libheif, tmux) is install
 **Build**
 
 ```bash
-git clone https://github.com/lrhodin/corten-matrix.git
+git clone https://github.com/Bijan-A/corten-matrix.git
 cd corten-matrix
 make
 ```
+
+**On Intel Macs, override the Homebrew prefix.** The Makefile hardcodes `/opt/homebrew`, which only exists on Apple Silicon. If `brew --prefix` prints `/usr/local`, plain `make` fails to find `olm/olm.h`; pass the CGO flags explicitly:
+
+```bash
+make CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"
+```
+
+You can also stamp a version with `make VERSION=1.1.0-fork.1 …`; without it the binary reports the Makefile's hardcoded default.
 
 `make` (the default target) installs any missing Homebrew dependencies, clones OpenBubbles `rustpush` at the SHA pinned in `third_party/rustpush-upstream.sha`, applies the bridge's source overlays, builds the Rust core (`librustpushgo.a`) with native NAC, then builds the Go bridge. The result is a single self-contained `corten-matrix` binary in the repository root.
 
@@ -585,6 +564,8 @@ From there it behaves exactly like a downloaded release — the binary is both t
 ```
 
 Other targets: `make clean` (remove the binary and Rust build artifacts), and `make rust` / `make bindings` to build just the Rust static library or the UniFFI Go bindings.
+
+Once installed, `corten-matrix update` will find this checkout and rebuild it in place — see [Updating](#updating). If you are replacing an existing binary by hand, read the `rm`-before-`cp` warning under [Coming from upstream](#coming-from-upstream-corten-matrix) first.
 
 ## Source layout
 
@@ -682,7 +663,7 @@ scripts/                                    # Setup scripts, embedded into the b
 
 - **Contact Key Verification must be off.** The bridge registers as a new iMessage device on your Apple ID and won't function while CKV is enabled. Turn it off before logging in: on iPhone, **Settings → [your name] → Contact Key Verification**; on a Mac, **System Settings → [your name] → Contact Key Verification**.
 - **chat.db backfill silently does nothing.** The bridge is missing Full Disk Access — grant it under **System Settings → Privacy & Security → Full Disk Access** (see [Receiving messages](#receiving-messages)).
-- **The extractor app won't open on the Mac.** Gatekeeper blocks the ad-hoc-signed app on first launch — see the Gatekeeper note under [Step 1](#step-1-extract-hardware-key-one-time-on-a-mac) for the per-macOS-version override.
+- **A downloaded binary won't launch ("killed").** Releases are ad-hoc signed and not notarized, so macOS quarantines them: run `xattr -cr corten-matrix-macos` before the first launch. If you replaced an existing binary in place, see the `rm`-before-`cp` warning under [Coming from upstream](#coming-from-upstream-corten-matrix) — a `CODESIGNING` crash looks identical.
 - **Reading logs.** `corten-matrix logs` (or `logs 1` for the second account) pretty-prints the live log. On disk, `logs/bridge.log` is structured JSON (rotated), and raw process stdout / crash output lands in `logs/bridge.stdout.log` — per account under `~/.local/share/corten-matrix/` and `~/.local/share/corten-matrix-1/`.
 - **Is it running at all?** `corten-matrix status`, then `corten-matrix restart` if needed — raw `launchctl` / `systemctl` equivalents are under [Management](#management).
 
