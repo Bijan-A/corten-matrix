@@ -20,18 +20,22 @@ import (
 // URL, env var, or config key to repoint at a fork. The README says as much —
 // "the `update` command isn't included in source builds".
 //
-// This implements the equivalent for a source install. A source build has no
-// release artifact to download, so updating means rebuilding the checkout it
-// came from: git pull, make, swap the binary in, restart. It follows whatever
-// remote that checkout already points at, so a fork updates from the fork with
-// no configuration.
+// This implements `update` with two modes, because a fork can be consumed both
+// ways:
+//
+//   - source  — rebuild the checkout this binary came from (git pull, make,
+//     swap, restart). The only option for a source install, since there is no
+//     artifact to fetch.
+//   - release — download the latest release asset from the fork and swap it in.
+//     For people who downloaded a binary and have no checkout.
+//
+// Picking between them is automatic: if a checkout is discoverable, rebuild it;
+// otherwise fetch a release. Both converge on the same install step, so the
+// stop → swap → start behaviour is identical either way.
 //
 // Everything here is stdlib-only and touches nothing proprietary — no rustpush,
 // no open-absinthe, no apple-private-apis, and no part of the closed release
-// tooling. It is a different mechanism from the private overlay, not a
-// reimplementation of it. Being confined to this one file also means a release
-// build that overlays the file drops this cleanly, and `git rebase upstream/…`
-// never conflicts here, since upstream leaves the stubs alone.
+// tooling. See hostcmd_release.go for the download path.
 
 // cortenSrcEnv overrides where the source checkout lives. Everything else is
 // discovery; this is the escape hatch when discovery guesses wrong.
@@ -53,6 +57,14 @@ var homeCandidates = [][]string{
 	{"Projects", "corten-matrix"},
 }
 
+type updateMode int
+
+const (
+	modeAuto updateMode = iota
+	modeSource
+	modeRelease
+)
+
 // HandleHostCommand lets the build configuration's host-command extensions
 // claim a management subcommand before the binary's normal dispatch. args is
 // os.Args[1:]; version/goos/goarch describe the running build. We claim only
@@ -61,7 +73,7 @@ func HandleHostCommand(args []string, version, goos, goarch string) bool {
 	if len(args) == 0 || args[0] != "update" {
 		return false
 	}
-	runUpdate(args[1:], version, goos)
+	runUpdate(args[1:], version, goos, goarch)
 	return true
 }
 
@@ -69,33 +81,48 @@ func HandleHostCommand(args []string, version, goos, goarch string) bool {
 // listing.
 func ExtraHostHelp() [][2]string {
 	return [][2]string{
-		{"update", "Rebuild from the local source checkout and restart"},
+		{"update", "Update to the latest version and restart"},
 	}
 }
 
-// runUpdate rebuilds the checkout and swaps the new binary in. It always
-// terminates the process.
-func runUpdate(args []string, version, goos string) {
-	if goos != "darwin" {
-		fatalf("update: source builds are macOS-only (this build reports %s)", goos)
-	}
+func updateUsage() {
+	fmt.Println("Usage: corten-matrix update [--source|--release] [--no-pull] [--force] [--check]")
+	fmt.Println()
+	fmt.Println("  Updates this binary and restarts the bridge.")
+	fmt.Println()
+	fmt.Println("  With a source checkout present it rebuilds that checkout; without one")
+	fmt.Println("  it downloads the latest release. Pick explicitly with --source/--release.")
+	fmt.Println()
+	fmt.Println("  --source    rebuild from the source checkout (git pull + make)")
+	fmt.Println("  --release   download the latest release asset instead of building")
+	fmt.Println("  --no-pull   source mode: skip git fetch/pull, build what is checked out")
+	fmt.Println("  --force     release mode: reinstall even if already on the latest version")
+	fmt.Println("  --check     report what would happen and exit without changing anything")
+	fmt.Println()
+	fmt.Printf("  $%s   override the checkout location\n", cortenSrcEnv)
+	fmt.Printf("  $%s  override the owner/repo releases come from\n", releaseRepoEnv)
+}
 
-	pull := true
+// runUpdate dispatches to the source or release path. It always terminates the
+// process.
+func runUpdate(args []string, version, goos, goarch string) {
+	mode := modeAuto
+	pull, force, check := true, false, false
+
 	for _, a := range args {
 		switch a {
+		case "--source":
+			mode = modeSource
+		case "--release":
+			mode = modeRelease
 		case "--no-pull":
 			pull = false
+		case "--force":
+			force = true
+		case "--check":
+			check = true
 		case "-h", "--help":
-			fmt.Println("Usage: corten-matrix update [--no-pull]")
-			fmt.Println()
-			fmt.Println("  Rebuilds this binary's source checkout and restarts the bridge.")
-			fmt.Println("  Source builds have no release artifact to download, so `update`")
-			fmt.Println("  means: git pull, make, swap the binary in, restart.")
-			fmt.Println()
-			fmt.Printf("  Checkout is found via $%s, else by searching upward from this\n", cortenSrcEnv)
-			fmt.Println("  binary, else the usual spots under your home directory.")
-			fmt.Println()
-			fmt.Println("  --no-pull   skip git fetch/pull; build whatever is checked out")
+			updateUsage()
 			os.Exit(0)
 		default:
 			fatalf("update: unknown argument %q (try --help)", a)
@@ -103,7 +130,47 @@ func runUpdate(args []string, version, goos string) {
 	}
 
 	target := installedPath()
-	src := resolveSrc(target)
+
+	// Building from source is macOS-only (the Makefile enforces it), but a
+	// downloaded release can update itself anywhere, so only gate the source
+	// path on the platform.
+	src, tried, found := findCheckout(target)
+	switch mode {
+	case modeSource:
+		if !found {
+			fatalf("update --source: %s", noCheckoutMessage(tried))
+		}
+	case modeAuto:
+		if found {
+			mode = modeSource
+		} else {
+			mode = modeRelease
+		}
+	}
+
+	if mode == modeSource {
+		if goos != "darwin" {
+			fatalf("update --source: building from source is macOS-only (this build reports %s).\n"+
+				"Use --release to download a prebuilt binary instead.", goos)
+		}
+		updateFromSource(src, target, version, pull, check)
+		return
+	}
+	updateFromRelease(target, version, goos, goarch, force, check)
+}
+
+func noCheckoutMessage(tried []string) string {
+	return fmt.Sprintf("no corten-matrix source checkout found.\n"+
+		"Point it at one:\n"+
+		"    CORTEN_SRC=/path/to/corten-matrix corten-matrix update --source\n\n"+
+		"Looked in:\n  %s", strings.Join(tried, "\n  "))
+}
+
+// ── source mode ─────────────────────────────────────────────────────────────
+
+// updateFromSource rebuilds the checkout and swaps the new binary in.
+func updateFromSource(src, target, version string, pull, check bool) {
+	fmt.Printf("→ mode:      source (rebuild)\n")
 	fmt.Printf("→ checkout:  %s\n", src)
 	fmt.Printf("→ installed: %s (%s)\n", target, version)
 
@@ -114,17 +181,25 @@ func runUpdate(args []string, version, goos string) {
 		fatalf("update: %s has uncommitted changes — commit, stash, or discard them first:\n%s", src, out)
 	}
 
+	branch := gitOut(src, "rev-parse", "--abbrev-ref", "HEAD")
+	origin := gitOut(src, "remote", "get-url", "origin")
+	fmt.Printf("→ branch:    %s (origin: %s)\n", branch, origin)
+
+	if check {
+		fmt.Println("\n--check: would run `git pull --ff-only` (unless --no-pull), `make`, then stop → swap → start.")
+		return
+	}
+
 	if pull {
-		branch := gitOut(src, "rev-parse", "--abbrev-ref", "HEAD")
 		fmt.Printf("→ pulling %s\n", branch)
 		mustRun(src, "git", "fetch", "origin")
 		// --ff-only on purpose: if the branch has diverged (typically after a
-		// `git rebase upstream/master`), stop and let a human decide instead
-		// of merging behind their back. --no-pull is the escape hatch.
+		// `git rebase upstream/…`), stop and let a human decide instead of
+		// merging behind their back. --no-pull is the escape hatch.
 		if err := run(src, "git", "pull", "--ff-only"); err != nil {
 			fatalf("update: cannot fast-forward %s.\n"+
 				"If you rebased onto upstream, that's expected — build what you have with:\n"+
-				"    corten-matrix update --no-pull", branch)
+				"    corten-matrix update --source --no-pull", branch)
 		}
 	}
 
@@ -136,13 +211,22 @@ func runUpdate(args []string, version, goos string) {
 		fatalf("update: make finished but %s is missing: %v", built, err)
 	}
 
+	swapIn(built, target, version)
+}
+
+// ── shared install ──────────────────────────────────────────────────────────
+
+// swapIn stops the bridge, replaces target with newBinary, and starts it again.
+// It returns rather than exiting so callers' deferred cleanup (the release
+// path's staged download) still runs.
+func swapIn(newBinary, target, oldVersion string) {
 	// Stop first: the LaunchAgent sets KeepAlive, so launchd would otherwise
 	// relaunch the old binary in the middle of the swap.
 	fmt.Println("→ stopping bridge")
 	mustRun("", target, "stop")
 
 	fmt.Printf("→ installing to %s\n", target)
-	if err := installBinary(built, target); err != nil {
+	if err := installBinary(newBinary, target); err != nil {
 		fatalf("update: install failed: %v\n"+
 			"The bridge is stopped and the old binary is intact — start it again with:\n"+
 			"    corten-matrix start", err)
@@ -151,8 +235,7 @@ func runUpdate(args []string, version, goos string) {
 	fmt.Println("→ starting bridge")
 	mustRun("", target, "start")
 
-	fmt.Printf("\n✓ updated %s → %s\n", version, strings.TrimSpace(cmdOut(target, "--version")))
-	os.Exit(0)
+	fmt.Printf("\n✓ updated %s → %s\n", oldVersion, strings.TrimSpace(cmdOut(target, "--version")))
 }
 
 // isCheckout reports whether dir is a corten-matrix source checkout: a git
@@ -178,24 +261,26 @@ func isCheckout(dir string) bool {
 	return false
 }
 
-// resolveSrc locates the source checkout. Order: $CORTEN_SRC, then upwards from
-// the running binary (covers the common source-build layout, where `make` leaves
-// the binary in the checkout root and it is run from there or via a symlink),
-// then the conventional home-directory locations.
-func resolveSrc(self string) string {
+// findCheckout locates the source checkout, reporting failure rather than
+// exiting so `update` can fall back to release mode. Order: $CORTEN_SRC, then
+// upward from the running binary (covers the common source-build layout, where
+// `make` leaves the binary in the checkout root and it is run from there or via
+// a symlink), then the conventional home-directory locations. Returns the
+// directory, the list of places tried, and whether one was found.
+func findCheckout(self string) (string, []string, bool) {
 	if dir := os.Getenv(cortenSrcEnv); dir != "" {
 		abs := absOrDie(dir)
 		if !isCheckout(abs) {
 			fatalf("update: $%s=%s is not a corten-matrix checkout\n"+
 				"Expected a git repo with a Makefile and go.mod declaring %q.", cortenSrcEnv, abs, cortenModulePath)
 		}
-		return usable(abs)
+		return usable(abs), []string{abs}, true
 	}
 
 	var tried []string
 	for dir := filepath.Dir(self); ; {
 		if isCheckout(dir) {
-			return usable(dir)
+			return usable(dir), tried, true
 		}
 		tried = append(tried, dir)
 		parent := filepath.Dir(dir)
@@ -209,18 +294,12 @@ func resolveSrc(self string) string {
 		for _, parts := range homeCandidates {
 			cand := filepath.Join(append([]string{home}, parts...)...)
 			if isCheckout(cand) {
-				return usable(cand)
+				return usable(cand), tried, true
 			}
 			tried = append(tried, cand)
 		}
 	}
-
-	fatalf("update: no corten-matrix source checkout found.\n"+
-		"A source build updates by rebuilding its own checkout, so it needs to know where that is.\n"+
-		"Point it at one:\n"+
-		"    CORTEN_SRC=/path/to/corten-matrix corten-matrix update\n\n"+
-		"Looked in:\n  %s", strings.Join(tried, "\n  "))
-	return ""
+	return "", tried, false
 }
 
 // usable rejects a checkout the build cannot actually use.

@@ -1,0 +1,205 @@
+name: Release (macOS)
+
+# Publishes a universal macOS binary named `corten-matrix-macos`, matching
+# upstream's asset naming so `corten-matrix update` can find it.
+#
+# macOS only, deliberately. The Linux binaries upstream ships cannot be built
+# from this tree: the Makefile hard-errors on non-Darwin, because Linux needs
+# the `cleanroom-registration` feature (open-absinthe/native-nac-rust +
+# remote-clearadi) whose crates are closed-source and not vendored here. The
+# public build uses `--no-default-features --features nac-apple-framework`
+# (Apple's native AAAbsintheContext), which only exists on macOS.
+#
+# Universal = two native builds + lipo. Cross-compiling both arches on one
+# runner founders on Homebrew being single-arch: libolm/libheif under
+# /opt/homebrew are arm64-only, so an x86_64 link fails. Building each slice on
+# its own runner sidesteps that entirely.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v1.1.0-fork.1)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Strip the leading v so `corten-matrix --version` prints 1.1.0-fork.1.
+  # `update` compares this against the release tag, and normalises the v away
+  # on both sides, but keeping them identical avoids confusion.
+  RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # macos-14+ runners are Apple Silicon; macos-13 is the last Intel
+          # image. If GitHub retires macos-13, drop that entry and this
+          # workflow still produces a working arm64-only binary — the lipo
+          # step handles a single slice.
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        # The Makefile's check-deps would brew-install these anyway; doing it
+        # explicitly keeps the build log readable and fails fast.
+        run: brew install protobuf libolm libheif tmux
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+            third_party/rustpush-upstream
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+          restore-keys: cargo-${{ matrix.arch }}-
+
+      - name: Build
+        # VERSION is a simple `:=` assignment, so a command-line override wins.
+        # Without it every release would report the Makefile's hardcoded 0.1.0
+        # and `update` could never tell versions apart.
+        run: make VERSION="${RAW_TAG#v}"
+
+      - name: Verify the binary
+        run: |
+          set -euo pipefail
+          test -f corten-matrix
+          file corten-matrix
+          ./corten-matrix --version
+          # The arch this slice actually contains.
+          lipo -info corten-matrix
+          # Prove the ShareProfile panic guard is compiled in, not just present
+          # in the source tree.
+          if ! strings corten-matrix | grep -q "inline ShareProfile fetch panicked"; then
+            echo "::error::panic guard string missing — built from stale artifacts?"
+            exit 1
+          fi
+          # Prove the source-build update command is wired up.
+          ./corten-matrix help | grep -q update || {
+            echo "::error::update subcommand not advertised in help"; exit 1; }
+
+      - name: Run Go tests
+        run: go test ./pkg/connector/... ./imessage/...
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corten-matrix-${{ matrix.arch }}
+          path: corten-matrix
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Universal binary
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: slices
+
+      - name: lipo into a universal binary
+        run: |
+          set -euo pipefail
+          slices=$(find slices -name corten-matrix -type f | sort)
+          echo "slices found:"; echo "$slices"
+          # shellcheck disable=SC2086
+          lipo -create -output corten-matrix-macos $slices
+          # lipo rewrites the Mach-O container, which invalidates the ad-hoc
+          # signatures on the input slices. Re-sign the fat binary with the
+          # SAME identifier the Makefile uses, so macOS/TCC keeps tracking it
+          # across updates (Full Disk Access is keyed to this).
+          codesign --force --sign - --identifier com.lrhodin.corten-matrix corten-matrix-macos
+          codesign --verify --verbose=2 corten-matrix-macos
+          lipo -info corten-matrix-macos
+          chmod +x corten-matrix-macos
+          ./corten-matrix-macos --version
+
+      - name: Checksum
+        # sha256sum format: "<hex>  <name>". `update` reads the first field.
+        run: shasum -a 256 corten-matrix-macos | tee corten-matrix-macos.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            corten-matrix-macos
+            corten-matrix-macos.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Passed as an env var rather than a heredoc: a heredoc terminator
+          # cannot be indented, and everything in a YAML `run:` block is.
+          NOTES: |
+            Universal macOS binary (arm64 + x86_64), built from source in CI.
+
+            ## Install
+
+            ```bash
+            chmod +x corten-matrix-macos
+            # Downloaded binaries are ad-hoc signed, not notarized, so macOS
+            # quarantines them. Strip the flag before first run:
+            xattr -cr corten-matrix-macos
+            ./corten-matrix-macos setup-beeper    # or: setup
+            ```
+
+            Verify the download:
+
+            ```bash
+            shasum -a 256 -c corten-matrix-macos.sha256
+            ```
+
+            ## Updating
+
+            `corten-matrix update` downloads the newest release and restarts the
+            bridge. With a source checkout present it rebuilds that instead; force
+            either with `--release` / `--source`.
+
+            ## Not included
+
+            No Linux binaries. Linux requires closed-source NAC crates that are
+            not in the public tree, so it cannot be built here — use upstream's
+            releases for Linux.
+        run: |
+          set -euo pipefail
+          gh release create "$RAW_TAG" \
+            corten-matrix-macos corten-matrix-macos.sha256 \
+            --repo "$REPO" \
+            --title "$RAW_TAG" \
+            --notes "$NOTES"
