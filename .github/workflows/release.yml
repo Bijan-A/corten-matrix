@@ -24,6 +24,10 @@ on:
       tag:
         description: 'Tag to build and release (e.g. v1.1.0-fork.1)'
         required: true
+      allow_partial:
+        description: 'Publish even if one architecture slice failed to build'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -38,16 +42,16 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     strategy:
-      # Don't let a failing Intel slice kill the arm64 one: an arm64-only
-      # release still works for Apple Silicon, and the package job below
-      # degrades to a thin binary rather than publishing nothing.
+      # Let both slices run to completion even if one fails, so a single run
+      # reports every problem instead of one per retry. The package job still
+      # refuses to publish an incomplete "universal" binary.
       fail-fast: false
       matrix:
         include:
           # macos-14+ runners are Apple Silicon; macos-13 is the last Intel
-          # image. If GitHub retires macos-13, drop that entry and this
-          # workflow still produces a working arm64-only binary — the lipo
-          # step handles a single slice.
+          # image. Both are required by default — see the package job. If
+          # GitHub retires macos-13, re-run via workflow_dispatch with
+          # allow_partial=true to ship arm64-only, deliberately.
           - runner: macos-14
             arch: arm64
           - runner: macos-13
@@ -106,15 +110,27 @@ jobs:
           ./corten-matrix --version
           # The arch this slice actually contains.
           lipo -info corten-matrix
+
+          # Materialise both haystacks to files before grepping. Piping into
+          # `grep -q` makes grep exit on first match, which SIGPIPEs the writer;
+          # under `set -o pipefail` that non-zero status propagates and reads as
+          # "not found" — a false negative that fails the build precisely when
+          # the string IS present.
+          strings corten-matrix > /tmp/cm-strings.txt
+          ./corten-matrix help > /tmp/cm-help.txt
+
           # Prove the ShareProfile panic guard is compiled in, not just present
           # in the source tree.
-          if ! strings corten-matrix | grep -q "inline ShareProfile fetch panicked"; then
+          if ! grep -q "inline ShareProfile fetch panicked" /tmp/cm-strings.txt; then
             echo "::error::panic guard string missing — built from stale artifacts?"
             exit 1
           fi
-          # Prove the source-build update command is wired up.
-          ./corten-matrix help | grep -q update || {
-            echo "::error::update subcommand not advertised in help"; exit 1; }
+          # Prove the update command is wired up.
+          if ! grep -q "update" /tmp/cm-help.txt; then
+            echo "::error::update subcommand not advertised in help"
+            exit 1
+          fi
+          echo "verified: panic guard present, update advertised"
 
       - name: Run Go tests
         run: |
@@ -136,8 +152,8 @@ jobs:
   package:
     name: Universal binary
     needs: build
-    # Run even if one matrix slice failed, so a dead Intel runner degrades to
-    # an arm64-only release instead of blocking the whole thing.
+    # Run even if a slice failed, so the missing-slice check below produces a
+    # clear diagnostic instead of the job being silently skipped.
     if: ${{ !cancelled() }}
     runs-on: macos-14
     steps:
@@ -146,19 +162,27 @@ jobs:
           path: slices
 
       - name: lipo into a universal binary
+        env:
+          ALLOW_PARTIAL: ${{ github.event.inputs.allow_partial || 'false' }}
         run: |
           set -euo pipefail
           slices=$(find slices -name corten-matrix -type f | sort)
           echo "slices found:"; echo "${slices:-none}"
 
-          # arm64 is non-negotiable: it's what current Macs run. Losing only
-          # the Intel slice is a degraded-but-useful release; losing arm64 is not.
-          if [ ! -f slices/corten-matrix-arm64/corten-matrix ]; then
-            echo "::error::arm64 slice missing — refusing to publish"
-            exit 1
-          fi
-          if [ ! -f slices/corten-matrix-x86_64/corten-matrix ]; then
-            echo "::warning::x86_64 slice missing — publishing an arm64-only binary (Intel Macs unsupported by this release)"
+          # A "universal" binary missing a slice is worse than no release: it
+          # looks green and then won't run on half the Macs it claims to
+          # support. Require both unless partial was explicitly requested.
+          missing=""
+          [ -f slices/corten-matrix-arm64/corten-matrix ]  || missing="$missing arm64"
+          [ -f slices/corten-matrix-x86_64/corten-matrix ] || missing="$missing x86_64"
+          if [ -n "$missing" ]; then
+            if [ "${ALLOW_PARTIAL}" = "true" ]; then
+              echo "::warning::missing slice(s):$missing — publishing a thin binary because allow_partial was set"
+            else
+              echo "::error::missing slice(s):$missing — refusing to publish a 'universal' binary that isn't."
+              echo "::error::To ship anyway, re-run this workflow via workflow_dispatch with allow_partial=true."
+              exit 1
+            fi
           fi
 
           # shellcheck disable=SC2086
