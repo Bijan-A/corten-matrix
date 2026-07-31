@@ -80,24 +80,30 @@ func HandleHostCommand(args []string, version, goos, goarch string) bool {
 // ExtraHostHelp returns extra {command, description} rows for the `help`
 // listing.
 func ExtraHostHelp() [][2]string {
+	// Mirrors the wording and shape of the official release build's rows, so
+	// muscle memory carries over between a downloaded binary and this one.
 	return [][2]string{
-		{"update", "Update to the latest version and restart"},
+		{"update", "update to the latest version & restart"},
+		{"update check", "preview what would happen without installing"},
+		{"update force", "reinstall even if already up to date"},
 	}
 }
 
 func updateUsage() {
-	fmt.Println("Usage: corten-matrix update [--source|--release] [--no-pull] [--force] [--check]")
+	fmt.Println("Usage: corten-matrix update [source|release] [check] [force] [no-pull]")
 	fmt.Println()
 	fmt.Println("  Updates this binary and restarts the bridge.")
 	fmt.Println()
 	fmt.Println("  With a source checkout present it rebuilds that checkout; without one")
-	fmt.Println("  it downloads the latest release. Pick explicitly with --source/--release.")
+	fmt.Println("  it downloads the latest release. Pick explicitly with source/release.")
 	fmt.Println()
-	fmt.Println("  --source    rebuild from the source checkout (git pull + make)")
-	fmt.Println("  --release   download the latest release asset instead of building")
-	fmt.Println("  --no-pull   source mode: skip git fetch/pull, build what is checked out")
-	fmt.Println("  --force     release mode: reinstall even if already on the latest version")
-	fmt.Println("  --check     report what would happen and exit without changing anything")
+	fmt.Println("  check      report what would happen and exit without changing anything")
+	fmt.Println("  force      reinstall even if already on the latest version")
+	fmt.Println("  source     rebuild from the source checkout (git pull + make)")
+	fmt.Println("  release    download the latest release asset instead of building")
+	fmt.Println("  no-pull    source mode: skip git fetch/pull, build what is checked out")
+	fmt.Println()
+	fmt.Println("  Every word also accepts a --flag spelling (--check, --force, …).")
 	fmt.Println()
 	fmt.Printf("  $%s   override the checkout location\n", cortenSrcEnv)
 	fmt.Printf("  $%s  override the owner/repo releases come from\n", releaseRepoEnv)
@@ -105,29 +111,51 @@ func updateUsage() {
 
 // runUpdate dispatches to the source or release path. It always terminates the
 // process.
-func runUpdate(args []string, version, goos, goarch string) {
-	mode := modeAuto
-	pull, force, check := true, false, false
+type updateOpts struct {
+	mode  updateMode
+	pull  bool
+	force bool
+	check bool
+	help  bool
+}
 
+// parseUpdateArgs accepts both spellings of every option: the bare words the
+// official release build uses (`update check`, `update force`) and the
+// flag forms (`--check`, `--force`). Leading dashes are simply stripped, so
+// the two are the same code path and neither can drift from the other.
+func parseUpdateArgs(args []string) (updateOpts, error) {
+	o := updateOpts{mode: modeAuto, pull: true}
 	for _, a := range args {
-		switch a {
-		case "--source":
-			mode = modeSource
-		case "--release":
-			mode = modeRelease
-		case "--no-pull":
-			pull = false
-		case "--force":
-			force = true
-		case "--check":
-			check = true
-		case "-h", "--help":
-			updateUsage()
-			os.Exit(0)
+		switch strings.TrimLeft(a, "-") {
+		case "source":
+			o.mode = modeSource
+		case "release":
+			o.mode = modeRelease
+		case "no-pull", "nopull":
+			o.pull = false
+		case "force":
+			o.force = true
+		case "check":
+			o.check = true
+		case "help", "h":
+			o.help = true
 		default:
-			fatalf("update: unknown argument %q (try --help)", a)
+			return o, fmt.Errorf("unknown argument %q", a)
 		}
 	}
+	return o, nil
+}
+
+func runUpdate(args []string, version, goos, goarch string) {
+	o, err := parseUpdateArgs(args)
+	if err != nil {
+		fatalf("update: %v\nTry: corten-matrix update help", err)
+	}
+	if o.help {
+		updateUsage()
+		return
+	}
+	mode, pull, force, check := o.mode, o.pull, o.force, o.check
 
 	target := installedPath()
 

@@ -133,8 +133,78 @@ func TestFindCheckoutReportsMissingWithoutExiting(t *testing.T) {
 
 func TestExtraHostHelpAdvertisesUpdate(t *testing.T) {
 	rows := ExtraHostHelp()
-	if len(rows) != 1 || rows[0][0] != "update" {
-		t.Fatalf("ExtraHostHelp() = %v, want a single 'update' row", rows)
+	var names []string
+	for _, r := range rows {
+		names = append(names, r[0])
+	}
+	// Matches the official build's three rows so `help` looks the same.
+	for _, want := range []string{"update", "update check", "update force"} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("ExtraHostHelp() missing %q; got %v", want, names)
+		}
+	}
+}
+
+// Both spellings must mean the same thing: the bare words the official release
+// build uses, and the --flag forms.
+func TestParseUpdateArgsAcceptsBareWordsAndFlags(t *testing.T) {
+	for _, pair := range [][2][]string{
+		{{"check"}, {"--check"}},
+		{{"force"}, {"--force"}},
+		{{"source"}, {"--source"}},
+		{{"release"}, {"--release"}},
+		{{"no-pull"}, {"--no-pull"}},
+		{{"help"}, {"-h"}},
+		{{"source", "no-pull"}, {"--source", "--no-pull"}},
+	} {
+		bare, err1 := parseUpdateArgs(pair[0])
+		flag, err2 := parseUpdateArgs(pair[1])
+		if err1 != nil || err2 != nil {
+			t.Errorf("%v / %v: errors %v / %v", pair[0], pair[1], err1, err2)
+			continue
+		}
+		if bare != flag {
+			t.Errorf("%v parsed as %+v but %v parsed as %+v", pair[0], bare, pair[1], flag)
+		}
+	}
+}
+
+func TestParseUpdateArgsDefaults(t *testing.T) {
+	o, err := parseUpdateArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.mode != modeAuto || !o.pull || o.force || o.check || o.help {
+		t.Fatalf("defaults = %+v; want auto mode, pull on, nothing else set", o)
+	}
+}
+
+func TestParseUpdateArgsSemantics(t *testing.T) {
+	o, _ := parseUpdateArgs([]string{"check"})
+	if !o.check || o.mode != modeAuto {
+		t.Errorf("check = %+v", o)
+	}
+	o, _ = parseUpdateArgs([]string{"release", "force"})
+	if o.mode != modeRelease || !o.force {
+		t.Errorf("release force = %+v", o)
+	}
+	o, _ = parseUpdateArgs([]string{"source", "no-pull"})
+	if o.mode != modeSource || o.pull {
+		t.Errorf("source no-pull = %+v", o)
+	}
+}
+
+func TestParseUpdateArgsRejectsUnknown(t *testing.T) {
+	for _, bad := range [][]string{{"bogus"}, {"--bogus"}, {"check", "nope"}, {""}} {
+		if _, err := parseUpdateArgs(bad); err == nil {
+			t.Errorf("parseUpdateArgs(%v) accepted an unknown argument", bad)
+		}
 	}
 }
 
