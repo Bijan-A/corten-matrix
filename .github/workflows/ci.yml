@@ -1,0 +1,140 @@
+name: CI
+
+# Build and test on every pull request, and on pushes to master.
+#
+# macos-14 only. macos-13 (the Intel image) consistently fails to schedule for
+# this repo, and a PR check that sits queued forever is worse than no check.
+# Release builds still attempt both slices -- see release.yml.
+#
+# Pushes to master matter for more than the badge: Actions caches are scoped so
+# that a pull request can READ the base branch's cache but not write it. Without
+# a master run populating the cargo cache, every PR would build Rust from
+# scratch.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the old run; don't burn a runner on a
+# commit nobody is waiting for.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needed to diff a pull request against its base commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Only the files this PR touches. 14 files inherited from upstream are not
+      # gofmt-clean; reformatting them wholesale would create conflict surface
+      # against future upstream rebases for no benefit, and it is not a
+      # contributor's job to fix them. New and modified code still has to be
+      # clean. Cheap and needs no toolchain, so it runs before cargo.
+      - name: gofmt (changed files)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- '*.go' || true)"
+          if [ -z "$changed" ]; then
+            echo "no Go files changed"
+            exit 0
+          fi
+          echo "checking:"; echo "$changed"
+          # shellcheck disable=SC2086
+          unformatted="$(gofmt -l $changed)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat files changed by this PR:"
+            echo "$unformatted"
+            echo "Run: gofmt -w $unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: brew install protobuf libolm libheif tmux
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+            third_party/rustpush-upstream
+          # Same key shape as release.yml so the two share a cache.
+          key: cargo-arm64-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+          restore-keys: cargo-arm64-
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          # The Makefile hardcodes /opt/homebrew; on the arm64 runner that is
+          # already correct, but deriving it keeps this working if the runner
+          # image ever changes.
+          BREW="$(brew --prefix)"
+          make CGO_CFLAGS="-I${BREW}/include" CGO_LDFLAGS="-L${BREW}/lib -L${PWD}"
+
+      - name: Verify the binary
+        run: |
+          set -euo pipefail
+          test -f corten-matrix
+          ./corten-matrix --version
+
+          # Materialise before grepping: piping into `grep -q` makes grep exit on
+          # first match, SIGPIPEs the writer, and under `set -o pipefail` that
+          # non-zero status reads as "not found" — failing precisely when the
+          # string IS present.
+          strings corten-matrix > /tmp/cm-strings.txt
+          ./corten-matrix help > /tmp/cm-help.txt
+
+          # Regression guard: these are the panic guards protecting the APNs
+          # receive loop. If a change removes them, catch it here rather than
+          # ten minutes into a wedge in production.
+          for needle in "inline ShareProfile fetch panicked" "Group photo MMCS download panicked"; do
+            if ! grep -q "$needle" /tmp/cm-strings.txt; then
+              echo "::error::panic guard missing from the binary: $needle"
+              exit 1
+            fi
+          done
+
+          if ! grep -q "update" /tmp/cm-help.txt; then
+            echo "::error::update subcommand not advertised in help"
+            exit 1
+          fi
+          echo "verified: panic guards present, update advertised"
+
+      - name: go vet
+        run: |
+          set -euo pipefail
+          BREW="$(brew --prefix)"
+          CGO_CFLAGS="-I${BREW}/include" CGO_LDFLAGS="-L${BREW}/lib -L${PWD}" \
+            go vet ./pkg/... ./imessage/... ./cmd/...
+
+      - name: go test
+        run: |
+          set -euo pipefail
+          # pkg/connector links librustpushgo.a, left in the repo root by `make`,
+          # so its tests need the same CGO flags the build used.
+          BREW="$(brew --prefix)"
+          CGO_CFLAGS="-I${BREW}/include" CGO_LDFLAGS="-L${BREW}/lib -L${PWD}" \
+            go test ./pkg/... ./imessage/...
