@@ -1,5 +1,7 @@
 # Corten-Matrix
 
+[![CI](https://github.com/Bijan-A/corten-matrix/actions/workflows/ci.yml/badge.svg)](https://github.com/Bijan-A/corten-matrix/actions/workflows/ci.yml)
+
 > **A community-maintained continuation of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)**, tracking upstream release **1.1.0**.
 >
 > Upstream is a hobby project and has paused incoming pull requests. This project exists so patches have somewhere to go — **issues and pull requests are welcome here**. See [Contributing](#contributing).
