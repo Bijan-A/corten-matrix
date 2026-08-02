@@ -50,11 +50,27 @@ ifneq ($(UNAME_S),Darwin)
   $(error This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework. Build and run it on a Mac.)
 endif
 
+# Homebrew's prefix differs by architecture: /opt/homebrew on Apple Silicon,
+# /usr/local on Intel. Ask brew rather than hardcoding, or an Intel build fails
+# to find olm/olm.h. Note these are `:=` assignments, which take precedence over
+# the environment in GNU make — so exporting CGO_CFLAGS cannot work around a
+# wrong value here, only a command-line override can. Deriving it is what lets
+# `make` and `corten-matrix update source` work unmodified on both arches.
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+ifeq ($(BREW_PREFIX),)
+  # brew isn't installed yet (check-deps installs it below); guess by arch.
+  ifeq ($(shell uname -m),arm64)
+    BREW_PREFIX := /opt/homebrew
+  else
+    BREW_PREFIX := /usr/local
+  endif
+endif
+
 # Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
-export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
+export PATH := $(BREW_PREFIX)/bin:$(BREW_PREFIX)/sbin:$(PATH)
 BINARY      := $(APP_NAME)
-CGO_CFLAGS  := -I/opt/homebrew/include
-CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
+CGO_CFLAGS  := -I$(BREW_PREFIX)/include
+CGO_LDFLAGS := -L$(BREW_PREFIX)/lib -L$(CURDIR)
 CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
 
 # ===========================================================================
@@ -66,7 +82,7 @@ check-deps:
 	@if ! command -v brew >/dev/null 2>&1; then \
 		echo "Installing Homebrew..."; \
 		NONINTERACTIVE=1 /bin/bash -c "$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; \
-		eval "$$(/opt/homebrew/bin/brew shellenv)"; \
+		eval "$$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)"; \
 	fi; \
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
