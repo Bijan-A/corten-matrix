@@ -73,6 +73,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
+		cmdSyncStatus,
 		cmdContacts,
 		cmdClearIdentityCache,
 	}
@@ -1285,6 +1286,51 @@ func fnRestoreDebug(ce *commands.Event) {
 	}
 
 	ce.Reply(sb.String())
+}
+
+// cmdSyncStatus reports overall progress for the two long-running sync
+// operations: pulling iMessage history from CloudKit into the local
+// database, and delivering it onward to Matrix. Shares its reporting logic
+// (GetSyncStatus/Format in sync_status.go) with the standalone
+// `corten-matrix sync-status` CLI subcommand, which reads the same database
+// directly without needing the bridge to be running.
+var cmdSyncStatus = &commands.FullHandler{
+	Name: "sync-status",
+	Func: fnSyncStatus,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "Show CloudKit backfill and Matrix delivery progress.",
+	},
+	RequiresLogin: true,
+}
+
+func fnSyncStatus(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("Not logged in.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	if !client.Main.Config.UseCloudKitBackfill() || client.cloudStore == nil {
+		ce.Reply("CloudKit backfill not enabled.")
+		return
+	}
+
+	report, err := GetSyncStatus(ce.Ctx, client.Main.Bridge.DB.Database, string(client.Main.Bridge.ID))
+	if err != nil {
+		ce.Reply("Failed to build sync status: %v", err)
+		return
+	}
+
+	client.cloudSyncRunningLock.RLock()
+	running := client.cloudSyncRunning
+	client.cloudSyncRunningLock.RUnlock()
+
+	ce.Reply(report.Format(&running))
 }
 
 // cmdMsgDebug inspects cloud_message for a given identifier and reports where

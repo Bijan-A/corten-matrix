@@ -3356,6 +3356,13 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
+	// Bump the sync-status live-traffic counter (kv_store-backed, readable by
+	// the standalone `corten-matrix sync-status` CLI too) — see
+	// incrLiveMessageCounter in sync_status.go for why this exists
+	// separately from the CloudKit backfill counters.
+	if c.Main.Bridge.DB.Database != nil {
+		incrLiveMessageCounter(context.Background(), c.Main.Bridge.DB.Database, string(c.Main.Bridge.ID), log)
+	}
 	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
 	if createPortal || sender.IsFromMe {
 		log.Info().

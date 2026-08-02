@@ -3045,6 +3045,89 @@ func (s *cloudBackfillStore) debugTotalMessageCount(ctx context.Context) (int, e
 	return count, err
 }
 
+// getSyncStateDetail returns the full persisted state for a zone: whether a
+// continuation token is stored, the timestamp of the last successful sync,
+// the last recorded error (if any), and when the row was last touched. Used
+// by the sync-status command/CLI to report per-zone progress without needing
+// the running process's in-memory flags.
+func (s *cloudBackfillStore) getSyncStateDetail(ctx context.Context, zone string) (hasToken bool, lastSuccess *time.Time, lastError string, updatedAt *time.Time, err error) {
+	var token, lastErr sql.NullString
+	var successMS, updatedMS sql.NullInt64
+	err = s.db.QueryRow(ctx,
+		`SELECT continuation_token, last_success_ts, last_error, updated_ts FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`,
+		s.loginID, zone,
+	).Scan(&token, &successMS, &lastErr, &updatedMS)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil, "", nil, nil
+		}
+		return false, nil, "", nil, err
+	}
+	hasToken = token.Valid && token.String != ""
+	if successMS.Valid {
+		t := time.UnixMilli(successMS.Int64)
+		lastSuccess = &t
+	}
+	if lastErr.Valid {
+		lastError = lastErr.String
+	}
+	if updatedMS.Valid {
+		t := time.UnixMilli(updatedMS.Int64)
+		updatedAt = &t
+	}
+	return hasToken, lastSuccess, lastError, updatedAt, nil
+}
+
+// debugTotalChatCount returns the number of non-deleted cloud_chat rows.
+func (s *cloudBackfillStore) debugTotalChatCount(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_chat WHERE login_id=$1 AND deleted=FALSE`,
+		s.loginID,
+	).Scan(&count)
+	return count, err
+}
+
+// deliverableMessageCount returns the number of non-deleted, non-reaction
+// cloud_message rows that are eligible to reach Matrix — i.e. the denominator
+// against which deliveredMessageCount's numerator is measured. Reactions
+// (tapback_type >= 2000) are excluded because they bridge into bridgev2's
+// separate `reaction` table, not `message`.
+func (s *cloudBackfillStore) deliverableMessageCount(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_message
+		WHERE login_id=$1 AND deleted=FALSE AND record_name <> ''
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+	`, s.loginID).Scan(&count)
+	return count, err
+}
+
+// deliveredMessageCount returns how many of those deliverable cloud_message
+// rows have actually reached Matrix, i.e. have a matching row in bridgev2's
+// `message` table. Mirrors the membership check in scrubBridgedBodies (same
+// part-suffix normalization, same UPPER() case-fold), so "deliverable minus
+// delivered" is exactly the set scrubBridgedBodies is still waiting on.
+func (s *cloudBackfillStore) deliveredMessageCount(ctx context.Context, bridgeID string) (int, error) {
+	instr := sqlInstrFunc(s.db)
+	query := strings.ReplaceAll(`
+		SELECT COUNT(*) FROM cloud_message
+		WHERE login_id=$1 AND deleted=FALSE AND record_name <> ''
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND UPPER(guid) IN (
+		    SELECT UPPER(id) FROM message
+		    WHERE bridge_id=$2 AND (room_receiver=$1 OR room_receiver='')
+		    UNION
+		    SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		    WHERE bridge_id=$2 AND {{INSTR}}(id, '_') > 0
+		      AND (room_receiver=$1 OR room_receiver='')
+		  )
+	`, "{{INSTR}}", instr)
+	var count int
+	err := s.db.QueryRow(ctx, query, s.loginID, bridgeID).Scan(&count)
+	return count, err
+}
+
 func nullableString(value *string) any {
 	if value == nil {
 		return nil

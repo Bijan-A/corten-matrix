@@ -669,6 +669,7 @@ func PrintHelp() {
 		{"restart", "restart the bridge"},
 		{"status", "show service status"},
 		{"logs 1", "tail a bridge log (1 = second account)"},
+		{"sync-status 1", "show CloudKit + Matrix sync progress (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
 		{"reset", "reset bridge state"},
@@ -736,6 +737,8 @@ func RunManagement(cmd string, args []string) {
 		tailLogs(args)
 	case "bbctl":
 		runBbctl(args)
+	case "sync-status":
+		runSyncStatus(args)
 	}
 	os.Exit(0)
 }

@@ -141,6 +141,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix start` / `stop` / `restart` | Control the running bridge service (launchd). One service runs both accounts. |
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
+| `corten-matrix sync-status 1` | Show CloudKit → database and database → Matrix sync progress; `1` = second account. Reads the database directly, no running bridge required. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
 | `corten-matrix reset` | Reset bridge state — prompts for confirmation (`--yes` to skip); see the warning under [Configuration](#configuration). |
@@ -454,6 +455,8 @@ Everything above is on by default and has no config toggle. The single escape ha
 ## Management
 
 The `corten-matrix` CLI is the easy path — `corten-matrix start | stop | restart | status | logs` work the same on both platforms. The raw equivalents (and other knobs) are below if you'd rather wire your own thing.
+
+**Checking sync progress.** `corten-matrix sync-status` (or `sync-status 1` for the second account) reports progress on the two long-running sync operations — pulling iMessage history from CloudKit into the local database, and delivering it onward to Matrix — without needing the bridge to be running: it reads the database directly. The same report is available from inside a chat with the bridge as the `sync-status` management-room command (prefix with `!im` from a portal room), which additionally shows whether a sync is actively running right now.
 
 ### macOS
 

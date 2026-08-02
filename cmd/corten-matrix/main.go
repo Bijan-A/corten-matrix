@@ -108,7 +108,7 @@ func main() {
 			// bridge under this one process (see pkg/cli.RunAllBridges).
 			cli.RunAllBridges()
 		case "setup", "setup-beeper", "start", "stop", "restart",
-			"status", "logs", "bbctl", "reset", "uninstall",
+			"status", "logs", "sync-status", "bbctl", "reset", "uninstall",
 			"install-service", "uninstall-service":
 			// Host-side management CLI (the familiar ops, now via subcommands
 			// instead of a Makefile). Docker-aware; see pkg/cli.
