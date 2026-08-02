@@ -85,23 +85,30 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 // columnExists reports whether tableName has a column named columnName.
-// SQLite exposes this via the pragma_table_info() table-valued function;
-// Postgres has no such function, so it's queried through information_schema
-// instead. Getting this wrong (e.g. always assuming the column is missing)
-// makes every ALTER TABLE ADD COLUMN migration below fail with "column
-// already exists" on the second and subsequent runs once a column has been
-// added once, which aborts ensureSchema and leaves the whole CloudKit
-// backfill store uninitialized.
+//
+// SQLite exposes this through the pragma_table_info() table-valued function.
+// Postgres has no such function, so the query has to go through
+// information_schema instead — and it must not be allowed to fail silently.
+// The migration loops below use this to decide whether to run
+// `ALTER TABLE ... ADD COLUMN`; if the check always answers "missing", the
+// first ALTER hits a duplicate-column error and aborts ensureSchema, which
+// leaves the whole store uninitialized.
 func columnExists(ctx context.Context, db *dbutil.Database, tableName, columnName string) (bool, error) {
 	var count int
 	var err error
 	switch db.Dialect {
 	case dbutil.Postgres:
+		// information_schema.columns is unqualified by schema here to match
+		// pragma_table_info's "whatever this connection can see" semantics;
+		// the bridge owns its database and does not shadow these names.
 		err = db.QueryRow(ctx,
 			`SELECT COUNT(*) FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
 			tableName, columnName,
 		).Scan(&count)
 	default:
+		// pragma_table_info's argument is a table name, not a bindable value,
+		// so it has to be interpolated. Every caller passes a hardcoded
+		// literal — never user input.
 		err = db.QueryRow(ctx,
 			fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=$1`, tableName),
 			columnName,
@@ -113,10 +120,10 @@ func columnExists(ctx context.Context, db *dbutil.Database, tableName, columnNam
 	return count > 0, nil
 }
 
-// sqlInstrFunc returns the name of the "find substring position" function for
-// the store's dialect: SQLite only has instr(str, substr), Postgres only has
-// strpos(str, substr). Both are 1-based with 0 meaning "not found," so a
-// caller can substitute the name straight into a query template.
+// sqlInstrFunc returns the dialect's name for "1-based position of substring,
+// or 0 if absent": SQLite has only instr(haystack, needle), Postgres has only
+// strpos(haystack, needle). Argument order and return convention are identical,
+// so callers can substitute the name into a query template.
 func sqlInstrFunc(db *dbutil.Database) string {
 	if db.Dialect == dbutil.Postgres {
 		return "strpos"
@@ -124,6 +131,40 @@ func sqlInstrFunc(db *dbutil.Database) string {
 	return "instr"
 }
 
+// sqlPlaceholders returns a comma-separated list of n bind placeholders in the
+// dialect's own spelling: "$1, $2, …" on Postgres, "?, ?, …" on SQLite.
+//
+// Nearly every query in this package can write "$N" unconditionally, because
+// dbutil rewrites "$N" to "?N" when the dialect is SQLite. That rewrite lives
+// in dbutil's Exec/Query/QueryRow wrappers ONLY. The batch upserts below run
+// through tx.PrepareContext on a raw *sql.Tx (beginTx hands back
+// s.db.RawDB.BeginTx), which never passes through dbutil at all — so those
+// statements have to carry the correct spelling themselves. Literal "?" there
+// is a syntax error on Postgres, which is what this fixes.
+func sqlPlaceholders(db *dbutil.Database, n int) string {
+	out := make([]string, n)
+	for i := range out {
+		if db.Dialect == dbutil.Postgres {
+			out[i] = "$" + strconv.Itoa(i+1)
+		} else {
+			out[i] = "?"
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// sqlBlobType returns the dialect's binary column type. Postgres has no BLOB;
+// SQLite has no BYTEA — but SQLite's type names only determine affinity, and
+// any name containing "BLOB" (or an unrecognised name) yields BLOB affinity,
+// which never coerces a []byte value. Declaring BYTEA on SQLite would work by
+// accident for that reason, but naming each dialect's real type keeps
+// `.schema` output honest and avoids relying on affinity fallback rules.
+func sqlBlobType(db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return "BYTEA"
+	}
+	return "BLOB"
+}
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	// Privacy: secure_delete forces SQLite to zero out freed pages during
 	// DELETE/UPDATE so NULLing text/subject/sender in scrubBridgedBodies does
@@ -137,6 +178,12 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	// (the pool hands scrub writes to arbitrary connections). Self-hosters who
 	// want immediate page reclamation can run `sqlite3 bridge.db "VACUUM;"`
 	// manually after first-boot scrub.
+
+	// Postgres has no BLOB type, and `CREATE TABLE IF NOT EXISTS` validates
+	// column types before it checks whether the table exists — so a literal
+	// BLOB here fails on every startup, not just the first, and aborts
+	// ensureSchema before the CloudKit sync controller can start.
+	blobType := sqlBlobType(s.db)
 
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
@@ -186,7 +233,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			login_id TEXT NOT NULL,
 			portal_id TEXT NOT NULL,
 			ts BIGINT NOT NULL,
-			data BYTEA NOT NULL,
+			data ` + blobType + ` NOT NULL,
 			PRIMARY KEY (login_id, portal_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS restore_override (
@@ -224,11 +271,14 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"group_photo_guid", "TEXT"},
 		{"deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
 		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
+		// DEFAULT FALSE, not DEFAULT 0: Postgres will not coerce an integer
+		// literal into a BOOLEAN column. SQLite treats FALSE as an alias for
+		// 0, so pre-existing rows written as 0/1 keep comparing correctly.
 		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT FALSE"},
 	} {
 		exists, err := columnExists(ctx, s.db, "cloud_chat", col.name)
 		if err != nil {
-			return fmt.Errorf("failed to check for %s column on cloud_chat: %w", col.name, err)
+			return fmt.Errorf("failed to check for the %s column on cloud_chat: %w", col.name, err)
 		}
 		if !exists {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_chat ADD COLUMN %s %s`, col.name, col.def)); err != nil {
@@ -258,7 +308,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	} {
 		exists, err := columnExists(ctx, s.db, "cloud_message", col.name)
 		if err != nil {
-			return fmt.Errorf("failed to check for %s column on cloud_message: %w", col.name, err)
+			return fmt.Errorf("failed to check for the %s column on cloud_message: %w", col.name, err)
 		}
 		if !exists {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
@@ -325,7 +375,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_cache (
 		login_id    TEXT    NOT NULL,
 		record_name TEXT    NOT NULL,
-		content_json BYTEA  NOT NULL,
+		content_json `+blobType+` NOT NULL,
 		created_ts  BIGINT  NOT NULL,
 		PRIMARY KEY (login_id, record_name)
 	)`); err != nil {
@@ -611,7 +661,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			attachments_json, date_read_ms, has_body,
 			reply_to_guid, reply_to_part,
 			created_ts, updated_ts
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+		) VALUES (`+sqlPlaceholders(s.db, 22)+`)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -894,7 +944,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
 			group_photo_guid, participants_json, updated_ts, created_ts, is_filtered
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES (`+sqlPlaceholders(s.db, 12)+`)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -1959,8 +2009,9 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
 	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
 	// 0 rows and the stub INSERT running, a concurrent CloudKit upsert
-	// could land a live (deleted=FALSE) row for this guid. ON CONFLICT DO NOTHING
-	// would then no-op against it and the body would bridge undeleted. Wrap
+	// could land a live (deleted=FALSE) row for this guid. ON CONFLICT DO
+	// NOTHING would then no-op against it and the body would bridge
+	// undeleted. Wrap
 	// both in a single txn so the upsert serializes either fully before
 	// (UPDATE scrubs it) or fully after (its ON CONFLICT CASE preserves the
 	// stub's deleted=TRUE). DoTxn reuses an outer txn if ctx already carries
@@ -2293,7 +2344,8 @@ func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, new
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
-// Uses ON CONFLICT DO NOTHING so it's safe to call even if the message already exists.
+// Uses ON CONFLICT DO NOTHING so it's safe to call even if the message
+// already exists.
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
@@ -2582,8 +2634,10 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 // Returns the number of rows fixed.
 func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
-	instr := sqlInstrFunc(s.db)
-	query := strings.ReplaceAll(`
+	// INSTR is SQLite-only; Postgres spells it STRPOS. Same arguments, same
+	// 1-based result, same 0-for-absent — only the name differs, so neither
+	// dialect can be served by a single literal spelling.
+	result, err := s.db.Exec(ctx, strings.ReplaceAll(`
 		UPDATE cloud_message AS m
 		SET portal_id = cc.portal_id,
 		    updated_ts = $2
@@ -2602,8 +2656,8 @@ func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (in
 		  )
 		  AND m.portal_id <> cc.portal_id
 		  AND cc.portal_id IS NOT NULL
-		  AND cc.portal_id <> ''`, "{{INSTR}}", instr)
-	result, err := s.db.Exec(ctx, query, s.loginID, now)
+		  AND cc.portal_id <> ''
+	`, "{{INSTR}}", sqlInstrFunc(s.db)), s.loginID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -3625,12 +3679,22 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	// Reactions (tapback_type IS NOT NULL) are excluded: an incoming reaction
 	// to something you sent does not create an unread state. The filter finds
 	// the last substantive message and uses its direction as the read signal.
+	//
+	// The tiebreaker used to be `rowid DESC` — SQLite's implicit insertion
+	// counter, which Postgres tables do not have at all. `created_ts` is the
+	// closest portable stand-in (it is the insertion timestamp), but unlike
+	// rowid it is not unique: a batch upsert stamps every row in it with the
+	// same time.Now().UnixMilli(). Two messages sharing both timestamp_ms and
+	// created_ts would then order arbitrarily, and this query's single result
+	// decides the conversation's read state. `guid` breaks the remaining tie —
+	// it is half of the primary key, so it is always unique per login, which
+	// makes the result deterministic on both dialects.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
 		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC, guid DESC
+		ORDER BY timestamp_ms DESC, created_ts DESC, guid DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
 	if err == nil {
@@ -3762,7 +3826,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
 	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
 	// CloudKit-mixed-case matching the EXISTS form had.
-	instr := sqlInstrFunc(s.db)
+	// instr() is SQLite-only; Postgres spells the same function strpos().
 	query := strings.ReplaceAll(`
 		UPDATE cloud_message
 		SET text=NULL,
@@ -3792,7 +3856,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      )`+exclusionSQL+`
 		    LIMIT `+limitPlaceholder+`
 		  )
-	`, "{{INSTR}}", instr)
+	`, "{{INSTR}}", sqlInstrFunc(s.db))
 	for {
 		result, err := s.db.Exec(ctx, query, args...)
 		if err != nil {
