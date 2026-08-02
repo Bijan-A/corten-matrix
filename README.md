@@ -143,8 +143,8 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix status` | Show the service status. |
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
 | `corten-matrix sync-status 1` | Show CloudKit → database and database → Matrix sync progress; `1` = second account. Reads the database directly, no running bridge required. |
-| `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA). |
-| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
+| `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
+| `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). `install-service` **will not overwrite a service unit it did not create** — the installer writes a richer unit than it can reproduce, and replacing that one breaks the install. If a unit is already there it refuses and tells you to use `uninstall-service` first. `uninstall-service` removes the unit from both the user and system scopes, and reports failure rather than success if anything survives. |
 | `corten-matrix reset` | Reset bridge state — prompts for confirmation (`--yes` to skip); see the warning under [Configuration](#configuration). |
 | `corten-matrix update` | Update and restart. Rebuilds your source checkout if you have one, otherwise downloads the newest release — see [Updating](#updating). |
 | `corten-matrix update check` / `update force` | `check` reports what would happen without changing anything; `force` reinstalls even if already current. |
