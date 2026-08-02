@@ -211,8 +211,11 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 	// Migrations: add missing columns to cloud_chat (SQLite doesn't support IF NOT EXISTS on ALTER).
-	// fwd_backfill_done: set to 1 when FetchMessages(forward) completes for a portal so that
-	// preUploadCloudAttachments skips those portals on restart. Default 0 means "not yet done".
+	// fwd_backfill_done: set to TRUE when FetchMessages(forward) completes for a portal so
+	// that preUploadCloudAttachments skips those portals on restart. Default FALSE means
+	// "not yet done". Must stay a proper boolean literal (not 0/1) in every query below —
+	// Postgres has no implicit boolean<->integer cast and raises "operator does not exist:
+	// boolean = integer" on comparisons like fwd_backfill_done=1.
 	// deleted: soft-deletes cloud_chat rows alongside cloud_message rows so restore-chat can
 	// recover group name and participants.
 	for _, col := range []struct{ name, def string }{
@@ -221,7 +224,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"group_photo_guid", "TEXT"},
 		{"deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
 		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
-		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT 0"},
+		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT FALSE"},
 	} {
 		exists, err := columnExists(ctx, s.db, "cloud_chat", col.name)
 		if err != nil {
@@ -2171,7 +2174,7 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 func (s *cloudBackfillStore) undeleteCloudChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
 		`UPDATE cloud_chat
-		 SET deleted=FALSE, updated_ts=$3, fwd_backfill_done=0
+		 SET deleted=FALSE, updated_ts=$3, fwd_backfill_done=FALSE
 		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
 		s.loginID, portalID, time.Now().UnixMilli(),
 	); err != nil {
@@ -2197,12 +2200,12 @@ func (s *cloudBackfillStore) hardDeleteMessagesByPortalID(ctx context.Context, p
 	return n, nil
 }
 
-// resetForwardBackfillDone unconditionally sets fwd_backfill_done=0 for all
+// resetForwardBackfillDone unconditionally sets fwd_backfill_done=FALSE for all
 // cloud_chat rows of a portal so forward backfill re-runs. Used during chat
 // recovery where the cloud_chat may or may not be soft-deleted.
 func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, portalID string) error {
 	_, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=0 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=FALSE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
 	return err
@@ -2271,7 +2274,7 @@ func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, new
 	}
 	nowMS := time.Now().UnixMilli()
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET portal_id=$3, fwd_backfill_done=0, updated_ts=$4
+		`UPDATE cloud_chat SET portal_id=$3, fwd_backfill_done=FALSE, updated_ts=$4
 		 WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, oldPortalID, newPortalID, nowMS,
 	); err != nil {
@@ -3267,7 +3270,7 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	// row wasn't soft-deleted (e.g., recover arrived before delete was persisted,
 	// or the row was only tracked in-memory via recentlyDeletedPortals).
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=0 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=FALSE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	); err != nil {
 		return 0, fmt.Errorf("failed to reset fwd_backfill_done for portal %s: %w", portalID, err)
@@ -3364,7 +3367,7 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 	}
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, group_id, display_name, group_photo_guid, participants_json, created_ts, updated_ts, deleted, fwd_backfill_done)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, FALSE, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, FALSE, FALSE)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			portal_id=EXCLUDED.portal_id,
 			display_name=COALESCE(EXCLUDED.display_name, cloud_chat.display_name),
@@ -3495,7 +3498,7 @@ func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recor
 // corresponding cloud_chat row.
 func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portalID string) {
 	res, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=1 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=TRUE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
 
@@ -3511,7 +3514,7 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	if needsInsert {
 		_, _ = s.db.Exec(context.Background(), `
 			INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
-			VALUES ($1, $2, $3, $4, 1)
+			VALUES ($1, $2, $3, $4, TRUE)
 			ON CONFLICT (login_id, cloud_chat_id) DO NOTHING`,
 			s.loginID, "synthetic:"+portalID, portalID, time.Now().UnixMilli(),
 		)
@@ -3524,7 +3527,7 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
 	var done bool
 	err := s.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=1)`,
+		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=TRUE)`,
 		s.loginID, portalID,
 	).Scan(&done)
 	if err != nil {
@@ -3538,7 +3541,7 @@ func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID
 // to skip portals that don't need pre-upload on restart.
 func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1 AND fwd_backfill_done=1`,
+		`SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1 AND fwd_backfill_done=TRUE`,
 		s.loginID,
 	)
 	if err != nil {
