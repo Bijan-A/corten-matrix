@@ -79,3 +79,21 @@ func TestForwardBackfillDoneLifecycle(t *testing.T) {
 		t.Fatalf("isForwardBackfillDone = false after second markForwardBackfillDone (update path), want true")
 	}
 }
+
+// A failing query must report false rather than true: treating an error as
+// "done" would skip backfill for the portal entirely. It must also not panic
+// or block. The warning it now logs is what makes the failure visible — see
+// issue #4 — but the contract tested here is the return value.
+func TestIsForwardBackfillDoneReturnsFalseOnQueryError(t *testing.T) {
+	store := openTestCloudChatDB(t)
+	ctx := context.Background()
+
+	// Drop the table out from under it to force a query error.
+	if _, err := store.db.Exec(ctx, `DROP TABLE cloud_chat`); err != nil {
+		t.Fatalf("drop cloud_chat: %v", err)
+	}
+
+	if store.isForwardBackfillDone(ctx, "p1") {
+		t.Fatal("isForwardBackfillDone = true when the query failed; a failed query must never report done")
+	}
+}

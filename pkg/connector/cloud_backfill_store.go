@@ -3531,6 +3531,16 @@ func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID
 		s.loginID, portalID,
 	).Scan(&done)
 	if err != nil {
+		// Returning false is the safe answer -- treating a failed query as "done"
+		// would skip backfill entirely -- but it must not be silent. A failure
+		// here is indistinguishable from a legitimate "not done yet" to the
+		// caller, and that ambiguity is what made #3 damaging: a Postgres
+		// boolean/integer type error made this return false for every portal, so
+		// the backward-backfill queue's no-anchor retry loop deferred
+		// indefinitely with nothing in the logs pointing at SQL.
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Str("portal_id", portalID).
+			Msg("fwd_backfill_done query failed; treating as not done, so backfill may defer for this portal")
 		return false
 	}
 	return done
