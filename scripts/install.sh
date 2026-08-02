@@ -44,13 +44,21 @@ else
 
     echo ""
     echo "Database:"
-    echo "  1) PostgreSQL (recommended)"
-    echo "  2) SQLite"
+    echo "  1) SQLite (recommended)"
+    echo "  2) PostgreSQL (unsupported)"
+    echo ""
+    echo "  SQLite is the only database this bridge is developed and tested"
+    echo "  against, and it is what every supported install uses. PostgreSQL"
+    echo "  is not supported: it gets no testing here, and problems specific"
+    echo "  to it are yours to diagnose. Pick SQLite unless you have a"
+    echo "  concrete reason not to and are comfortable on your own."
     read -p "Choice [1]: " DB_CHOICE
     DB_CHOICE="${DB_CHOICE:-1}"
 
-    if [ "$DB_CHOICE" = "1" ]; then
+    if [ "$DB_CHOICE" = "2" ]; then
         DB_TYPE="postgres"
+        echo ""
+        echo "WARNING: PostgreSQL is unsupported. Proceeding at your own risk."
         read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
         DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
@@ -432,16 +440,14 @@ open('$CONFIG', 'w').write(text)
                 echo "ERROR: Password is required." >&2
                 exit 1
             fi
-            # Providers (Google, Fastmail, ...) display app passwords in
-            # space-separated groups for readability, but the actual secret
-            # has no spaces. Strip them so a verbatim copy-paste still works.
-            CARDDAV_PASSWORD="${CARDDAV_PASSWORD// /}"
-
-            # Encrypt password and patch config. Args are built as an array
-            # (not a plain string) so the password is passed as a single
-            # argument even though it may contain shell-special characters —
-            # a plain "$CARDDAV_ARGS" expansion word-splits on whitespace and
-            # silently truncates the password at its first space/tab.
+            # Encrypt password and patch config
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
             CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")

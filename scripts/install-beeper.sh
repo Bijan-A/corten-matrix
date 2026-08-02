@@ -505,16 +505,14 @@ open('$CONFIG', 'w').write(text)
                 echo "ERROR: Password is required." >&2
                 exit 1
             fi
-            # Providers (Google, Fastmail, ...) display app passwords in
-            # space-separated groups for readability, but the actual secret
-            # has no spaces. Strip them so a verbatim copy-paste still works.
-            CARDDAV_PASSWORD="${CARDDAV_PASSWORD// /}"
-
-            # Encrypt password and patch config. Args are built as an array
-            # (not a plain string) so the password is passed as a single
-            # argument even though it may contain shell-special characters —
-            # a plain "$CARDDAV_ARGS" expansion word-splits on whitespace and
-            # silently truncates the password at its first space/tab.
+            # Encrypt password and patch config
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
             CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
