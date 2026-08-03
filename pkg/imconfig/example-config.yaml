@@ -61,6 +61,19 @@ facetime_display_name: ""
 # answer FaceTime natively — the bridge wrapper adds nothing in that case.
 disable_facetime: false
 
+# Let Matrix users keep a raised power level instead of being demoted back to
+# the room baseline. Off by default: the bridge normally resets any non-bot
+# user above users_default, because an escalated user can otherwise clobber
+# bridge-managed room state.
+#
+# Turn this on if you want users to be able to rename portal rooms — renaming
+# needs power over m.room.name, and the demotion is what takes that away.
+# Destructive actions stay locked either way (tombstone, encryption, server
+# ACL, invite/kick/ban, redacting other people's messages), so a user raised to
+# a normal level like 50 or 100 still can't reach them. Only enable this where
+# you trust everyone in your portals.
+allow_power_level_escalation: false
+
 # Publish "available" to StatusKit once after startup. Peer iOS reciprocates
 # with a reshare, which is what gives the bridge the keys needed to decrypt
 # contacts' Focus/DND presence. Leaving this on dramatically improves the

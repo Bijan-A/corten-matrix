@@ -7278,6 +7278,13 @@ func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Por
 		Ban:    ptr.Ptr(plLockLevel),
 		Redact: ptr.Ptr(plLockLevel), // can't redact others; self-unsend still works
 		Custom: func(pl *event.PowerLevelsEventContent) bool {
+			// Layer 2 only. The homeserver-enforced locks above stay in force
+			// either way; this opts out of demoting users back to the room
+			// baseline, which is what allows renaming a portal (m.room.name is
+			// governed by state_default, not by the locked events map).
+			if c.Main.Config.AllowPowerLevelEscalation {
+				return false
+			}
 			return c.resetEscalatedUsers(ctx, portal, pl)
 		},
 	}

@@ -92,6 +92,20 @@ type IMConfig struct {
 	// in that case and just clutters the chat.
 	DisableFaceTime bool `yaml:"disable_facetime"`
 
+	// AllowPowerLevelEscalation lets Matrix users keep a raised power level
+	// instead of being demoted back to the room baseline. Off by default: the
+	// bridge normally resets any non-bot user above users_default, because an
+	// escalated user can otherwise clobber bridge-managed room state.
+	//
+	// Turning this on is what allows a user to rename a portal room, since
+	// m.room.name is governed by state_default and the demotion is what takes
+	// that away. The destructive actions stay locked regardless -- tombstone,
+	// encryption, server ACL, invite/kick/ban and redacting other people's
+	// messages are pinned at plLockLevel (9000), which no ordinary set-pl
+	// grants. A user deliberately raised to 9000 or above WOULD regain them,
+	// so only enable this where you trust everyone in your portals.
+	AllowPowerLevelEscalation bool `yaml:"allow_power_level_escalation"`
+
 	// StatusKitShareOnStartup publishes share_status(available) once after
 	// StatusKit init completes. Peer iOS reciprocates with a reshare (which
 	// carries the key material needed to decrypt its subsequent presence
@@ -253,6 +267,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")
 	helper.Copy(up.Str, "carddav", "password_encrypted")
+	helper.Copy(up.Bool, "allow_power_level_escalation")
 	helper.Copy(up.Bool, "debug_disable_privacy")
 }
 
