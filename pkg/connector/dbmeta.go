@@ -15,8 +15,8 @@ import (
 type PortalMetadata struct {
 	ThreadID   string `json:"thread_id,omitempty"`
 	SenderGuid string `json:"sender_guid,omitempty"` // Persistent iMessage group UUID
-	GroupName  string `json:"group_name,omitempty"`   // iMessage cv_name for outbound routing
-	IsSms      bool   `json:"is_sms,omitempty"`       // True if this portal routes through SMS
+	GroupName  string `json:"group_name,omitempty"`  // iMessage cv_name for outbound routing
+	IsSms      bool   `json:"is_sms,omitempty"`      // True if this portal routes through SMS
 }
 
 type GhostMetadata struct{}
@@ -41,6 +41,10 @@ type UserLoginMetadata struct {
 	Platform    string `json:"platform,omitempty"`
 	ChatsSynced bool   `json:"chats_synced,omitempty"`
 	WelcomeSent bool   `json:"welcome_sent,omitempty"`
+	// SyncCompleteNotified guards the one-time "sync is fully caught up"
+	// management-room notice (see runSyncCompletionNotifyLoop) so it fires
+	// once per login rather than on every tick after the backlog clears.
+	SyncCompleteNotified bool `json:"sync_complete_notified,omitempty"`
 
 	// Persisted rustpush state (restored across restarts)
 	APSState    string `json:"aps_state,omitempty"`

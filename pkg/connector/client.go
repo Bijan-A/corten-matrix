@@ -1579,6 +1579,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// pulled until the next restart. Self-gated to a gentle cadence — see
 		// runStatusKitPullLoop / statusKitFreshFloor.
 		go c.runStatusKitPullLoop(log.With().Str("component", "statuskit_pull").Logger(), c.stopChan)
+		// Notify the management room once CloudKit backfill and Matrix
+		// delivery are fully caught up — see runSyncCompletionNotifyLoop.
+		go c.runSyncCompletionNotifyLoop(log.With().Str("component", "sync_completion").Logger(), c.stopChan)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -2245,6 +2248,12 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 					ChatInfo: chatInfo,
 				},
 			})
+			// Bump the sync-status StatusKit-update counter — see
+			// incrStatusKitUpdateCounter in sync_status.go for why this is
+			// tracked separately from real message deliveries.
+			if c.Main.Bridge.DB.Database != nil {
+				incrStatusKitUpdateCounter(context.Background(), c.Main.Bridge.DB.Database, string(c.Main.Bridge.ID), log)
+			}
 			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
 				Msg("StatusKit: updated DM title for focus change")
 		}

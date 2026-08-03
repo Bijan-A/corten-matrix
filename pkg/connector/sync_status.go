@@ -13,56 +13,58 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
-// kv_store keys for the live-traffic counter. Bridge-wide (not per-login),
-// stored via the generic kv_store table bridgev2 already provides — see
-// incrLiveMessageCounter for why this bypasses the KV.Set Go API.
+// kv_store keys for the steady-state activity counters. Bridge-wide (not
+// per-login), stored via the generic kv_store table bridgev2 already
+// provides — see incrKVCounter for why this bypasses the KV.Set Go API.
 const (
 	liveMessageCountKVKey = "sync_status_live_message_count"
 	liveMessageLastKVKey  = "sync_status_live_message_last_ts"
+
+	statusKitUpdateCountKVKey = "sync_status_statuskit_update_count"
+	statusKitUpdateLastKVKey  = "sync_status_statuskit_update_last_ts"
 )
 
-// incrLiveMessageCounter atomically bumps the persisted "messages handed off
-// for live delivery" counter and timestamp. Called from handleMessage for
-// every live APNs message, so sync-status can report steady-state activity
-// in addition to CloudKit backfill progress — the backfill counters
-// (deliverableMessageCount/deliveredMessageCount) only ever see rows that
-// have gone through a CloudKit re-sync, which live-only traffic between
-// syncs never does (see cloud_backfill_store.go's record_name filter).
+// incrKVCounter atomically bumps a persisted counter and its last-touched
+// timestamp in kv_store. Used for steady-state activity counters (live
+// messages, StatusKit updates) that sync-status reports alongside the
+// CloudKit-sourced backfill counters, which don't move for activity that
+// never goes through a CloudKit re-sync (see cloud_backfill_store.go's
+// record_name filter).
 //
 // Uses a raw INSERT ... ON CONFLICT DO UPDATE against kv_store instead of
-// KV.Get+KV.Set to avoid a read-modify-write race under concurrent live
-// messages; kv_store's schema (bridge_id, key, value all TEXT) is a stable,
+// KV.Get+KV.Set to avoid a read-modify-write race under concurrent callers;
+// kv_store's schema (bridge_id, key, value all TEXT) is a stable,
 // already-relied-upon part of the framework (see statuskit_alias_resolver.go
 // for the same raw-SQL-against-kv_store pattern). Best-effort: errors are
-// logged, not returned, so a KV hiccup never blocks live message delivery.
-func incrLiveMessageCounter(ctx context.Context, db *dbutil.Database, bridgeID string, log zerolog.Logger) {
+// logged, not returned, so a KV hiccup never blocks the caller's real work.
+func incrKVCounter(ctx context.Context, db *dbutil.Database, bridgeID, countKey, lastKey string, log zerolog.Logger) {
 	_, err := db.Exec(ctx, `
 		INSERT INTO kv_store (bridge_id, key, value) VALUES ($1, $2, '1')
 		ON CONFLICT (bridge_id, key) DO UPDATE SET value = CAST(CAST(kv_store.value AS INTEGER) + 1 AS TEXT)
-	`, bridgeID, liveMessageCountKVKey)
+	`, bridgeID, countKey)
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to increment live-message sync-status counter")
+		log.Warn().Err(err).Str("counter", countKey).Msg("Failed to increment sync-status counter")
 	}
 	_, err = db.Exec(ctx, `
 		INSERT INTO kv_store (bridge_id, key, value) VALUES ($1, $2, $3)
 		ON CONFLICT (bridge_id, key) DO UPDATE SET value = $3
-	`, bridgeID, liveMessageLastKVKey, strconv.FormatInt(time.Now().UnixMilli(), 10))
+	`, bridgeID, lastKey, strconv.FormatInt(time.Now().UnixMilli(), 10))
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to update live-message sync-status timestamp")
+		log.Warn().Err(err).Str("counter", lastKey).Msg("Failed to update sync-status counter timestamp")
 	}
 }
 
-// getLiveMessageStats reads back the counter written by incrLiveMessageCounter.
-func getLiveMessageStats(ctx context.Context, db *dbutil.Database, bridgeID string) (count int64, lastAt *time.Time, err error) {
+// getKVCounterStats reads back a counter written by incrKVCounter.
+func getKVCounterStats(ctx context.Context, db *dbutil.Database, bridgeID, countKey, lastKey string) (count int64, lastAt *time.Time, err error) {
 	var raw string
-	err = db.QueryRow(ctx, `SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2`, bridgeID, liveMessageCountKVKey).Scan(&raw)
+	err = db.QueryRow(ctx, `SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2`, bridgeID, countKey).Scan(&raw)
 	if err != nil && err != sql.ErrNoRows {
 		return 0, nil, err
 	}
 	if raw != "" {
 		count, _ = strconv.ParseInt(raw, 10, 64)
 	}
-	err = db.QueryRow(ctx, `SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2`, bridgeID, liveMessageLastKVKey).Scan(&raw)
+	err = db.QueryRow(ctx, `SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2`, bridgeID, lastKey).Scan(&raw)
 	if err != nil && err != sql.ErrNoRows {
 		return count, nil, err
 	}
@@ -73,6 +75,29 @@ func getLiveMessageStats(ctx context.Context, db *dbutil.Database, bridgeID stri
 		}
 	}
 	return count, lastAt, nil
+}
+
+// incrLiveMessageCounter is called from handleMessage for every live APNs
+// message that's handed off for delivery.
+func incrLiveMessageCounter(ctx context.Context, db *dbutil.Database, bridgeID string, log zerolog.Logger) {
+	incrKVCounter(ctx, db, bridgeID, liveMessageCountKVKey, liveMessageLastKVKey, log)
+}
+
+func getLiveMessageStats(ctx context.Context, db *dbutil.Database, bridgeID string) (count int64, lastAt *time.Time, err error) {
+	return getKVCounterStats(ctx, db, bridgeID, liveMessageCountKVKey, liveMessageLastKVKey)
+}
+
+// incrStatusKitUpdateCounter is called wherever a StatusKit (Focus/DND)
+// change queues a ChatInfoChange event. These rewrite a room's name/state
+// but carry no message content, and are otherwise easy to mistake for real
+// message activity when a room's "last active" sort bumps in a Matrix
+// client — see the sync-status "StatusKit vs. message-bearing" breakdown.
+func incrStatusKitUpdateCounter(ctx context.Context, db *dbutil.Database, bridgeID string, log zerolog.Logger) {
+	incrKVCounter(ctx, db, bridgeID, statusKitUpdateCountKVKey, statusKitUpdateLastKVKey, log)
+}
+
+func getStatusKitUpdateStats(ctx context.Context, db *dbutil.Database, bridgeID string) (count int64, lastAt *time.Time, err error) {
+	return getKVCounterStats(ctx, db, bridgeID, statusKitUpdateCountKVKey, statusKitUpdateLastKVKey)
 }
 
 // ZoneSyncStatus is the persisted sync state for one CloudKit zone
@@ -113,6 +138,13 @@ type SyncStatusReport struct {
 	// database was created — not reset per process restart.
 	LiveMessageCount  int64
 	LiveMessageLastAt *time.Time
+
+	// StatusKitUpdateCount/StatusKitUpdateLastAt track ChatInfoChange events
+	// from StatusKit Focus/DND changes — room name/state churn with no
+	// message content. Reported alongside LiveMessageCount so "a room looks
+	// recently active" can be told apart from "a room got a new message."
+	StatusKitUpdateCount  int64
+	StatusKitUpdateLastAt *time.Time
 }
 
 // PendingMessages returns how many deliverable messages have not yet reached
@@ -123,6 +155,14 @@ func (r *SyncStatusReport) PendingMessages() int {
 		return 0
 	}
 	return n
+}
+
+// FullyCaughtUp reports whether CloudKit bootstrap has completed and every
+// deliverable message has reached Matrix — i.e. no backlog remains. Used
+// both by Format() and by runSyncCompletionNotifyLoop's one-time
+// management-room notice.
+func (r *SyncStatusReport) FullyCaughtUp() bool {
+	return r.BootstrapComplete && r.PendingMessages() == 0
 }
 
 // discoverLoginID finds the single user_login row for this bridge instance.
@@ -189,6 +229,9 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, bridgeID string) (*
 	}
 	if report.LiveMessageCount, report.LiveMessageLastAt, err = getLiveMessageStats(ctx, db, bridgeID); err != nil {
 		return nil, fmt.Errorf("failed to read live-message stats: %w", err)
+	}
+	if report.StatusKitUpdateCount, report.StatusKitUpdateLastAt, err = getStatusKitUpdateStats(ctx, db, bridgeID); err != nil {
+		return nil, fmt.Errorf("failed to read StatusKit update stats: %w", err)
 	}
 	return report, nil
 }
@@ -265,7 +308,11 @@ func (r *SyncStatusReport) Format(liveRunning *bool) string {
 		pct = 100 * float64(r.DeliveredMessages) / float64(r.DeliverableMessages)
 	}
 	sb.WriteString(fmt.Sprintf("Delivered: %d / %d messages (%.1f%%), %d pending\n", r.DeliveredMessages, r.DeliverableMessages, pct, pending))
-	sb.WriteString("(Reactions aren't counted — they bridge separately and aren't tracked here. \"Pending\" includes messages whose chat has no Matrix room yet, e.g. very old chats never opened in Matrix, not just an active delivery backlog.)\n\n")
+	if r.FullyCaughtUp() {
+		sb.WriteString("✅ Fully caught up — no backlog remaining.\n\n")
+	} else {
+		sb.WriteString("(Reactions aren't counted — they bridge separately and aren't tracked here. \"Pending\" includes messages whose chat has no Matrix room yet, e.g. very old chats never opened in Matrix, not just an active delivery backlog.)\n\n")
+	}
 
 	sb.WriteString("**Live traffic (steady-state, since ever)**\n")
 	if r.LiveMessageLastAt != nil {
@@ -273,7 +320,12 @@ func (r *SyncStatusReport) Format(liveRunning *bool) string {
 	} else {
 		sb.WriteString("No live messages recorded yet.\n")
 	}
-	sb.WriteString("(This is the number to watch for \"new messages are arriving but the CloudKit counters above aren't moving\" — that's expected: live traffic bypasses the CloudKit-sourced counters above until the next CloudKit re-sync.)\n")
+	if r.StatusKitUpdateLastAt != nil {
+		sb.WriteString(fmt.Sprintf("%d StatusKit-only room updates (Focus/DND, no message content), most recent %s ago\n", r.StatusKitUpdateCount, time.Since(*r.StatusKitUpdateLastAt).Round(time.Second)))
+	} else {
+		sb.WriteString("No StatusKit-only room updates recorded yet.\n")
+	}
+	sb.WriteString("(A room bumping to \"recently active\" in your Matrix client can mean either of the two lines above — a StatusKit Focus/DND change rewrites the room name/state with no new message, so it's easy to mistake for backfill. Live message traffic bypasses the CloudKit-sourced counters above until the next CloudKit re-sync.)\n")
 
 	return sb.String()
 }

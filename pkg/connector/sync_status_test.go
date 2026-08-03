@@ -110,6 +110,9 @@ func TestGetSyncStatus(t *testing.T) {
 	if got := report.PendingMessages(); got != 1 {
 		t.Errorf("PendingMessages() = %d, want 1", got)
 	}
+	if report.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp() = true, want false (1 message still pending)")
+	}
 
 	var chatsZone, messagesZone, attachmentsZone *ZoneSyncStatus
 	for i := range report.Zones {
@@ -135,6 +138,74 @@ func TestGetSyncStatus(t *testing.T) {
 	out := report.Format(nil)
 	if out == "" {
 		t.Errorf("Format() returned empty string")
+	}
+}
+
+func TestSyncStatusReportFullyCaughtUp(t *testing.T) {
+	tests := []struct {
+		name        string
+		bootstrap   bool
+		deliverable int
+		delivered   int
+		want        bool
+	}{
+		{"not bootstrapped, nothing pending", false, 5, 5, false},
+		{"bootstrapped, backlog remains", true, 5, 3, false},
+		{"bootstrapped, fully delivered", true, 5, 5, true},
+		{"bootstrapped, nothing ever deliverable", true, 0, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &SyncStatusReport{
+				BootstrapComplete:   tt.bootstrap,
+				DeliverableMessages: tt.deliverable,
+				DeliveredMessages:   tt.delivered,
+			}
+			if got := r.FullyCaughtUp(); got != tt.want {
+				t.Errorf("FullyCaughtUp() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStatusKitUpdateCounter(t *testing.T) {
+	ctx := context.Background()
+	db := openTestSyncDB(t)
+	const bridgeID = ""
+
+	count, lastAt, err := getStatusKitUpdateStats(ctx, db, bridgeID)
+	if err != nil {
+		t.Fatalf("getStatusKitUpdateStats (empty): %v", err)
+	}
+	if count != 0 || lastAt != nil {
+		t.Fatalf("getStatusKitUpdateStats (empty) = (%d, %v), want (0, nil)", count, lastAt)
+	}
+
+	log := zerolog.Nop()
+	before := time.Now()
+	incrStatusKitUpdateCounter(ctx, db, bridgeID, log)
+	incrStatusKitUpdateCounter(ctx, db, bridgeID, log)
+	after := time.Now()
+
+	count, lastAt, err = getStatusKitUpdateStats(ctx, db, bridgeID)
+	if err != nil {
+		t.Fatalf("getStatusKitUpdateStats: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("count = %d, want 2", count)
+	}
+	if lastAt == nil || lastAt.Before(before.Add(-time.Second)) || lastAt.After(after.Add(time.Second)) {
+		t.Errorf("lastAt = %v, want between %v and %v", lastAt, before, after)
+	}
+
+	// The live-message and StatusKit counters must be independent —
+	// bumping one must not affect the other.
+	liveCount, _, err := getLiveMessageStats(ctx, db, bridgeID)
+	if err != nil {
+		t.Fatalf("getLiveMessageStats: %v", err)
+	}
+	if liveCount != 0 {
+		t.Errorf("live message count = %d, want 0 (unaffected by StatusKit counter)", liveCount)
 	}
 }
 

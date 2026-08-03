@@ -1924,6 +1924,93 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 	}
 }
 
+// syncCompletionCheckInterval is the steady-state cadence for
+// runSyncCompletionNotifyLoop's backlog check.
+const syncCompletionCheckInterval = 5 * time.Minute
+
+// syncCompleteNoticeMarkdown is posted once per login when CloudKit backfill
+// and Matrix delivery have fully caught up. The two %d params are the
+// delivered message count and the chat count.
+const syncCompleteNoticeMarkdown = `✅ **Sync complete** — all %d messages across %d chats known to CloudKit have been delivered to Matrix. No backlog remaining.
+
+Run ` + "`sync-status`" + ` any time for a detailed breakdown.`
+
+// runSyncCompletionNotifyLoop periodically checks whether CloudKit backfill
+// and Matrix delivery have fully caught up (SyncStatusReport.FullyCaughtUp:
+// bootstrap complete AND every deliverable message delivered) and, the first
+// time that becomes true for this login, posts a one-time notice to the
+// user's management room. Guarded by UserLoginMetadata.SyncCompleteNotified
+// so it never repeats for the life of this login — logging out and back in
+// starts a fresh login with a fresh flag.
+//
+// On homeservers without Beeper's batch-send extension, bridgev2's backward
+// backfill queue never runs at all (see the sync-status command's own
+// "Live traffic" caveat and its Format() documentation), so in practice this
+// may rarely or never fire for most self-hosted setups whose CloudKit
+// history exceeds what the one-time forward-backfill window captured at
+// portal creation. That's a known, separate limitation — not a bug in this
+// loop, which only reports the state GetSyncStatus already computes.
+func (c *IMClient) runSyncCompletionNotifyLoop(log zerolog.Logger, stopChan <-chan struct{}) {
+	if c.cloudStore == nil {
+		return
+	}
+	check := func() {
+		meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata)
+		if !ok || meta.SyncCompleteNotified {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		report, err := GetSyncStatus(ctx, c.Main.Bridge.DB.Database, string(c.Main.Bridge.ID))
+		if err != nil {
+			log.Warn().Err(err).Msg("Sync-completion check: failed to build sync status")
+			return
+		}
+		if !report.FullyCaughtUp() {
+			return
+		}
+		mgmtRoom, err := c.UserLogin.User.GetManagementRoom(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("Sync-completion notice: failed to get management room")
+			return
+		}
+		markdown := fmt.Sprintf(syncCompleteNoticeMarkdown, report.DeliveredMessages, report.TotalChats)
+		content := format.RenderMarkdown(markdown, true, false)
+		if _, err := c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
+			log.Warn().Err(err).Str("management_room", string(mgmtRoom)).Msg("Sync-completion notice: failed to send")
+			return
+		}
+		meta.SyncCompleteNotified = true
+		if err := c.UserLogin.Save(ctx); err != nil {
+			log.Warn().Err(err).Msg("Sync-completion notice: failed to persist notified flag")
+			return
+		}
+		log.Info().Str("management_room", string(mgmtRoom)).
+			Msg("Sync-completion notice: posted — CloudKit backfill and Matrix delivery are fully caught up")
+	}
+
+	// Check shortly after startup too, not just on the first multi-minute
+	// tick — covers the case where the backlog was already clear before
+	// this process even started (small account, or a prior run finished).
+	select {
+	case <-stopChan:
+		return
+	case <-time.After(1 * time.Minute):
+		check()
+	}
+
+	ticker := time.NewTicker(syncCompletionCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// This goroutine used to run without a recover on purpose: a panic here
 	// leaves setCloudSyncDone() uncalled, which permanently blocks the APNs
