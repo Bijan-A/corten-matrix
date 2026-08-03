@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#linux-is-not-supported-here)
 [![License](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
 
-> **A community-maintained continuation of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix)**, tracking upstream release **1.1.0**.
+> **A fork of [lrhodin/corten-matrix](https://github.com/lrhodin/corten-matrix) with community-contributed patches**, tracking upstream release **1.1.0**.
 >
 > Upstream is a hobby project and has paused incoming pull requests. This project exists so patches have somewhere to go — **issues and pull requests are welcome here**. See [Contributing](#contributing).
 >
@@ -33,7 +33,7 @@ This tree is upstream **1.1.0** plus the changes below. Everything else — feat
 | `sync-status` command | Reports CloudKit → database and database → Matrix sync progress per zone, plus a persisted live-traffic counter so steady-state APNs activity is visible separately from backfill. Available both as a CLI subcommand — which reads the database directly and works with the bridge stopped — and as an in-room management command. From [#2](https://github.com/Bijan-A/corten-matrix/pull/2) by [@ajkessel](https://github.com/ajkessel). See [Checking sync progress](#management). |
 | CardDAV app-password handling | The setup scripts now strip spaces from the CardDAV password and quote arguments properly — a password containing a space was previously truncated at the first one. See [External CardDAV](#external-carddav). |
 | Continuous integration | Every pull request and push to `master` builds the whole tree on macOS and runs `go vet` plus the test suite. It also greps the compiled binary for the panic guard strings, so a change that silently drops them fails CI instead of surfacing months later as a wedged receive loop. Upstream's public tree has no CI workflows. |
-| Open to contributions | Upstream closes external pull requests automatically. Issues and PRs are accepted here — see [Contributing](#contributing). |
+| Open to contributions | Upstream has paused incoming pull requests. Issues and PRs are accepted here — see [Contributing](#contributing). |
 | macOS release pipeline | Pushing a `v*` tag builds the arm64 slice in CI; a maintainer combines it with a locally built x86_64 slice into a universal binary with a SHA-256 checksum, which `update` verifies before installing. GitHub never assigns this repo an Intel runner, so the second slice is built by hand — see Releases in [CONTRIBUTING.md](CONTRIBUTING.md). Linux is not buildable from this tree at all — see [Linux is not supported here](#linux-is-not-supported-here). |
 
 ## How it's distributed
