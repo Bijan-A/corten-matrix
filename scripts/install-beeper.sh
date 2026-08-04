@@ -1037,8 +1037,16 @@ fi
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
 DATA_ABS="$(cd "$DATA_DIR" && pwd)"
-LOG_OUT="$DATA_ABS/bridge.stdout.log"
-LOG_ERR="$DATA_ABS/bridge.stderr.log"
+# launchd's ProgramArguments runs `corten-matrix bridge-all` directly, and
+# that parent process never writes to its own stdout/stderr in normal
+# operation — it redirects the real child bridge's output straight into
+# logs/bridge.stdout.log itself (see cli.go's bridge-all). Pointing
+# StandardOutPath/StandardErrorPath anywhere real just leaves launchd
+# holding open two files that are permanently empty. Discard them instead,
+# and use the actual per-account log for the readiness check below.
+LOG_OUT="/dev/null"
+LOG_ERR="/dev/null"
+READY_LOG="$DATA_ABS/logs/bridge.stdout.log"
 
 # ── Write auto-update wrapper ─────────────────────────────────
 cat > "$DATA_ABS/start.sh" << HEADER_EOF
@@ -1187,7 +1195,7 @@ case "${START_NOW}" in
     echo ""
     echo "Waiting for bridge to start..."
     for i in $(seq 1 15); do
-        if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
+        if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$READY_LOG" 2>/dev/null; then
             echo "✓ Bridge is running"
             break
         fi
