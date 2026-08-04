@@ -6487,7 +6487,13 @@ async fn download_icon_change_photo(
                 Some(Err(e)) => {
                     error!("Failed to download group photo via MMCS: {}", e);
                 }
-                None => {}
+                None => {
+                    // CI's binary-string regression guard checks for this exact
+                    // message — guard_panic's own breadcrumb is rate-limited and
+                    // per-window, so it isn't a substitute for a call-site-specific
+                    // signal that this particular guard actually caught something.
+                    error!("Group photo MMCS download panicked in upstream rustpush — dropping the photo to keep the receive loop alive");
+                }
             }
         }
     }
