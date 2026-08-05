@@ -131,12 +131,27 @@ Cross-compiling the second slice isn't an option either: this is a CGO project
 linking `libolm` and `libheif` from Homebrew, which is single-arch, so an
 x86_64 link on an arm64 host fails at the linker.
 
+### Version scheme
+
+Releases here are tagged `vYYYY.MM.DD` (a fourth `.N` segment if more than one
+ships in a day), e.g. `v2026.08.04`. Deliberately **not** upstream's `1.x.y`
+scheme: this repo periodically pulls commits from upstream and layers its own
+patches on top, so there is no single upstream version a given release maps
+to, and reusing upstream's numbers would eventually collide or mislead. A date
+says plainly "here is what this repo looked like on this day" instead.
+
+The one hard constraint, regardless of scheme: `release.yml` triggers on
+`push: tags: 'v*'`, so the tag must keep the `v` prefix or CI never fires.
+`corten-matrix update` itself doesn't care about the format beyond that — it
+only string-compares the tag against the installed version after stripping
+`v`, no semver parsing involved.
+
 ### Cutting a release
 
 **1. Tag it.** This starts the arm64 build.
 
 ```bash
-git tag -a v1.1.2 -m "corten-matrix 1.1.2" && git push origin v1.1.2
+git tag -a v2026.08.04 -m "corten-matrix 2026.08.04" && git push origin v2026.08.04
 ```
 
 Wait for *Release (arm64 slice)* to finish (~9 minutes warm). Its run summary
@@ -146,8 +161,8 @@ prints the exact commands for the rest, with the run ID already filled in.
 
 ```bash
 cd ~/src/corten-matrix
-git fetch origin --tags && git checkout v1.1.2
-make VERSION=1.1.2 CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"
+git fetch origin --tags && git checkout v2026.08.04
+make VERSION=2026.08.04 CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"
 file corten-matrix        # must say x86_64
 ```
 
@@ -178,8 +193,8 @@ shasum -a 256 corten-matrix-macos > corten-matrix-macos.sha256
 **4. Publish:**
 
 ```bash
-gh release create v1.1.2 corten-matrix-macos corten-matrix-macos.sha256 \
-  --repo <owner>/corten-matrix --title "v1.1.2" --generate-notes
+gh release create v2026.08.04 corten-matrix-macos corten-matrix-macos.sha256 \
+  --repo <owner>/corten-matrix --title "v2026.08.04" --generate-notes
 ```
 
 The asset **must** be named `corten-matrix-macos` — that is the name
