@@ -1582,6 +1582,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// Notify the management room once CloudKit backfill and Matrix
 		// delivery are fully caught up — see runSyncCompletionNotifyLoop.
 		go c.runSyncCompletionNotifyLoop(log.With().Str("component", "sync_completion").Logger(), c.stopChan)
+		// On homeservers without Beeper's batch-send extension, bridgev2's own
+		// backfill queue (RunBackfillQueue) never starts, so the backward-
+		// backfill tasks this connector enqueues would never drain and
+		// historical delivery stalls partway. Run our own drain loop in that
+		// case. On Beeper (batch send available) bridgev2's queue handles it and
+		// this must stay off to avoid double-processing the same task.
+		if !c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
+			go c.runSynapseBackfillDrainLoop(log.With().Str("component", "backfill_drain").Logger(), c.stopChan)
+		}
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -8315,19 +8324,41 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					return nil, queryErr
 				}
 				if len(rows) > 0 {
-					// Reverse to chronological order
+					// Reverse to chronological order (rows[0] is now the oldest)
 					for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 						rows[i], rows[j] = rows[j], rows[i]
 					}
 					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					// Recovery only fetched the newest `count` messages. If we got
+					// a full batch, older history remains — signal HasMore and hand
+					// back a cursor at the oldest fetched message so the next batch
+					// paginates further back (the room now has messages, so that
+					// dispatch takes the normal cursor/anchor path). Returning
+					// HasMore=false unconditionally was a bug: it delivered only the
+					// most recent ~count messages and then marked the whole backfill
+					// task done, permanently stranding all older history.
+					hasMore := len(rows) == count
+					var nextCursor networkid.PaginationCursor
+					if hasMore {
+						cursor, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
+							TimestampMS: rows[0].TimestampMS,
+							GUID:        rows[0].GUID,
+						})
+						if cursorErr != nil {
+							return nil, cursorErr
+						}
+						nextCursor = cursor
+					}
 					log.Info().
 						Str("portal_id", portalID).
 						Int("db_rows", len(rows)).
 						Int("backfill_msgs", len(allMessages)).
+						Bool("has_more", hasMore).
 						Msg("Recovery backfill COMPLETE")
 					return &bridgev2.FetchMessagesResponse{
 						Messages: allMessages,
-						HasMore:  false,
+						Cursor:   nextCursor,
+						HasMore:  hasMore,
 						Forward:  false,
 					}, nil
 				}
@@ -8360,8 +8391,45 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 	reverseCloudMessageRows(rows)
 
+	// Skip messages that are already delivered under a DIFFERENT room for this
+	// receiver. The same group chat can have two portal IDs (CloudKit chat-id
+	// vs live/APNs delivery id) that never reconcile; because bridgev2's message
+	// unique key (bridge_id, room_receiver, id, part_id) ignores room_id,
+	// re-delivering such a guid here fails with a duplicate-key error and wedges
+	// this portal's backfill task. Dropping them avoids the collision and loses
+	// nothing (the message is already delivered in the other room). Cursor is
+	// still taken from the unfiltered window below, so pagination advances past
+	// the whole batch. Fail-open on query error — a collision would just error
+	// the task exactly as before, no worse.
+	deliverRows := rows
+	if len(rows) > 0 && c.cloudStore != nil {
+		guids := make([]string, len(rows))
+		for i := range rows {
+			guids[i] = rows[i].GUID
+		}
+		if delivered, derr := c.cloudStore.guidsDeliveredInOtherRoom(ctx, string(c.Main.Bridge.ID), portalID, guids); derr != nil {
+			log.Warn().Err(derr).Str("portal_id", portalID).
+				Msg("Backward backfill: dedup pre-check failed — delivering unfiltered")
+		} else if len(delivered) > 0 {
+			deliverRows = make([]cloudMessageRow, 0, len(rows))
+			exampleRoom := ""
+			for _, r := range rows {
+				if room, dup := delivered[r.GUID]; dup {
+					exampleRoom = room
+					continue
+				}
+				deliverRows = append(deliverRows, r)
+			}
+			log.Warn().
+				Str("portal_id", portalID).
+				Int("skipped", len(rows)-len(deliverRows)).
+				Str("existing_room", exampleRoom).
+				Msg("Backward backfill: skipped messages already delivered in another room (duplicate-portal group chat)")
+		}
+	}
+
 	convertStart := time.Now()
-	messages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+	messages := c.cloudRowsToBackfillMessages(ctx, deliverRows, groupDisplayName)
 	convertElapsed := time.Since(convertStart)
 
 	var nextCursor networkid.PaginationCursor

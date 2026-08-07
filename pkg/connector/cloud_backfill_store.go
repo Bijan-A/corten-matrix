@@ -120,6 +120,56 @@ func columnExists(ctx context.Context, db *dbutil.Database, tableName, columnNam
 	return count > 0, nil
 }
 
+// indexExists reports whether an index named indexName exists.
+//
+// This is the index-level analogue of columnExists, and it exists for a
+// specific reliability reason: `CREATE INDEX IF NOT EXISTS` still acquires a
+// blocking SHARE lock on the target table just to discover the index is
+// already there. On Postgres that SHARE lock conflicts with the ROW EXCLUSIVE
+// lock any concurrent UPDATE/DELETE holds, so a slow or orphaned write on
+// cloud_message (e.g. a runaway scrub chunk from a previous, now-dead process
+// whose backend is still executing server-side) makes ensureSchema block
+// indefinitely on re-creating an index that already exists — wedging Connect
+// before the CloudKit sync controller can start. Checking existence first
+// means the steady-state path takes no table lock at all.
+func indexExists(ctx context.Context, db *dbutil.Database, indexName string) (bool, error) {
+	var count int
+	var err error
+	switch db.Dialect {
+	case dbutil.Postgres:
+		err = db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM pg_indexes WHERE indexname=$1`, indexName,
+		).Scan(&count)
+	default:
+		err = db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=$1`, indexName,
+		).Scan(&count)
+	}
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ensureIndex creates the index named name via createSQL only when it does not
+// already exist, so the common (already-created) path takes no table lock. See
+// indexExists for why that matters. createSQL should still spell CREATE INDEX
+// IF NOT EXISTS so a lost race between the existence check and the create is
+// harmless.
+func (s *cloudBackfillStore) ensureIndex(ctx context.Context, name, createSQL string) error {
+	exists, err := indexExists(ctx, s.db, name)
+	if err != nil {
+		return fmt.Errorf("failed to check for index %s: %w", name, err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := s.db.Exec(ctx, createSQL); err != nil {
+		return fmt.Errorf("failed to create index %s: %w", name, err)
+	}
+	return nil
+}
+
 // sqlInstrFunc returns the dialect's name for "1-based position of substring,
 // or 0 if absent": SQLite has only instr(haystack, needle), Postgres has only
 // strpos(haystack, needle). Argument order and return convention are identical,
@@ -242,18 +292,31 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			updated_ts BIGINT NOT NULL,
 			PRIMARY KEY (login_id, portal_id)
 		)`,
-		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
-			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
-		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
-			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
-		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
-			ON cloud_message (login_id, chat_id, timestamp_ms, guid)`,
 	}
 
 	// Run table creation queries first (without indexes that depend on migrations)
 	for _, query := range queries {
 		if _, err := s.db.Exec(ctx, query); err != nil {
 			return fmt.Errorf("failed to ensure cloud backfill schema: %w", err)
+		}
+	}
+
+	// Indexes on base columns. Routed through ensureIndex (existence check
+	// first) so a re-run never takes a blocking SHARE lock on the large
+	// cloud_message table — see indexExists for the wedge this avoids.
+	for _, idx := range []struct{ name, sql string }{
+		{"cloud_chat_portal_idx",
+			`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
+				ON cloud_chat (login_id, portal_id, cloud_chat_id)`},
+		{"cloud_message_portal_ts_idx",
+			`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
+				ON cloud_message (login_id, portal_id, timestamp_ms, guid)`},
+		{"cloud_message_chat_ts_idx",
+			`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
+				ON cloud_message (login_id, chat_id, timestamp_ms, guid)`},
+	} {
+		if err := s.ensureIndex(ctx, idx.name, idx.sql); err != nil {
+			return err
 		}
 	}
 
@@ -397,15 +460,17 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 	// Create index that depends on record_name column (must be after migration)
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
-		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
-		return fmt.Errorf("failed to create record_name index: %w", err)
+	if err := s.ensureIndex(ctx, "cloud_chat_record_name_idx",
+		`CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
+			ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
+		return err
 	}
 
 	// Create index for group_id lookups (messages reference chats by group_id UUID)
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
-		ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
-		return fmt.Errorf("failed to create group_id index: %w", err)
+	if err := s.ensureIndex(ctx, "cloud_chat_group_id_idx",
+		`CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
+			ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
+		return err
 	}
 
 	return nil
@@ -2744,6 +2809,54 @@ const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestam
 	COALESCE(reply_to_guid, ''), COALESCE(reply_to_part, ''),
 	COALESCE(body_scrubbed, FALSE)`
 
+// guidsDeliveredInOtherRoom returns, for the given guids, those already present
+// in bridgev2's `message` table for this receiver under a room OTHER than
+// excludePortalID — mapping guid -> an example other room_id.
+//
+// This exists because the same group chat can end up with two portal IDs (a
+// CloudKit chat-record id and the live/APNs delivery id) that never reconcile,
+// so the same message guid lives under two rooms. bridgev2's message unique key
+// is (bridge_id, room_receiver, id, part_id) and IGNORES room_id, so a backward
+// backfill that re-delivers such a guid raises a duplicate-key error and wedges
+// the portal's whole backfill task in a 1h error-retry loop. Backward backfill
+// uses this to skip those already-delivered guids.
+//
+// Matches message.id exactly against the guid, which covers the text/base part
+// (message.id == guid). Attachment-only parts (message.id == "<guid>_attN")
+// aren't matched here; text parts are the common case and the observed
+// collisions, and an exact match keeps this on the message_real_pkey index
+// (guid and message.id share CloudKit's uppercase spelling, so no case folding).
+func (s *cloudBackfillStore) guidsDeliveredInOtherRoom(ctx context.Context, bridgeID, excludePortalID string, guids []string) (map[string]string, error) {
+	if len(guids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(guids)+3)
+	args = append(args, bridgeID, string(s.loginID), excludePortalID)
+	ph := make([]string, len(guids))
+	for i, g := range guids {
+		args = append(args, g)
+		ph[i] = fmt.Sprintf("$%d", i+4)
+	}
+	query := `SELECT id, room_id FROM message
+		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+		  AND room_id <> $3
+		  AND id IN (` + strings.Join(ph, ", ") + `)`
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var id, roomID string
+		if err = rows.Scan(&id, &roomID); err != nil {
+			return nil, err
+		}
+		out[id] = roomID
+	}
+	return out, rows.Err()
+}
+
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
 	portalID string,
@@ -3470,14 +3583,18 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 // readable on a version-upgrade re-sync — those land as freshly-written rows
 // with old message times, so message-time alone would wrongly skip them.
 func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Context) (map[string]bool, error) {
+	// is_done=TRUE (not =1): is_done is BOOLEAN, and Postgres has no
+	// boolean=integer operator. CASE ... END (not MAX(a,b)): the two-argument
+	// scalar MAX is SQLite-only — Postgres MAX is an aggregate and spells the
+	// scalar as GREATEST, which SQLite in turn lacks. The CASE works in both.
 	rows, err := s.db.Query(ctx, `
 		SELECT bt.portal_id
 		FROM backfill_task bt
-		WHERE bt.user_login_id=$1 AND bt.is_done=1 AND bt.completed_at > 0
+		WHERE bt.user_login_id=$1 AND bt.is_done=TRUE AND bt.completed_at > 0
 		  AND NOT EXISTS (
 		    SELECT 1 FROM cloud_message cm
 		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
-		      AND MAX(cm.created_ts, cm.updated_ts) > bt.completed_at/1000000
+		      AND (CASE WHEN cm.created_ts > cm.updated_ts THEN cm.created_ts ELSE cm.updated_ts END) > bt.completed_at/1000000
 		  )
 	`, s.loginID)
 	if err != nil {
@@ -3871,12 +3988,49 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		    LIMIT `+limitPlaceholder+`
 		  )
 	`, "{{INSTR}}", sqlInstrFunc(s.db))
+
+	// Bound each chunk server-side. An UPDATE holds a table-level ROW EXCLUSIVE
+	// lock on cloud_message for its whole duration, and the bridged-guid
+	// subquery scans the entire message table — so a pathological chunk can run
+	// for a very long time while holding that lock, blocking schema init
+	// (CREATE INDEX wants a conflicting SHARE lock) and live ingestion. Worse,
+	// if this process is replaced mid-chunk, the Postgres backend keeps running
+	// the query server-side (a dead client sends no cancel), orphaning the lock
+	// for however long the statement takes. A server-side statement_timeout is
+	// the only thing that reliably kills such a runaway/orphaned chunk. SQLite
+	// has no statement_timeout and its local writes are fast, so it runs plain.
+	const scrubChunkTimeout = 2 * time.Minute
+	execChunk := func() (int64, error) {
+		if s.db.Dialect != dbutil.Postgres {
+			result, err := s.db.Exec(ctx, query, args...)
+			if err != nil {
+				return 0, err
+			}
+			n, _ := result.RowsAffected()
+			return n, nil
+		}
+		var n int64
+		err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+			// SET LOCAL is scoped to this transaction and reverts on
+			// commit/rollback, so it never leaks to other pooled connections.
+			// Bare integer value is interpreted as milliseconds.
+			if _, err := s.db.Exec(ctx, fmt.Sprintf(`SET LOCAL statement_timeout = %d`, scrubChunkTimeout.Milliseconds())); err != nil {
+				return err
+			}
+			result, err := s.db.Exec(ctx, query, args...)
+			if err != nil {
+				return err
+			}
+			n, _ = result.RowsAffected()
+			return nil
+		})
+		return n, err
+	}
 	for {
-		result, err := s.db.Exec(ctx, query, args...)
+		n, err := execChunk()
 		if err != nil {
 			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
 		}
-		n, _ := result.RowsAffected()
 		total += n
 		if n < chunkSize {
 			break
