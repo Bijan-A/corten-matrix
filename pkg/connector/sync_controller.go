@@ -1874,6 +1874,82 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 	go c.runCloudSyncController(log.With().Str("component", "cloud_sync").Logger())
 }
 
+// backfillDrainIdleBackoff is how long the Synapse backfill drain loop waits
+// after finding no due task before polling again. Short enough that a portal
+// re-dispatched batch_delay after its previous batch is picked up promptly,
+// long enough not to spin when the queue is genuinely empty.
+const backfillDrainIdleBackoff = 5 * time.Second
+
+// backfillDrainErrorBackoff mirrors bridgev2's BackfillQueueErrorBackoff for
+// the "GetNext failed" case.
+const backfillDrainErrorBackoff = 1 * time.Minute
+
+// runSynapseBackfillDrainLoop drains the bridgev2 backward-backfill queue on
+// homeservers that lack Beeper's batch-send extension (i.e. self-hosted
+// Synapse). bridgev2's own RunBackfillQueue refuses to start when
+// Matrix.GetCapabilities().BatchSending is false, so the BackfillTask rows this
+// connector enqueues (see the reset loop that ends in WakeupBackfillQueue)
+// would never be processed — historical delivery stalls partway, frozen at
+// whatever the one-time forward backfill captured at portal creation. The
+// per-portal send path already falls back to sendLegacyBackfill when batch send
+// is unavailable, so the only missing piece is a loop that pulls due tasks and
+// runs them.
+//
+// This mirrors the task-processing body of bridgev2's RunBackfillQueue
+// (GetNext -> DoBackfillTask): DoBackfillTask marks the task dispatched,
+// backfills one batch via the connector's FetchMessages, delivers it, and
+// reschedules or completes the task. It is only started when batch send is
+// unavailable; on Beeper, bridgev2's queue runs and this loop must stay off to
+// avoid double-processing the same task.
+func (c *IMClient) runSynapseBackfillDrainLoop(log zerolog.Logger, stopChan <-chan struct{}) {
+	br := c.Main.Bridge
+	// Tie a cancelable context to stopChan so an in-flight batch aborts on
+	// Disconnect instead of blocking shutdown, matching how bridgev2's own
+	// queue wires cancellation.
+	ctx, cancel := context.WithCancel(log.WithContext(context.Background()))
+	defer cancel()
+	go func() {
+		select {
+		case <-stopChan:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	log.Info().Msg("Starting Synapse backfill drain loop (batch send unavailable — draining backfill queue directly)")
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		task, err := br.DB.BackfillTask.GetNext(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Err(err).Msg("Backfill drain: failed to get next task")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backfillDrainErrorBackoff):
+			}
+			continue
+		}
+		if task == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backfillDrainIdleBackoff):
+			}
+			continue
+		}
+		task.FromQueue = true
+		// DoBackfillTask marks the task dispatched, runs one backfill batch
+		// (delivering via sendLegacyBackfill on non-batch homeservers), and
+		// persists the updated cursor / next-dispatch time. Failures back the
+		// task off internally, so we just loop on to the next due task.
+		br.DoBackfillTask(ctx, task)
+	}
+}
+
 // cloudSyncRetryInterval is the interval used when a bootstrap sync attempt
 // fails, so recovery happens quickly.
 const cloudSyncRetryInterval = 1 * time.Minute
