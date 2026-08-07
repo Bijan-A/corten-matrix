@@ -2270,6 +2270,12 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
 	}
 
+	// One-time: re-key existing group cloud rows from gid:<UUID> to the
+	// participant key, so createPortalsFromCloudSync builds one room per group
+	// directly instead of one per rotated GUID. Runs before consolidation so the
+	// canonical key is already in place. No-op after the first run.
+	c.rekeyGroupPortalsToParticipantSet(ctx, log)
+
 	// Heal groups that GUID rotation sharded across many rooms (any group, not
 	// createPortalsFromCloudSync so the canonical portal is the one (re-)backfilled.
 	c.consolidateGroupPortals(ctx, log)
@@ -3889,6 +3895,62 @@ func planGroupConsolidation(entries []groupConsolidationEntry) []groupConsolidat
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].canonical < out[j].canonical })
 	return out
+}
+
+// groupPortalRekeyFlagKey guards the one-time cloud-data re-key migration below.
+const groupPortalRekeyFlagKey = database.Key("group_portal_participant_rekey_v1")
+
+// rekeyGroupPortalsToParticipantSet is a one-time migration that re-points
+// existing group cloud_chat/cloud_message rows from the old gid:<UUID> key to
+// the canonical participant-set key.
+//
+// The participant-keying change (resolvePortalIDForCloudChat) only affects
+// data ingested AFTER the upgrade — rows already stored under gid:<UUID> keep
+// them. Because iMessage rotates a group's GUID over time, one chat can hold
+// dozens of gid: variants; createPortalsFromCloudSync dedups by group_id, not
+// participants, so those variants would otherwise each spawn a room (and
+// re-upload media) before consolidateGroupPortals slowly merged them. Re-keying
+// the cloud rows in place collapses every variant onto one participant key up
+// front, so portal creation builds a single room per group directly.
+//
+// In-place UPDATEs only (no CloudKit re-download, no message re-ingest, so no
+// self-chat misrouting risk). Idempotent and gated by a KV flag so it runs
+// exactly once; on error the flag is left unset so it retries next start.
+func (c *IMClient) rekeyGroupPortalsToParticipantSet(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	if c.Main.Bridge.DB.KV.Get(ctx, groupPortalRekeyFlagKey) != "" {
+		return
+	}
+	chats, err := c.cloudStore.listGroupChats(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Group portal re-key: failed to list group chats (will retry next start)")
+		return
+	}
+	rekeyed := 0
+	for _, chat := range chats {
+		// Only re-key genuine groups; a degenerate roster (fewer than 2 non-self
+		// members) can't build a participant key, so leave its gid: fallback.
+		if c.countNonSelfMembers(chat.participants, nil) < 2 {
+			continue
+		}
+		newKey := strings.Join(c.buildCanonicalParticipantList(chat.participants), ",")
+		if newKey == "" || newKey == chat.portalID {
+			continue // already participant-keyed
+		}
+		if err := c.cloudStore.reKeyPortalID(ctx, chat.portalID, newKey); err != nil {
+			log.Warn().Err(err).Str("from", chat.portalID).Str("to", newKey).
+				Msg("Group portal re-key: failed to re-point cloud rows")
+			continue
+		}
+		rekeyed++
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, groupPortalRekeyFlagKey, time.Now().Format(time.RFC3339))
+	if rekeyed > 0 {
+		log.Info().Int("chats_rekeyed", rekeyed).
+			Msg("Group portal participant-key migration: re-pointed group cloud rows from gid:<UUID> to participant keys")
+	}
 }
 
 // consolidateGroupPortals collapses groups sharded across multiple
