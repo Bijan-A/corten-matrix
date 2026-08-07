@@ -3929,6 +3929,10 @@ func (c *IMClient) rekeyGroupPortalsToParticipantSet(ctx context.Context, log ze
 		return
 	}
 	rekeyed := 0
+	// Destination keys that received at least one re-keyed (merged) row. Each
+	// must have fwd_backfill_done reset across ALL its cloud_chat rows so the
+	// merged room forward-backfills the combined history — see the reset below.
+	destKeys := make(map[string]struct{})
 	for _, chat := range chats {
 		// Only re-key genuine groups; a degenerate roster (fewer than 2 non-self
 		// members) can't build a participant key, so leave its gid: fallback.
@@ -3944,11 +3948,29 @@ func (c *IMClient) rekeyGroupPortalsToParticipantSet(ctx context.Context, log ze
 				Msg("Group portal re-key: failed to re-point cloud rows")
 			continue
 		}
+		destKeys[newKey] = struct{}{}
 		rekeyed++
+	}
+	// Reset fwd_backfill_done=FALSE across every merge destination key. reKeyPortalID
+	// already clears it on the rows it moves, but a destination key can also hold a
+	// row that was ALREADY participant-keyed (so the loop skipped it) carrying a
+	// stale fwd_backfill_done=TRUE from a previous backfill. isForwardBackfillDone
+	// uses EXISTS(...=TRUE), so a single stale TRUE among the now-merged rows makes
+	// the whole portal look done and suppresses forward backfill — the merged room
+	// would stay empty. Clearing the entire destination key guarantees the combined
+	// history is (re-)delivered.
+	reset := 0
+	for key := range destKeys {
+		if err := c.cloudStore.resetForwardBackfillDone(ctx, key); err != nil {
+			log.Warn().Err(err).Str("portal_id", key).
+				Msg("Group portal re-key: failed to reset fwd_backfill_done on merge destination")
+			continue
+		}
+		reset++
 	}
 	c.Main.Bridge.DB.KV.Set(ctx, groupPortalRekeyFlagKey, time.Now().Format(time.RFC3339))
 	if rekeyed > 0 {
-		log.Info().Int("chats_rekeyed", rekeyed).
+		log.Info().Int("chats_rekeyed", rekeyed).Int("dest_keys_reset", reset).
 			Msg("Group portal participant-key migration: re-pointed group cloud rows from gid:<UUID> to participant keys")
 	}
 }
