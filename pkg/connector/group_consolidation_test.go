@@ -5,79 +5,79 @@ import (
 	"testing"
 )
 
-func TestPlanCarrierGroupConsolidation(t *testing.T) {
+func TestPlanGroupConsolidation(t *testing.T) {
 	comma := "tel:+15551111111,tel:+15552222222"
 	commaB := "tel:+15553333333,tel:+15554444444"
 
 	tests := []struct {
 		name    string
-		entries []carrierConsolidationEntry
-		want    []carrierConsolidationGroup
+		entries []groupConsolidationEntry
+		want    []groupConsolidationGroup
 	}{
 		{
 			name: "multiple gid encodings collapse to one canonical group",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: "gid:aaaa", canonical: comma},
 				{portalID: "gid:bbbb", canonical: comma},
 				{portalID: "gid:cccc", canonical: comma},
 			},
-			want: []carrierConsolidationGroup{
+			want: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa", "gid:bbbb", "gid:cccc"}},
 			},
 		},
 		{
 			name: "single gid still re-keyed to participant form",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: "gid:aaaa", canonical: comma},
 			},
-			want: []carrierConsolidationGroup{
+			want: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa"}},
 			},
 		},
 		{
 			name: "already-canonical single portal is a no-op",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: comma, canonical: comma},
 			},
 			want: nil,
 		},
 		{
 			name: "comma survivor plus gid duplicate still consolidates",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: comma, canonical: comma},
 				{portalID: "gid:aaaa", canonical: comma},
 			},
-			want: []carrierConsolidationGroup{
+			want: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa", comma}},
 			},
 		},
 		{
 			name: "distinct participant sets stay separate",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: "gid:aaaa", canonical: comma},
 				{portalID: "gid:bbbb", canonical: comma},
 				{portalID: "gid:cccc", canonical: commaB},
 				{portalID: "gid:dddd", canonical: commaB},
 			},
-			want: []carrierConsolidationGroup{
+			want: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa", "gid:bbbb"}},
 				{canonical: commaB, members: []string{"gid:cccc", "gid:dddd"}},
 			},
 		},
 		{
 			name: "duplicate portal IDs are de-duplicated within a group",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: "gid:aaaa", canonical: comma},
 				{portalID: "gid:aaaa", canonical: comma},
 				{portalID: "gid:bbbb", canonical: comma},
 			},
-			want: []carrierConsolidationGroup{
+			want: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa", "gid:bbbb"}},
 			},
 		},
 		{
 			name: "entries with empty canonical or portal are ignored",
-			entries: []carrierConsolidationEntry{
+			entries: []groupConsolidationEntry{
 				{portalID: "gid:aaaa", canonical: ""},
 				{portalID: "", canonical: comma},
 			},
@@ -87,22 +87,22 @@ func TestPlanCarrierGroupConsolidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := planCarrierGroupConsolidation(tt.entries)
+			got := planGroupConsolidation(tt.entries)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("planCarrierGroupConsolidation() = %#v, want %#v", got, tt.want)
+				t.Fatalf("planGroupConsolidation() = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestPlanCarrierRoomMoves(t *testing.T) {
+func TestPlanGroupRoomMoves(t *testing.T) {
 	const comma = "tel:+15551111111,tel:+15552222222"
 
 	tests := []struct {
 		name             string
 		canonicalHasRoom bool
-		members          []carrierMemberRoom
-		want             carrierRoomMovePlan
+		members          []groupMemberRoom
+		want             groupRoomMovePlan
 	}{
 		{
 			// Canonical key already has a room: it must survive, and even a larger
@@ -110,47 +110,47 @@ func TestPlanCarrierRoomMoves(t *testing.T) {
 			// larger room — the bug this guards against).
 			name:             "existing canonical room survives over a larger member",
 			canonicalHasRoom: true,
-			members: []carrierMemberRoom{
+			members: []groupMemberRoom{
 				{portalID: "gid:aaaa", hasRoom: true, msgCount: 9999},
 			},
-			want: carrierRoomMovePlan{survivor: comma, reIDs: []string{"gid:aaaa"}},
+			want: groupRoomMovePlan{survivor: comma, reIDs: []string{"gid:aaaa"}},
 		},
 		{
 			name:             "no canonical room: most-history member is renamed onto canonical first",
 			canonicalHasRoom: false,
-			members: []carrierMemberRoom{
+			members: []groupMemberRoom{
 				{portalID: "gid:aaaa", hasRoom: true, msgCount: 10},
 				{portalID: "gid:bbbb", hasRoom: true, msgCount: 50},
 				{portalID: "gid:cccc", hasRoom: true, msgCount: 20},
 			},
-			want: carrierRoomMovePlan{survivor: "gid:bbbb", reIDs: []string{"gid:bbbb", "gid:aaaa", "gid:cccc"}},
+			want: groupRoomMovePlan{survivor: "gid:bbbb", reIDs: []string{"gid:bbbb", "gid:aaaa", "gid:cccc"}},
 		},
 		{
 			name:             "members without rooms are skipped",
 			canonicalHasRoom: false,
-			members: []carrierMemberRoom{
+			members: []groupMemberRoom{
 				{portalID: "gid:aaaa", hasRoom: false},
 				{portalID: "gid:bbbb", hasRoom: true, msgCount: 5},
 				{portalID: "gid:cccc", hasRoom: false},
 			},
-			want: carrierRoomMovePlan{survivor: "gid:bbbb", reIDs: []string{"gid:bbbb"}},
+			want: groupRoomMovePlan{survivor: "gid:bbbb", reIDs: []string{"gid:bbbb"}},
 		},
 		{
 			name:             "no member has a room: nothing to move, createPortals builds it",
 			canonicalHasRoom: false,
-			members: []carrierMemberRoom{
+			members: []groupMemberRoom{
 				{portalID: "gid:aaaa", hasRoom: false},
 				{portalID: "gid:bbbb", hasRoom: false},
 			},
-			want: carrierRoomMovePlan{survivor: "", reIDs: nil},
+			want: groupRoomMovePlan{survivor: "", reIDs: nil},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := planCarrierRoomMoves(comma, tt.canonicalHasRoom, tt.members)
+			got := planGroupRoomMoves(comma, tt.canonicalHasRoom, tt.members)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("planCarrierRoomMoves() = %#v, want %#v", got, tt.want)
+				t.Fatalf("planGroupRoomMoves() = %#v, want %#v", got, tt.want)
 			}
 		})
 	}

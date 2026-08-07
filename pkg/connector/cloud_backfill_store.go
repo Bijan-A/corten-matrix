@@ -2327,20 +2327,22 @@ func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, porta
 	return err
 }
 
-// carrierGroupChatRow is one carrier-service (SMS/RCS/MMS) group cloud_chat row
+// groupChatRow is one group cloud_chat row
 // used by the participant-set consolidation migration.
-type carrierGroupChatRow struct {
+type groupChatRow struct {
 	portalID     string
 	participants []string
 }
 
-// listCarrierGroupChats returns the distinct group portals (gid: or comma) for
+// listGroupChats returns the distinct group portals (gid: or comma) for
 // non-deleted SMS/RCS/MMS chats, each with its normalized participant roster, for
-// consolidateCarrierGroupPortals. DM portals and empty-roster rows are excluded.
-func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carrierGroupChatRow, error) {
+// consolidateGroupPortals. DM portals and empty-roster rows are excluded.
+func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow, error) {
+	// All group chats (not just carrier): iMessage group GUIDs also rotate over
+	// time, so any group can end up split across multiple gid:/comma portals.
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
-		 WHERE login_id=$1 AND UPPER(TRIM(service)) IN ('SMS','RCS','MMS') AND deleted=FALSE
+		 WHERE login_id=$1 AND deleted=FALSE
 		   AND portal_id <> '' AND participants_json IS NOT NULL AND participants_json <> ''
 		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')`,
 		s.loginID,
@@ -2350,7 +2352,7 @@ func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carri
 	}
 	defer rows.Close()
 
-	var out []carrierGroupChatRow
+	var out []groupChatRow
 	seen := make(map[string]bool)
 	for rows.Next() {
 		var portalID, participantsJSON string
@@ -2374,7 +2376,7 @@ func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carri
 			continue
 		}
 		seen[portalID] = true
-		out = append(out, carrierGroupChatRow{portalID: portalID, participants: normalized})
+		out = append(out, groupChatRow{portalID: portalID, participants: normalized})
 	}
 	return out, rows.Err()
 }

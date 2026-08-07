@@ -84,13 +84,39 @@ func TestCarrierGroupKeyIgnoresUnstableGid(t *testing.T) {
 	}
 }
 
-// TestNonCarrierGroupStillUsesGid guards that the carrier branch is correctly
-// scoped: an iMessage group with a group_id must keep its gid: key, untouched.
-func TestNonCarrierGroupStillUsesGid(t *testing.T) {
+// TestImessageGroupUsesParticipantKey pins the core of this change: iMessage
+// groups (which carry a group_id/UUID) are now keyed by participant set too, not
+// by gid:<UUID>. iMessage reassigns a group's GUID over its lifetime, so two
+// records for the same roster under different UUIDs must collapse to one key
+// instead of splitting into separate rooms.
+func TestImessageGroupUsesParticipantKey(t *testing.T) {
 	c := testClient()
-	got := c.resolvePortalIDForCloudChat([]string{handleA, handleB}, nil, "ABCD-1234", 43, "iMessage")
+	want := selfHandle + "," + handleA + "," + handleB
+	k1 := c.resolvePortalIDForCloudChat([]string{handleA, handleB}, nil, "ABCD-1234", 43, "iMessage")
+	k2 := c.resolvePortalIDForCloudChat([]string{handleB, handleA}, nil, "d7341997-de38-41e3-8c20-03d728a98114", 43, "iMessage")
+	if k1 != want {
+		t.Fatalf("iMessage group key = %q, want participant key %q", k1, want)
+	}
+	if strings.HasPrefix(k1, "gid:") {
+		t.Fatalf("iMessage group should no longer use a gid: key, got %q", k1)
+	}
+	if k1 != k2 {
+		t.Fatalf("same iMessage group under different UUIDs produced %q and %q — would split", k1, k2)
+	}
+}
+
+// TestGroupFallsBackToGidWhenRosterUnknown pins the fallback: a group whose
+// roster is too sparse to key (fewer than 2 non-self members) but that still
+// carries a group_id keeps a gid:<UUID> key so its messages land somewhere.
+// consolidateGroupPortals folds it into the participant portal once the roster
+// is known.
+func TestGroupFallsBackToGidWhenRosterUnknown(t *testing.T) {
+	c := testClient()
+	// style 43 = group; only one non-self member known → can't build a
+	// participant key, so the gid fallback applies.
+	got := c.resolvePortalIDForCloudChat([]string{handleA}, nil, "ABCD-1234", 43, "iMessage")
 	if got != "gid:abcd-1234" {
-		t.Fatalf("iMessage group key = %q, want gid:abcd-1234", got)
+		t.Fatalf("roster-unknown group key = %q, want gid:abcd-1234 fallback", got)
 	}
 }
 
