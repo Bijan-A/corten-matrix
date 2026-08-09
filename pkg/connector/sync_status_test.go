@@ -42,8 +42,10 @@ func openTestSyncDB(t *testing.T) *dbutil.Database {
 	CREATE TABLE cloud_message (
 		login_id TEXT, guid TEXT, record_name TEXT, portal_id TEXT,
 		deleted BOOLEAN, tapback_type INTEGER, timestamp_ms INTEGER,
-		updated_ts INTEGER
+		updated_ts INTEGER,
+		text TEXT, attachments_json TEXT, body_scrubbed BOOLEAN DEFAULT 0
 	);
+	CREATE TABLE portal (id TEXT, receiver TEXT, mxid TEXT);
 	CREATE TABLE user_login (id TEXT, bridge_id TEXT);
 	CREATE TABLE message (id TEXT, bridge_id TEXT, room_receiver TEXT);
 	CREATE TABLE kv_store (bridge_id TEXT, key TEXT, value TEXT, PRIMARY KEY (bridge_id, key));
@@ -77,15 +79,21 @@ func TestGetSyncStatus(t *testing.T) {
 
 	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted) VALUES (?, 'p1', 0)`, loginID)
 	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted) VALUES (?, 'p2', 1)`, loginID) // deleted, excluded
+	// p1 has a Matrix room (mxid set) so its contentful messages are deliverable.
+	exec(`INSERT INTO portal (id, receiver, mxid) VALUES ('p1', ?, '!room1:hs')`, loginID)
 
-	// 3 deliverable messages: 2 delivered (one matched directly, one via a
-	// part-suffixed bridgev2 message id), 1 pending. Plus a reaction (should
-	// be excluded from both counts) and a deleted message (excluded).
-	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, timestamp_ms, updated_ts) VALUES (?, 'guid-a', 'rec-a', 'p1', 0, NULL, ?, ?)`, loginID, now, now)
-	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, timestamp_ms, updated_ts) VALUES (?, 'guid-b', 'rec-b', 'p1', 0, NULL, ?, ?)`, loginID, now, now)
-	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, timestamp_ms, updated_ts) VALUES (?, 'guid-c', 'rec-c', 'p1', 0, NULL, ?, ?)`, loginID, now, now)
-	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, timestamp_ms, updated_ts) VALUES (?, 'guid-r', 'rec-r', 'p1', 0, 2000, ?, ?)`, loginID, now, now)
-	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, timestamp_ms, updated_ts) VALUES (?, 'guid-d', 'rec-d', 'p1', 1, NULL, ?, ?)`, loginID, now, now)
+	// 3 deliverable messages in p1 (has a room + content): 2 delivered (one
+	// matched directly, one via a part-suffixed bridgev2 message id), 1 pending.
+	// Plus rows that must be excluded from "deliverable": a reaction, a deleted
+	// message, a contentful message in a chat with NO room (guid-e), and an
+	// empty/no-content message (guid-f). The last two count as UNBRIDGEABLE.
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-a', 'rec-a', 'p1', 0, NULL, 'hi', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-b', 'rec-b', 'p1', 0, NULL, 'hi', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-c', 'rec-c', 'p1', 0, NULL, 'hi', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-r', 'rec-r', 'p1', 0, 2000, 'react', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-d', 'rec-d', 'p1', 1, NULL, 'hi', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-e', 'rec-e', 'p_noroom', 0, NULL, 'hi', ?, ?)`, loginID, now, now)
+	exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, deleted, tapback_type, text, timestamp_ms, updated_ts) VALUES (?, 'guid-f', 'rec-f', 'p1', 0, NULL, '', ?, ?)`, loginID, now, now)
 
 	exec(`INSERT INTO message (id, bridge_id, room_receiver) VALUES ('GUID-A', ?, ?)`, bridgeID, loginID)
 	exec(`INSERT INTO message (id, bridge_id, room_receiver) VALUES ('guid-b_1', ?, ?)`, bridgeID, loginID)
@@ -102,10 +110,13 @@ func TestGetSyncStatus(t *testing.T) {
 		t.Errorf("TotalChats = %d, want 1", report.TotalChats)
 	}
 	if report.DeliverableMessages != 3 {
-		t.Errorf("DeliverableMessages = %d, want 3 (excludes reaction + deleted)", report.DeliverableMessages)
+		t.Errorf("DeliverableMessages = %d, want 3 (contentful, in a room; excludes reaction, deleted, no-room, empty)", report.DeliverableMessages)
 	}
 	if report.DeliveredMessages != 2 {
 		t.Errorf("DeliveredMessages = %d, want 2 (direct match + part-suffixed match)", report.DeliveredMessages)
+	}
+	if report.UnbridgeableMessages != 2 {
+		t.Errorf("UnbridgeableMessages = %d, want 2 (no-room message + empty message)", report.UnbridgeableMessages)
 	}
 	if got := report.PendingMessages(); got != 1 {
 		t.Errorf("PendingMessages() = %d, want 1", got)

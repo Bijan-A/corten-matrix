@@ -3265,7 +3265,34 @@ func (s *cloudBackfillStore) debugTotalChatCount(ctx context.Context) (int, erro
 // against which deliveredMessageCount's numerator is measured. Reactions
 // (tapback_type >= 2000) are excluded because they bridge into bridgev2's
 // separate `reaction` table, not `message`.
+// deliverableMessageCount counts messages the bridge can actually deliver to
+// Matrix: non-deleted, non-reaction, contentful (has text/attachments, or was
+// body-scrubbed after delivery), AND whose portal has a Matrix room. The
+// portal-has-room join is what makes this "deliverable" rather than merely
+// "present": it excludes iMessage-filtered chats and any chat without a room
+// (both unbridgeable in the current config), so the delivered/deliverable ratio
+// reflects genuine backfill progress instead of stalling below 100% forever on
+// messages that can never be bridged. See candidateMessageCount for the broader
+// "all real messages" total used to report the unbridgeable remainder.
 func (s *cloudBackfillStore) deliverableMessageCount(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM cloud_message m
+		JOIN portal p ON p.id = m.portal_id AND p.receiver = $1 AND p.mxid <> ''
+		WHERE m.login_id=$1 AND m.deleted=FALSE AND m.record_name <> ''
+		  AND (m.tapback_type IS NULL OR m.tapback_type < 2000)
+		  AND (COALESCE(m.text,'') <> '' OR COALESCE(m.attachments_json,'') <> '' OR m.body_scrubbed=TRUE)
+	`, s.loginID).Scan(&count)
+	return count, err
+}
+
+// candidateMessageCount counts all real (non-deleted, non-reaction) messages
+// regardless of whether they can be bridged. Subtracting deliverableMessageCount
+// from this yields the "unbridgeable" remainder — messages in iMessage-filtered
+// chats, in chats without a Matrix room, or with no content — which sync-status
+// reports separately so a stable delivered/deliverable ratio reads as "complete"
+// rather than "stuck".
+func (s *cloudBackfillStore) candidateMessageCount(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM cloud_message
@@ -3286,6 +3313,7 @@ func (s *cloudBackfillStore) deliveredMessageCount(ctx context.Context, bridgeID
 		SELECT COUNT(*) FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> ''
 		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND (COALESCE(text,'') <> '' OR COALESCE(attachments_json,'') <> '' OR body_scrubbed=TRUE)
 		  AND UPPER(guid) IN (
 		    SELECT UPPER(id) FROM message
 		    WHERE bridge_id=$2 AND (room_receiver=$1 OR room_receiver='')

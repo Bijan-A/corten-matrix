@@ -127,9 +127,19 @@ type SyncStatusReport struct {
 
 	// DeliverableMessages/DeliveredMessages cover real messages only —
 	// reactions bridge into bridgev2's separate `reaction` table and are not
-	// counted here.
+	// counted here. DeliverableMessages is further restricted to messages the
+	// bridge can actually deliver: contentful and in a chat that has a Matrix
+	// room. Messages that can never be bridged in the current config (see
+	// UnbridgeableMessages) are excluded so the ratio can reach 100%.
 	DeliverableMessages int
 	DeliveredMessages   int
+
+	// UnbridgeableMessages counts real messages that are NOT deliverable and
+	// never will be here: those in iMessage-filtered chats, in chats without a
+	// Matrix room, or with no content. Reported separately so a stable
+	// delivered/deliverable ratio reads as "backfill complete" rather than
+	// "stuck below 100%".
+	UnbridgeableMessages int
 
 	// LiveMessageCount/LiveMessageLastAt track steady-state APNs traffic
 	// handed off for live delivery to Matrix, separately from the CloudKit
@@ -227,6 +237,13 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, bridgeID string) (*
 	if report.DeliveredMessages, err = store.deliveredMessageCount(ctx, bridgeID); err != nil {
 		return nil, fmt.Errorf("failed to count delivered messages: %w", err)
 	}
+	// Unbridgeable = all real messages minus the deliverable subset (filtered
+	// chats, chats without a room, empty/system messages).
+	if candidate, cErr := store.candidateMessageCount(ctx); cErr != nil {
+		return nil, fmt.Errorf("failed to count candidate messages: %w", cErr)
+	} else if candidate > report.DeliverableMessages {
+		report.UnbridgeableMessages = candidate - report.DeliverableMessages
+	}
 	if report.LiveMessageCount, report.LiveMessageLastAt, err = getLiveMessageStats(ctx, db, bridgeID); err != nil {
 		return nil, fmt.Errorf("failed to read live-message stats: %w", err)
 	}
@@ -307,11 +324,14 @@ func (r *SyncStatusReport) Format(liveRunning *bool) string {
 	if r.DeliverableMessages > 0 {
 		pct = 100 * float64(r.DeliveredMessages) / float64(r.DeliverableMessages)
 	}
-	sb.WriteString(fmt.Sprintf("Delivered: %d / %d messages (%.1f%%), %d pending\n", r.DeliveredMessages, r.DeliverableMessages, pct, pending))
+	sb.WriteString(fmt.Sprintf("Delivered: %d / %d bridgeable messages (%.1f%%), %d pending\n", r.DeliveredMessages, r.DeliverableMessages, pct, pending))
+	if r.UnbridgeableMessages > 0 {
+		sb.WriteString(fmt.Sprintf("Not bridgeable here: %d messages — in iMessage-filtered chats, in chats without a Matrix room, or with no content (excluded from the total above).\n", r.UnbridgeableMessages))
+	}
 	if r.FullyCaughtUp() {
-		sb.WriteString("✅ Fully caught up — no backlog remaining.\n\n")
+		sb.WriteString("✅ Backfill complete — every bridgeable message has been delivered.\n\n")
 	} else {
-		sb.WriteString("(Reactions aren't counted — they bridge separately and aren't tracked here. \"Pending\" includes messages whose chat has no Matrix room yet, e.g. very old chats never opened in Matrix, not just an active delivery backlog.)\n\n")
+		sb.WriteString("(Reactions aren't counted — they bridge separately. \"Pending\" is bridgeable messages not yet in Matrix. If it holds steady with no active sync, the remainder is unrecoverable from CloudKit — check the log for \"VISIBLE data loss\".)\n\n")
 	}
 
 	sb.WriteString("**Live traffic (steady-state, since ever)**\n")
