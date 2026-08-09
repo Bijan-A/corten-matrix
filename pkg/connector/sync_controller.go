@@ -3942,12 +3942,6 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 		return
 	}
 
-	// Bound the Matrix room moves (re-ID / tombstone — each a homeserver round
-	// trip) performed per startup, so a large backlog of split groups can't stall
-	// startup or flood the homeserver with tombstones in one burst. The migration
-	// is idempotent and self-healing, so groups deferred here are consolidated on
-	// subsequent startups. At least one group always runs so progress is
-	// guaranteed even if a single group exceeds the budget on its own.
 	maxRooms := 0
 	for _, g := range groups {
 		maxRooms += len(g.members)
@@ -3955,12 +3949,31 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 	log.Info().Int("groups", len(groups)).Int("max_member_rooms", maxRooms).
 		Msg("Planning group consolidation")
 
+	// Re-key every group's cloud rows to its canonical participant key up front,
+	// including groups whose room moves are deferred below. This is pure DB work
+	// (no homeserver round trips), so it's unbudgeted — and doing it for deferred
+	// groups too means createPortalsFromCloudSync (which dedups by group_id)
+	// builds a single canonical room per participant set, instead of one room per
+	// not-yet-consolidated gid:<UUID> variant that a later startup would have to
+	// tombstone (re-spending the room-move budget). Correctness depends on it: a
+	// rotated GUID can shard into several gid: rooms, not just one.
+	for _, g := range groups {
+		c.reKeyGroupCloudData(ctx, log, g)
+	}
+
+	// Bound the Matrix room moves (re-ID / tombstone — each a homeserver round
+	// trip) performed per startup, so a large backlog of split groups can't stall
+	// startup or flood the homeserver with tombstones in one burst. Idempotent and
+	// self-healing, so groups deferred here have their rooms merged on subsequent
+	// startups (their cloud rows are already canonical from the pass above). At
+	// least one group always runs so progress is guaranteed even if a single group
+	// exceeds the budget on its own.
 	consolidated, roomMoves := 0, 0
 	for _, g := range groups {
 		if consolidated > 0 && roomMoves >= groupRoomMoveBudgetPerStartup {
 			break
 		}
-		roomMoves += c.consolidateOneGroup(ctx, log, g)
+		roomMoves += c.moveGroupRooms(ctx, log, g)
 		consolidated++
 	}
 	deferred := len(groups) - consolidated
@@ -4001,7 +4014,7 @@ type groupRoomMovePlan struct {
 // renamed onto the canonical key (emitted first so it claims the key before the
 // rest tombstone into it). Members without a room are skipped — they're left for
 // createPortalsFromCloudSync to build from the re-keyed cloud_chat. Pure logic:
-// the tested core of consolidateOneGroup's room moves.
+// the tested core of moveGroupRooms's room moves.
 func planGroupRoomMoves(canonical string, canonicalHasRoom bool, members []groupMemberRoom) groupRoomMovePlan {
 	survivor := ""
 	if canonicalHasRoom {
@@ -4032,10 +4045,31 @@ func planGroupRoomMoves(canonical string, canonicalHasRoom bool, members []group
 	return plan
 }
 
-// consolidateOneGroup performs the data + room moves for a single
-// group. Returns the number of room re-ID/tombstone operations it attempted, so
-// the caller can budget room moves across groups per startup.
-func (c *IMClient) consolidateOneGroup(ctx context.Context, log zerolog.Logger, g groupConsolidationGroup) int {
+// reKeyGroupCloudData re-keys every member's cloud rows to the group's canonical
+// participant key and resets the canonical portal's forward-backfill state so the
+// survivor re-backfills the union of their messages. Pure DB work (no homeserver
+// round trips), so consolidateGroupPortals runs it for every group each startup —
+// including budget-deferred ones — to keep cloud keys canonical ahead of the
+// (budgeted) room moves.
+func (c *IMClient) reKeyGroupCloudData(ctx context.Context, log zerolog.Logger, g groupConsolidationGroup) {
+	for _, m := range g.members {
+		if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
+			log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
+				Msg("Failed to re-key group cloud data")
+		}
+	}
+	if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
+		log.Warn().Err(err).Str("canonical", g.canonical).
+			Msg("Failed to reset backfill state for canonical group portal")
+	}
+}
+
+// moveGroupRooms merges a single group's existing Matrix rooms onto the canonical
+// key. Assumes reKeyGroupCloudData already re-keyed the group's cloud rows.
+// Returns the number of room re-ID/tombstone operations it attempted (each a
+// homeserver round trip), so the caller can budget room moves across groups per
+// startup.
+func (c *IMClient) moveGroupRooms(ctx context.Context, log zerolog.Logger, g groupConsolidationGroup) int {
 	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
 
 	// Gather room state, then let planGroupRoomMoves decide the survivor and the
@@ -4053,19 +4087,6 @@ func (c *IMClient) consolidateOneGroup(ctx context.Context, log zerolog.Logger, 
 		members = append(members, room)
 	}
 	plan := planGroupRoomMoves(g.canonical, c.portalHasRoom(ctx, canonicalKey), members)
-
-	// Re-key all members' cloud data to the canonical key so the survivor
-	// re-backfills the union of their messages.
-	for _, m := range g.members {
-		if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
-			log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
-				Msg("Failed to re-key group cloud data")
-		}
-	}
-	if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
-		log.Warn().Err(err).Str("canonical", g.canonical).
-			Msg("Failed to reset backfill state for canonical group portal")
-	}
 
 	// Apply the room moves. The survivor rename (when present) is reIDs[0] and
 	// must claim the canonical key before the rest tombstone into it, so a failure
