@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"sync/atomic"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -32,17 +31,6 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
-
-	// drainLoopRunning bridge-scopes the Synapse backfill drain loop to at most
-	// one per process. The loop is started per-IMClient (login) in Connect, but
-	// database.BackfillTask.GetNext is bridge-global and takes no per-task claim,
-	// so with two or more logins each loop would fetch and process the same task
-	// concurrently — duplicate delivery plus a stale-cursor writeback that rewinds
-	// progress. CompareAndSwap-guarding the start (released when the loop exits so
-	// a later login connect can re-establish it) keeps it to a single loop
-	// bridge-wide. A single loop still serves every login because DoBackfillTask
-	// routes each task by its stored user_login_id.
-	drainLoopRunning atomic.Bool
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
@@ -151,6 +139,22 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// state (session.json + keystore), create a user_login from the backup
 	// instead of requiring a full re-login.
 	c.tryAutoRestore(ctx)
+
+	// On homeservers without Beeper's batch-send extension, bridgev2's own
+	// backfill queue (RunBackfillQueue) never starts, so the backward-backfill
+	// tasks this connector enqueues would never drain and historical delivery
+	// stalls partway. Run our own drain loop in that case. Started here (once
+	// per process, tied to br.BackgroundCtx which is cancelled on bridge Stop)
+	// rather than per login: the queue is bridge-global and unclaimed, so a
+	// second loop would double-process tasks, and a login-scoped loop would die
+	// when that login logs out. A single loop serves every login because
+	// DoBackfillTask routes each task by its stored user_login_id. On Beeper
+	// (batch send available) bridgev2's queue handles it and this must stay off
+	// to avoid double-processing the same task.
+	if c.Config.UseCloudKitBackfill() && !c.Bridge.Matrix.GetCapabilities().BatchSending {
+		drainLog := c.Bridge.Log.With().Str("component", "backfill_drain").Logger()
+		go c.runSynapseBackfillDrainLoop(c.Bridge.BackgroundCtx, drainLog)
+	}
 
 	return nil
 }

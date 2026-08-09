@@ -1901,20 +1901,19 @@ const backfillDrainErrorBackoff = 1 * time.Minute
 // reschedules or completes the task. It is only started when batch send is
 // unavailable; on Beeper, bridgev2's queue runs and this loop must stay off to
 // avoid double-processing the same task.
-func (c *IMClient) runSynapseBackfillDrainLoop(log zerolog.Logger, stopChan <-chan struct{}) {
-	br := c.Main.Bridge
-	// Tie a cancelable context to stopChan so an in-flight batch aborts on
-	// Disconnect instead of blocking shutdown, matching how bridgev2's own
-	// queue wires cancellation.
-	ctx, cancel := context.WithCancel(log.WithContext(context.Background()))
-	defer cancel()
-	go func() {
-		select {
-		case <-stopChan:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+//
+// Bridge-scoped: the queue (BackfillTask.GetNext) is bridge-global and takes no
+// per-task claim, so exactly one loop may run per process — two would fetch and
+// process the same task concurrently (duplicate delivery + a stale-cursor
+// writeback that rewinds progress). It is therefore started once from
+// IMConnector.Start rather than per login, and its lifetime is tied to
+// br.BackgroundCtx (cancelled on bridge Stop) rather than any one login's
+// stopChan — so it survives any single login logging out and reconnecting, and
+// a single loop serves every login because DoBackfillTask routes each task by
+// its stored user_login_id.
+func (c *IMConnector) runSynapseBackfillDrainLoop(ctx context.Context, log zerolog.Logger) {
+	br := c.Bridge
+	ctx = log.WithContext(ctx)
 	log.Info().Msg("Starting Synapse backfill drain loop (batch send unavailable — draining backfill queue directly)")
 	for {
 		if ctx.Err() != nil {

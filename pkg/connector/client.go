@@ -1582,25 +1582,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// Notify the management room once CloudKit backfill and Matrix
 		// delivery are fully caught up — see runSyncCompletionNotifyLoop.
 		go c.runSyncCompletionNotifyLoop(log.With().Str("component", "sync_completion").Logger(), c.stopChan)
-		// On homeservers without Beeper's batch-send extension, bridgev2's own
-		// backfill queue (RunBackfillQueue) never starts, so the backward-
-		// backfill tasks this connector enqueues would never drain and
-		// historical delivery stalls partway. Run our own drain loop in that
-		// case. On Beeper (batch send available) bridgev2's queue handles it and
-		// this must stay off to avoid double-processing the same task.
-		if !c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-			// Bridge-scope the drain loop: GetNext is bridge-global and unclaimed,
-			// so more than one loop (one per login) would double-process tasks.
-			// CompareAndSwap ensures a single loop per process; the guard is
-			// released when the loop exits so a later login can re-establish it.
-			if c.Main.drainLoopRunning.CompareAndSwap(false, true) {
-				drainLog := log.With().Str("component", "backfill_drain").Logger()
-				go func() {
-					defer c.Main.drainLoopRunning.Store(false)
-					c.runSynapseBackfillDrainLoop(drainLog, c.stopChan)
-				}()
-			}
-		}
+		// The Synapse backward-backfill drain loop is no longer started here: it
+		// is bridge-global (one per process, tied to the bridge lifetime, not a
+		// login's stopChan) and is started once from IMConnector.Start. See
+		// runSynapseBackfillDrainLoop.
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
