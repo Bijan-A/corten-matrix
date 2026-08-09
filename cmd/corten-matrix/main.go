@@ -22,7 +22,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/beeper/bridge-manager/api/beeperapi"
 
@@ -62,7 +64,42 @@ func init() {
 		for _, h := range connector.BridgeCommands(disableFT) {
 			proc.AddHandler(h)
 		}
+		raiseMatrixHTTPTimeout()
 	}
+}
+
+// defaultMatrixHTTPTimeout raises the appservice HTTP client timeout well above
+// mautrix's 180s default. On a self-hosted (non-batch-send) Synapse under mass
+// backfill, createRoom — which carries many initial-state events plus invites —
+// can take longer than 180s to return even though Synapse ultimately completes
+// it. When the client times out, the bridge's later re-attempt at portal
+// creation makes a SECOND room, orphaning the first (Beeper's BeeperLocalRoomID
+// idempotency hint is a hungryserv extension Synapse ignores). A longer timeout
+// lets the first createRoom return, so no duplicate room is ever made. This
+// client's timeout is shared by the bot AND every appservice ghost intent
+// (appservice.NewMautrixClient reuses as.HTTPClient), so ghost message sends get
+// the same headroom. Override with CORTEN_MATRIX_HTTP_TIMEOUT (seconds).
+const defaultMatrixHTTPTimeout = 10 * time.Minute
+
+func raiseMatrixHTTPTimeout() {
+	timeout := defaultMatrixHTTPTimeout
+	if raw := os.Getenv("CORTEN_MATRIX_HTTP_TIMEOUT"); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+			timeout = time.Duration(secs) * time.Second
+		} else {
+			m.Log.Warn().Str("value", raw).
+				Msg("Ignoring invalid CORTEN_MATRIX_HTTP_TIMEOUT (want positive integer seconds)")
+		}
+	}
+	if m.Matrix == nil || m.Matrix.AS == nil || m.Matrix.AS.HTTPClient == nil {
+		m.Log.Warn().Msg("Could not raise Matrix HTTP client timeout: appservice client not available")
+		return
+	}
+	// Mutate .Timeout in place — replacing the client would drop the cookie jar
+	// and any unix-socket transport MakeAppService configured.
+	m.Matrix.AS.HTTPClient.Timeout = timeout
+	m.Log.Info().Stringer("timeout", timeout).
+		Msg("Raised Matrix appservice HTTP client timeout (prevents createRoom orphan-room leak under load)")
 }
 
 func main() {
