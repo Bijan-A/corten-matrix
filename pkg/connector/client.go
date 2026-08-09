@@ -4767,6 +4767,35 @@ func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger
 	}
 }
 
+// rehydrateScrubbedPortal clears the body_scrubbed flag for a portal and
+// re-fetches its messages from CloudKit so scrubbed rows regain their text.
+// Called inline by forward backfill when a portal's deliverable rows were all
+// body-scrubbed before delivery — without repopulating them, conversion yields
+// nothing and the portal would be marked done empty (silent data loss).
+// Returns true if CloudKit repopulated at least one message. Bounded by its own
+// timeout so a slow/absent CloudKit fetch can't hang the portal event loop.
+func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logger, portalID string) bool {
+	if c.cloudStore == nil || c.client == nil {
+		return false
+	}
+	if cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Msg("Rehydrate: failed to clear body_scrubbed flag")
+		return false
+	} else {
+		log.Info().Int("cleared", cleared).Str("portal_id", portalID).
+			Msg("Rehydrate: cleared body_scrubbed, re-fetching from CloudKit")
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(fetchCtx, log, portalID)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch failed")
+		return false
+	}
+	log.Info().Int("imported", imported).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch complete")
+	return imported > 0
+}
+
 func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
 	if opts.Notify == nil {
 		return
@@ -8168,6 +8197,43 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
 
 		if len(allMessages) == 0 {
+			// CORRECTNESS: before marking the portal done, guard against the
+			// silent-data-loss path. cloudRowToBackfillMessages skips body_scrubbed
+			// rows, so if the privacy scrubber cleared a portal's bodies before
+			// backfill delivered them, conversion produces zero messages here and
+			// marking done would strand real history permanently. Detect that case
+			// and rehydrate from CloudKit, then retry conversion once.
+			if c.cloudStore != nil {
+				if scrubbed, _ := c.cloudStore.hasScrubbedBackfillableMessages(ctx, portalID); scrubbed {
+					log.Warn().Str("portal_id", portalID).
+						Msg("Forward backfill: 0 messages but portal has body-scrubbed deliverable rows — rehydrating from CloudKit before marking done")
+					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
+						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
+						if queryErr != nil {
+							log.Err(queryErr).Str("portal_id", portalID).Msg("Forward backfill: re-query after rehydrate FAILED")
+							return nil, queryErr
+						}
+						for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+							rows[i], rows[j] = rows[j], rows[i]
+						}
+						c.preUploadChunkAttachments(ctx, rows, *log)
+						allRows = rows
+						totalRows = len(rows)
+						allMessages = c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
+					}
+					if len(allMessages) == 0 {
+						// CloudKit had no copy to restore — the scrubbed content is
+						// genuinely unrecoverable. Surface the loss loudly (it was
+						// silent before) and mark done so the backward-backfill queue
+						// doesn't loop forever on an anchor that will never appear.
+						log.Error().Str("portal_id", portalID).
+							Msg("Forward backfill: body-scrubbed rows could not be rehydrated from CloudKit — history unrecoverable, marking done (VISIBLE data loss)")
+					}
+				}
+			}
+		}
+
+		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
 			// Use context.Background() — if the bridge is shutting down, ctx
 			// may be cancelled but we still need to persist the flag.
@@ -8485,8 +8551,36 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		}
 	}
 
-	// Pass 2: resolve tapbacks — attach to target if in this batch,
-	// otherwise fall back to QueueRemoteEvent.
+	// Pass 2a: pre-resolve which out-of-batch tapback targets are actually
+	// present in bridgev2's message table. A tapback whose target isn't in this
+	// batch AND isn't already delivered can never render — bridgev2 logs "Target
+	// message for reaction not found" and drops it. Queueing those anyway floods
+	// the per-portal event loop (a reaction-heavy group chat produced ~9k such
+	// events → channel-full storm). Batch one query instead of thousands of
+	// doomed QueueRemoteEvents; the rendering outcome is identical because
+	// bridgev2 resolves reaction targets by the same message id == guid.
+	var outOfBatchTargets []string
+	for _, row := range tapbackRows {
+		targetGUID := tapbackTargetGUID(row.TapbackTargetGUID)
+		if targetGUID == "" {
+			continue
+		}
+		if _, inBatch := messageByGUID[targetGUID]; !inBatch {
+			outOfBatchTargets = append(outOfBatchTargets, targetGUID)
+		}
+	}
+	deliveredTargets, derr := c.cloudStore.guidsWithDeliveredMessage(ctx, string(c.Main.Bridge.ID), outOfBatchTargets)
+	if derr != nil {
+		// On query error, fall back to the old behavior (queue everything) rather
+		// than silently drop reactions — correctness over the flood mitigation.
+		log := zerolog.Ctx(ctx)
+		log.Warn().Err(derr).Msg("Tapback target pre-check failed — queueing out-of-batch reactions unfiltered")
+	}
+
+	// Pass 2b: resolve tapbacks — attach to target if in this batch, queue for
+	// out-of-batch targets that are delivered, skip out-of-batch targets that
+	// aren't (they'd be dropped as "target not found" anyway).
+	skippedOrphanReactions := 0
 	for _, row := range tapbackRows {
 		sender := c.makeCloudSender(row)
 		if sender.Sender == "" && !sender.IsFromMe {
@@ -8530,12 +8624,33 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 				TargetPart: targetPart,
 			})
 		} else {
-			// Fall back to QueueRemoteEvent for removes and out-of-batch targets.
+			// Out-of-batch target (or a remove). Only queue if the target is
+			// actually delivered — otherwise bridgev2 drops it and we'd just be
+			// flooding the event loop. On a pre-check error deliveredTargets is
+			// nil and we queue unconditionally (old behavior).
+			if derr == nil && !deliveredTargets[targetGUID] {
+				skippedOrphanReactions++
+				continue
+			}
 			c.cloudTapbackToBackfill(row, sender, time.UnixMilli(row.TimestampMS))
 		}
 	}
+	if skippedOrphanReactions > 0 {
+		zerolog.Ctx(ctx).Debug().
+			Int("skipped", skippedOrphanReactions).
+			Msg("Skipped backfill reactions whose target message was never delivered (would flood event loop as 'target not found')")
+	}
 
 	return messages
+}
+
+// tapbackTargetGUID extracts the bare target GUID from a tapback target field,
+// which may be in "p:N/GUID" balloon-part form.
+func tapbackTargetGUID(raw string) string {
+	if parts := strings.SplitN(raw, "/", 2); len(parts) == 2 {
+		return parts[1]
+	}
+	return raw
 }
 
 // cloudReactionMinType is the lowest tapback_type that denotes a real reaction.

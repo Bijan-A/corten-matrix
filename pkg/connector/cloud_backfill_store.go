@@ -2785,6 +2785,28 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
+// hasScrubbedBackfillableMessages reports whether a portal has non-deleted,
+// deliverable rows whose bodies were cleared by the privacy scrubber
+// (body_scrubbed=TRUE, has_body=TRUE, not a reaction). cloudRowToBackfillMessages
+// skips such rows, so a portal where ALL deliverable rows are scrubbed converts
+// to zero backfill messages — and the forward-backfill empty path would then mark
+// it done with nothing delivered (silent data loss). Forward backfill uses this
+// to decide whether to rehydrate from CloudKit before marking a portal done.
+func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		  AND body_scrubbed=TRUE AND has_body=TRUE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+	`, s.loginID, portalID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // countBackfillableMessages returns the number of rows FetchMessages can read
 // for a portal (deleted=FALSE and record_name <> ”).
 // When requireContentful is true, only rows with text or attachments count.
@@ -2855,6 +2877,46 @@ func (s *cloudBackfillStore) guidsDeliveredInOtherRoom(ctx context.Context, brid
 			return nil, err
 		}
 		out[id] = roomID
+	}
+	return out, rows.Err()
+}
+
+// guidsWithDeliveredMessage returns the subset of guids that already have a
+// bridgev2 `message` row for this receiver (i.e. were delivered to Matrix).
+// bridgev2 resolves a reaction's target by message id == guid, so this matches
+// exactly the targets its reaction handler would find. Backfill uses it to drop
+// tapbacks whose target isn't present BEFORE queueing them: such reactions can't
+// render ("Target message for reaction not found") and, in reaction-heavy group
+// chats, queueing thousands of them floods the per-portal event loop (channel-full
+// storm). Filtering here yields the same rendering outcome without the flood.
+// room_id is intentionally not constrained — a target delivered under any room
+// for this receiver is resolvable, matching bridgev2's room-agnostic lookup.
+func (s *cloudBackfillStore) guidsWithDeliveredMessage(ctx context.Context, bridgeID string, guids []string) (map[string]bool, error) {
+	if len(guids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(guids)+2)
+	args = append(args, bridgeID, string(s.loginID))
+	ph := make([]string, len(guids))
+	for i, g := range guids {
+		args = append(args, g)
+		ph[i] = fmt.Sprintf("$%d", i+3)
+	}
+	query := `SELECT DISTINCT id FROM message
+		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+		  AND id IN (` + strings.Join(ph, ", ") + `)`
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool, len(guids))
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
 	}
 	return out, rows.Err()
 }
@@ -3978,13 +4040,29 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND updated_ts < $2
 		      AND (
 		        deleted=TRUE
-		        OR UPPER(guid) IN (
-		          SELECT UPPER(id) FROM message
-		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
-		          UNION
-		          SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		          WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
-		            AND (room_receiver=$1 OR room_receiver='')
+		        OR (
+		          -- Only scrub a bridged body once the portal's forward backfill is
+		          -- confirmed done. Without this gate the periodic scrubber can race
+		          -- ahead of an in-progress (or not-yet-run) backfill: it clears the
+		          -- body of a row that briefly had a `+"`message`"+` row from an earlier
+		          -- attempt, then cloudRowToBackfillMessages' body_scrubbed skip drops
+		          -- it and the forward-backfill empty path marks the portal done with
+		          -- nothing delivered (silent data loss). fwd_backfill_done is set only
+		          -- after delivery completes, so gating on it closes that race. The
+		          -- deleted=TRUE branch above stays ungated — user-deleted content must
+		          -- be scrubbed for privacy regardless of backfill state.
+		          portal_id IN (
+		            SELECT portal_id FROM cloud_chat
+		            WHERE login_id=$1 AND fwd_backfill_done=TRUE
+		          )
+		          AND UPPER(guid) IN (
+		            SELECT UPPER(id) FROM message
+		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
+		            UNION
+		            SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		            WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
+		              AND (room_receiver=$1 OR room_receiver='')
+		          )
 		        )
 		      )`+exclusionSQL+`
 		    LIMIT `+limitPlaceholder+`
@@ -4138,9 +4216,18 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 
 	// Only portals whose contentful row count exceeds the cap have an
 	// unreachable tail; the rest are entirely within the backfill window.
+	// Restrict to portals whose forward backfill is confirmed done: the tail is
+	// "unreachable" only after the newest keepPerPortal rows have actually been
+	// delivered. Scrubbing before then can clear rows the initial forward fetch
+	// still needs, and cloudRowToBackfillMessages' body_scrubbed skip would then
+	// drop them, marking the portal done with nothing delivered (silent loss).
 	rows, err := s.db.Query(ctx, `
 		SELECT portal_id FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
+		  AND portal_id IN (
+		    SELECT portal_id FROM cloud_chat
+		    WHERE login_id=$1 AND fwd_backfill_done=TRUE
+		  )
 		GROUP BY portal_id
 		HAVING COUNT(*) > $2
 	`, s.loginID, keepPerPortal)

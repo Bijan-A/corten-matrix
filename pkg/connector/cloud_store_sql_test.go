@@ -552,7 +552,27 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 		t.Fatalf("age messages: %v", err)
 	}
 
+	// scrubBridgedBodies only scrubs bridged bodies once the portal's forward
+	// backfill is confirmed done (fwd_backfill_done=TRUE). While it's still
+	// FALSE the scrubber must leave the body intact, otherwise it can race ahead
+	// of an in-progress backfill and strand history. Verify the gate first.
 	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies (before fwd_backfill_done): %v", err)
+	}
+	if scrubbed != 0 {
+		t.Errorf("scrubBridgedBodies scrubbed %d rows before fwd_backfill_done, want 0", scrubbed)
+	}
+
+	// Mark the portal's forward backfill done, then the bridged body must scrub.
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_chat SET fwd_backfill_done=TRUE WHERE login_id=$1 AND portal_id=$2`,
+		testSQLLoginID, "gid:right-portal",
+	); err != nil {
+		t.Fatalf("mark fwd_backfill_done: %v", err)
+	}
+
+	scrubbed, err = store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)
 	}

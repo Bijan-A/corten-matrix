@@ -80,6 +80,122 @@ func TestForwardBackfillDoneLifecycle(t *testing.T) {
 	}
 }
 
+// hasScrubbedBackfillableMessages is the trigger for forward backfill's
+// rehydrate-before-marking-done guard. It must fire only for deliverable rows
+// whose bodies were cleared by the privacy scrubber (body_scrubbed=TRUE,
+// has_body=TRUE, non-reaction) — not for genuinely-empty portals, non-scrubbed
+// rows, deleted rows, or scrubbed reactions.
+func TestHasScrubbedBackfillableMessages(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const now = int64(1_000_000)
+
+	// A live (non-scrubbed) contentful row must NOT trigger rehydration.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-LIVE", PortalID: "p-live", CloudChatID: "C1",
+		TimestampMS: now, Text: "hello", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert live: %v", err)
+	}
+	// Give it a record_name so it counts as backfillable (matches the guard's
+	// record_name <> '' predicate).
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1`, testSQLLoginID); err != nil {
+		t.Fatalf("set record_name: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-live"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-live): %v", err)
+	} else if got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-live) = true for a live contentful row, want false")
+	}
+
+	// A scrubbed, has_body, non-reaction row on p-scrub MUST trigger.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-SCRUB", PortalID: "p-scrub", CloudChatID: "C2",
+		TimestampMS: now, Text: "will be scrubbed", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert scrub: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET record_name='r', text=NULL, body_scrubbed=TRUE WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-SCRUB",
+	); err != nil {
+		t.Fatalf("scrub G-SCRUB: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-scrub"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-scrub): %v", err)
+	} else if !got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-scrub) = false for a scrubbed deliverable row, want true")
+	}
+
+	// A portal with no rows at all must NOT trigger.
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-empty"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-empty): %v", err)
+	} else if got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-empty) = true for an empty portal, want false")
+	}
+}
+
+// guidsWithDeliveredMessage backs 3b's reaction-flood mitigation: backfill uses
+// it to skip queueing tapbacks whose target message was never delivered (which
+// would otherwise flood the per-portal event loop as "target not found"). It must
+// return exactly the guids that have a bridgev2 `message` row for this receiver.
+func TestGuidsWithDeliveredMessage(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
+		id TEXT NOT NULL, bridge_id TEXT NOT NULL,
+		room_receiver TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create message table: %v", err)
+	}
+	const bridgeID = "test-bridge"
+	// DELIVERED-A: normal delivered target. DELIVERED-B: delivered under empty
+	// room_receiver (appservice rows) — must still match. WRONG-LOGIN: belongs to
+	// a different receiver — must NOT match.
+	for _, r := range []struct{ id, recv string }{
+		{"DELIVERED-A", string(testSQLLoginID)},
+		{"DELIVERED-B", ""},
+		{"WRONG-LOGIN", "someone-else"},
+	} {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			r.id, bridgeID, r.recv); err != nil {
+			t.Fatalf("insert message %s: %v", r.id, err)
+		}
+	}
+
+	got, err := store.guidsWithDeliveredMessage(ctx, bridgeID,
+		[]string{"DELIVERED-A", "DELIVERED-B", "WRONG-LOGIN", "NEVER-DELIVERED"})
+	if err != nil {
+		t.Fatalf("guidsWithDeliveredMessage: %v", err)
+	}
+	want := map[string]bool{"DELIVERED-A": true, "DELIVERED-B": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for g := range want {
+		if !got[g] {
+			t.Errorf("guid %q missing from delivered set %v", g, got)
+		}
+	}
+	if got["WRONG-LOGIN"] {
+		t.Error("WRONG-LOGIN (different receiver) must not be reported delivered")
+	}
+	if got["NEVER-DELIVERED"] {
+		t.Error("NEVER-DELIVERED (no message row) must not be reported delivered")
+	}
+
+	// Empty input must not error or query.
+	if m, err := store.guidsWithDeliveredMessage(ctx, bridgeID, nil); err != nil || len(m) != 0 {
+		t.Errorf("empty guids: got (%v, %v), want (empty, nil)", m, err)
+	}
+}
+
 // A failing query must report false rather than true: treating an error as
 // "done" would skip backfill for the portal entirely. It must also not panic
 // or block. The warning it now logs is what makes the failure visible — see
