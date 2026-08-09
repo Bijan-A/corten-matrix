@@ -1589,7 +1589,17 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// case. On Beeper (batch send available) bridgev2's queue handles it and
 		// this must stay off to avoid double-processing the same task.
 		if !c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-			go c.runSynapseBackfillDrainLoop(log.With().Str("component", "backfill_drain").Logger(), c.stopChan)
+			// Bridge-scope the drain loop: GetNext is bridge-global and unclaimed,
+			// so more than one loop (one per login) would double-process tasks.
+			// CompareAndSwap ensures a single loop per process; the guard is
+			// released when the loop exits so a later login can re-establish it.
+			if c.Main.drainLoopRunning.CompareAndSwap(false, true) {
+				drainLog := log.With().Str("component", "backfill_drain").Logger()
+				go func() {
+					defer c.Main.drainLoopRunning.Store(false)
+					c.runSynapseBackfillDrainLoop(drainLog, c.stopChan)
+				}()
+			}
 		}
 	} else {
 		if !c.Main.Config.CloudKitBackfill {

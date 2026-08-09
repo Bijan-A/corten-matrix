@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -31,6 +32,17 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
+
+	// drainLoopRunning bridge-scopes the Synapse backfill drain loop to at most
+	// one per process. The loop is started per-IMClient (login) in Connect, but
+	// database.BackfillTask.GetNext is bridge-global and takes no per-task claim,
+	// so with two or more logins each loop would fetch and process the same task
+	// concurrently — duplicate delivery plus a stale-cursor writeback that rewinds
+	// progress. CompareAndSwap-guarding the start (released when the loop exits so
+	// a later login connect can re-establish it) keeps it to a single loop
+	// bridge-wide. A single loop still serves every login because DoBackfillTask
+	// routes each task by its stored user_login_id.
+	drainLoopRunning atomic.Bool
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
