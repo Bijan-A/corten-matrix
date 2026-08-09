@@ -516,6 +516,17 @@ type IMClient struct {
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
 
+	// backwardDeferCounts bounds how long a backward-backfill task waits for
+	// forward backfill to produce an anchor. Forward backfill runs once at portal
+	// creation; if its send fails (e.g. a transient "failed to ensure joined"
+	// during a room-join burst) CompleteCallback/markForwardBackfillDone never
+	// fires, so the room stays empty and backward backfill would defer forever.
+	// Counting consecutive no-anchor deferrals per portal lets FetchMessages give
+	// up waiting after maxBackwardDeferAttempts and self-heal via a recovery
+	// backfill instead of stranding the portal until the next process restart.
+	backwardDeferMu     sync.Mutex
+	backwardDeferCounts map[string]int
+
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
 	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
@@ -7995,6 +8006,15 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
+// maxBackwardDeferAttempts bounds how many consecutive no-anchor deferrals a
+// backward-backfill task makes while waiting for forward backfill to deliver.
+// Each deferral sleeps 30s, so this is ~10 min of grace — comfortably longer
+// than any real forward backfill takes to deliver its first message (which
+// creates the anchor and ends deferral), but finite so a forward backfill that
+// FAILED its send doesn't strand the portal forever. After the bound, backward
+// backfill falls through to a recovery backfill instead.
+const maxBackwardDeferAttempts = 20
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8352,15 +8372,32 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// creates an infinite retry loop.
 		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
 			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
-			if hasMessages {
+			if !hasMessages {
 				log.Info().Str("portal_id", portalID).
+					Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
+				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			}
+			// The portal has messages but no anchor yet. Forward backfill runs
+			// exactly once at portal creation, so a missing anchor means it's
+			// either still in progress OR its send failed (e.g. a transient
+			// "failed to ensure joined" during a room-join burst) so
+			// CompleteCallback/markForwardBackfillDone never fired. Bound the wait:
+			// defer for a while (once forward delivers even one message an anchor
+			// exists and this branch is no longer hit), but after
+			// maxBackwardDeferAttempts treat forward as failed and fall through to
+			// the recovery backfill below rather than deferring forever and
+			// permanently stranding the portal. Re-delivery is GUID-deduped, so a
+			// delayed forward backfill later running too is harmless.
+			c.backwardDeferMu.Lock()
+			c.backwardDeferCounts[portalID]++
+			deferCount := c.backwardDeferCounts[portalID]
+			c.backwardDeferMu.Unlock()
+			if deferCount <= maxBackwardDeferAttempts {
+				log.Info().Str("portal_id", portalID).Int("attempt", deferCount).
 					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
 				// Sleep before returning HasMore=true so the bridgev2 backfill
-				// queue doesn't tight-loop on this task and steal scheduler
-				// time from forward backfill (which we're waiting on). Each
-				// tight-loop iteration was ~1s of pure no-op — with 30+
-				// deferred portals, that's 30+ CPU-seconds per second burned
-				// waiting for a state change that takes minutes to happen.
+				// queue doesn't tight-loop on this task and steal scheduler time
+				// from forward backfill (which we're waiting on).
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -8368,14 +8405,19 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				}
 				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
 			}
-			log.Info().Str("portal_id", portalID).
-				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			log.Warn().Str("portal_id", portalID).Int("attempts", deferCount).
+				Msg("Backward backfill: forward backfill produced no anchor after repeated deferrals — treating it as failed and doing a recovery backfill")
+			c.backwardDeferMu.Lock()
+			delete(c.backwardDeferCounts, portalID)
+			c.backwardDeferMu.Unlock()
+			// fall through to the recovery backfill below
 		}
-		// No anchor but forward backfill is done — this happens for recovered
-		// portals where the room already exists but has no messages (e.g. chat
-		// was deleted and recovered). Fetch the latest messages forward-style
-		// so the portal gets populated.
+		// No anchor, and either forward backfill is done or it failed (the
+		// deferral bound above was exceeded). Either way the room exists but has no
+		// messages — a recovered/deleted chat, or a portal whose forward backfill
+		// send failed. Fetch the latest messages forward-style so the portal gets
+		// populated; the CompleteCallback marks forward done after delivery so the
+		// forward-failed case reaches a consistent, scrubbable state.
 		if c.cloudStore != nil {
 			if hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID); hasMessages {
 				log.Info().Str("portal_id", portalID).
@@ -8421,6 +8463,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						Cursor:   nextCursor,
 						HasMore:  hasMore,
 						Forward:  false,
+						// Mark forward done only AFTER bridgev2 delivers this batch
+						// (not before send), so a forward-failed portal recovered here
+						// reaches a consistent fwd_backfill_done state — unblocking the
+						// scrub gate — without the mark-before-send anti-pattern.
+						CompleteCallback: func() {
+							c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
+						},
 					}, nil
 				}
 			}
