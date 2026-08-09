@@ -4031,7 +4031,7 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 //
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
 // may scrub the entire backlog of already-delivered messages at once.
-func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string) (int64, error) {
+func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string, backfillActive bool) (int64, error) {
 	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
 	if debugDisablePrivacy {
 		return 0, nil
@@ -4077,6 +4077,33 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
 	// CloudKit-mixed-case matching the EXISTS form had.
 	// instr() is SQLite-only; Postgres spells the same function strpos().
+	//
+	// backfillGate decides WHEN a delivered (bridged) row may be scrubbed. The
+	// UPPER(guid) IN (message set) clause below already proves the row is bridged
+	// to Matrix; this gate adds the "wait for forward backfill" protection ONLY
+	// when backfill is actually the delivery mechanism (backfillActive):
+	//   - Without the gate the periodic scrubber can race ahead of an in-progress
+	//     (or not-yet-run) forward backfill — it clears the body of a row that
+	//     briefly had a `message` row from an earlier attempt, then
+	//     cloudRowToBackfillMessages' body_scrubbed skip drops it and the
+	//     forward-backfill empty path marks the portal done with nothing
+	//     delivered (silent data loss). fwd_backfill_done is set only after
+	//     delivery completes, so gating on it closes that race.
+	//   - But when backfill is DISABLED, forward backfill never runs and
+	//     fwd_backfill_done is never set, so gating on it unconditionally would
+	//     retain plaintext for every bridged row forever (a privacy regression).
+	//     In that mode there is nothing to wait for, so scrub delivered rows now.
+	//   - Rows with a NULL portal_id have no portal whose backfill to wait on, so
+	//     they bypass the wait even while backfill is active.
+	// The deleted=TRUE branch stays ungated in both modes — user-deleted content
+	// must be scrubbed for privacy regardless of backfill state.
+	backfillGate := "TRUE"
+	if backfillActive {
+		backfillGate = `(portal_id IS NULL OR portal_id IN (
+		            SELECT portal_id FROM cloud_chat
+		            WHERE login_id=$1 AND fwd_backfill_done=TRUE
+		          ))`
+	}
 	query := strings.ReplaceAll(`
 		UPDATE cloud_message
 		SET text=NULL,
@@ -4096,21 +4123,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND (
 		        deleted=TRUE
 		        OR (
-		          -- Only scrub a bridged body once the portal's forward backfill is
-		          -- confirmed done. Without this gate the periodic scrubber can race
-		          -- ahead of an in-progress (or not-yet-run) backfill: it clears the
-		          -- body of a row that briefly had a `+"`message`"+` row from an earlier
-		          -- attempt, then cloudRowToBackfillMessages' body_scrubbed skip drops
-		          -- it and the forward-backfill empty path marks the portal done with
-		          -- nothing delivered (silent data loss). fwd_backfill_done is set only
-		          -- after delivery completes, so gating on it closes that race. The
-		          -- deleted=TRUE branch above stays ungated — user-deleted content must
-		          -- be scrubbed for privacy regardless of backfill state.
-		          portal_id IN (
-		            SELECT portal_id FROM cloud_chat
-		            WHERE login_id=$1 AND fwd_backfill_done=TRUE
-		          )
-		          AND UPPER(guid) IN (
+		          UPPER(guid) IN (
 		            SELECT UPPER(id) FROM message
 		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
 		            UNION
@@ -4118,6 +4131,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		            WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
 		              AND (room_receiver=$1 OR room_receiver='')
 		          )
+		          AND `+backfillGate+`
 		        )
 		      )`+exclusionSQL+`
 		    LIMIT `+limitPlaceholder+`
@@ -4269,20 +4283,24 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 		exclude[pid] = struct{}{}
 	}
 
-	// Only portals whose contentful row count exceeds the cap have an
-	// unreachable tail; the rest are entirely within the backfill window.
-	// Restrict to portals whose forward backfill is confirmed done: the tail is
-	// "unreachable" only after the newest keepPerPortal rows have actually been
-	// delivered. Scrubbing before then can clear rows the initial forward fetch
-	// still needs, and cloudRowToBackfillMessages' body_scrubbed skip would then
-	// drop them, marking the portal done with nothing delivered (silent loss).
+	// Only portals whose row count exceeds the cap have an unreachable tail; the
+	// rest are entirely within the backfill window.
+	//
+	// This deliberately does NOT restrict to fwd_backfill_done portals. The tail
+	// is "unreachable" independently of backfill state: the per-portal threshold
+	// below is computed with the IDENTICAL predicate and ordering that
+	// listLatestMessages uses to deliver the newest `count` rows in capped mode
+	// (deleted=FALSE AND record_name <> '', ORDER BY timestamp_ms DESC, guid
+	// DESC), and we scrub only rows strictly OLDER than that threshold. So the
+	// newest keepPerPortal rows — everything forward backfill could ever deliver
+	// — are provably never in the scrubbed set, whether or not forward backfill
+	// has run yet. Gating on fwd_backfill_done here was redundant for that safety
+	// and left filtered / never-bridged chats (which have cloud_chat + message
+	// rows but never get a portal, so fwd_backfill_done stays FALSE forever)
+	// retaining their entire plaintext history — the regression this removes.
 	rows, err := s.db.Query(ctx, `
 		SELECT portal_id FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
-		  AND portal_id IN (
-		    SELECT portal_id FROM cloud_chat
-		    WHERE login_id=$1 AND fwd_backfill_done=TRUE
-		  )
 		GROUP BY portal_id
 		HAVING COUNT(*) > $2
 	`, s.loginID, keepPerPortal)

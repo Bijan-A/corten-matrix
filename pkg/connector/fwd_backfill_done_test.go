@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -222,6 +223,96 @@ func TestGuidsWithDeliveredMessage(t *testing.T) {
 	// Empty input must not error or query.
 	if m, err := store.guidsWithDeliveredMessage(ctx, bridgeID, nil); err != nil || len(m) != 0 {
 		t.Errorf("empty guids: got (%v, %v), want (empty, nil)", m, err)
+	}
+}
+
+// TestScrubBridgedBodiesBackfillGate covers the fwd_backfill_done gate on
+// scrubBridgedBodies (PR #3 finding 1): the "wait for forward backfill" gate
+// must apply ONLY when backfill is the delivery mechanism, and NULL-portal rows
+// must bypass it — otherwise plaintext is retained forever whenever forward
+// backfill never runs.
+func TestScrubBridgedBodiesBackfillGate(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
+		id TEXT NOT NULL, bridge_id TEXT NOT NULL,
+		room_receiver TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create message table: %v", err)
+	}
+	const bridgeID = "test-bridge"
+	// A tiny fixed timestamp is safely older than any real (now - graceWindow)
+	// cutoff, so every seeded row is past the grace window.
+	const aged = int64(1_000_000)
+
+	// seed inserts a delivered (bridged), aged, unscrubbed row whose portal has
+	// fwd_backfill_done unset.
+	seed := func(guid, portalID string) {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: portalID, CloudChatID: "C-" + guid,
+			TimestampMS: aged, Text: "secret", Service: "iMessage", HasBody: true,
+		}}); err != nil {
+			t.Fatalf("upsert %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx,
+			`UPDATE cloud_message SET record_name='r', updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+			aged, testSQLLoginID, guid); err != nil {
+			t.Fatalf("age %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			guid, bridgeID, string(testSQLLoginID)); err != nil {
+			t.Fatalf("insert message %s: %v", guid, err)
+		}
+	}
+	isScrubbed := func(guid string) bool {
+		var text sql.NullString
+		if err := db.QueryRow(ctx,
+			`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid).Scan(&text); err != nil {
+			t.Fatalf("read %s: %v", guid, err)
+		}
+		return !text.Valid
+	}
+
+	// Case 1: backfill DISABLED — a delivered row must scrub even though its
+	// portal's fwd_backfill_done is FALSE. Nothing will ever set it, so gating
+	// would retain plaintext forever.
+	seed("G-DISABLED", "p-disabled")
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, false); err != nil {
+		t.Fatalf("scrubBridgedBodies (backfill disabled): %v", err)
+	}
+	if !isScrubbed("G-DISABLED") {
+		t.Error("delivered row not scrubbed with backfill disabled — plaintext retained forever (privacy regression)")
+	}
+
+	// Case 2: backfill ACTIVE but portal_id IS NULL — no portal whose backfill to
+	// wait on, so it must scrub.
+	seed("G-NULLPORTAL", "placeholder")
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=NULL WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-NULLPORTAL"); err != nil {
+		t.Fatalf("null portal: %v", err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, true); err != nil {
+		t.Fatalf("scrubBridgedBodies (null portal): %v", err)
+	}
+	if !isScrubbed("G-NULLPORTAL") {
+		t.Error("delivered NULL-portal row not scrubbed with backfill active — should bypass the fwd_backfill_done wait")
+	}
+
+	// Case 3: backfill ACTIVE, real portal, fwd_backfill_done FALSE — must NOT
+	// scrub (the race gate still holds where it matters).
+	seed("G-WAIT", "p-wait")
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, true); err != nil {
+		t.Fatalf("scrubBridgedBodies (waiting): %v", err)
+	}
+	if isScrubbed("G-WAIT") {
+		t.Error("row scrubbed before fwd_backfill_done with backfill active — reopens the scrub-vs-backfill race")
 	}
 }
 

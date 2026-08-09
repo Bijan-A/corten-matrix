@@ -556,7 +556,7 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 	// backfill is confirmed done (fwd_backfill_done=TRUE). While it's still
 	// FALSE the scrubber must leave the body intact, otherwise it can race ahead
 	// of an in-progress backfill and strand history. Verify the gate first.
-	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil, true)
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies (before fwd_backfill_done): %v", err)
 	}
@@ -572,7 +572,7 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 		t.Fatalf("mark fwd_backfill_done: %v", err)
 	}
 
-	scrubbed, err = store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	scrubbed, err = store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil, true)
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)
 	}

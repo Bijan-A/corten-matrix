@@ -1979,7 +1979,7 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs())
+			scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs(), c.Main.Bridge.Config.Backfill.Enabled)
 			if err != nil {
 				log.Warn().Err(err).Msg("Body scrub failed")
 			} else if scrubbed > 0 {
@@ -2394,7 +2394,7 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 	// successfully bridged to Matrix. Runs both here (post-bootstrap, so
 	// existing rows migrate on first boot of this version) and on a
 	// dedicated ticker (see runBodyScrubLoop).
-	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs()); err != nil {
+	if scrubbed, err := c.cloudStore.scrubBridgedBodies(ctx, string(c.Main.Bridge.ID), bodyScrubGracePeriod, c.activeRestorePortalIDs(), c.Main.Bridge.Config.Backfill.Enabled); err != nil {
 		log.Warn().Err(err).Msg("Failed to scrub bridged message bodies")
 	} else if scrubbed > 0 {
 		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")

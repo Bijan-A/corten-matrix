@@ -8025,13 +8025,15 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
-// maxBackwardDeferAttempts bounds how many consecutive no-anchor deferrals a
-// backward-backfill task makes while waiting for forward backfill to deliver.
-// Each deferral sleeps 30s, so this is ~10 min of grace — comfortably longer
-// than any real forward backfill takes to deliver its first message (which
-// creates the anchor and ends deferral), but finite so a forward backfill that
-// FAILED its send doesn't strand the portal forever. After the bound, backward
-// backfill falls through to a recovery backfill instead.
+// maxBackwardDeferAttempts is the MINIMUM no-anchor grace a backward-backfill
+// task gives forward backfill before it may give up. Each deferral sleeps 30s,
+// so this is ~10 min. It is a floor, not a ceiling: the give-up also requires
+// the forward-backfill wave to have fully drained (len(forwardBackfillSem)==0)
+// — otherwise, under the 3-slot forward semaphore across thousands of portals,
+// a portal whose forward backfill is merely queued would be wrongly declared
+// failed and prematurely recovered (see the FetchMessages defer loop). So a
+// portal defers for AT LEAST this long, and longer while forward work is still
+// in flight; only a genuinely stalled/failed forward backfill hits recovery.
 const maxBackwardDeferAttempts = 20
 
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
@@ -8411,8 +8413,21 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			c.backwardDeferCounts[portalID]++
 			deferCount := c.backwardDeferCounts[portalID]
 			c.backwardDeferMu.Unlock()
-			if deferCount <= maxBackwardDeferAttempts {
+			// Keep deferring while EITHER we're still within the grace bound OR the
+			// forward-backfill wave is still draining. Under a 3-slot semaphore
+			// across thousands of portals, a portal's forward backfill can sit
+			// queued for far longer than the ~10-min grace — so a purely
+			// time-based bound would declare a slow-but-alive portal "failed" and
+			// run a recovery backfill that marks fwd_backfill_done before its real
+			// forward backfill ran (reopening the scrub-gate and group-merge
+			// races). len(forwardBackfillSem) > 0 means forward backfills are still
+			// executing, so ours is plausibly just waiting its turn: don't give up.
+			// Only once the wave has fully drained AND grace is exhausted do we
+			// treat forward as genuinely failed and fall through to recovery.
+			forwardWaveActive := len(c.forwardBackfillSem) > 0
+			if deferCount <= maxBackwardDeferAttempts || forwardWaveActive {
 				log.Info().Str("portal_id", portalID).Int("attempt", deferCount).
+					Bool("forward_wave_active", forwardWaveActive).
 					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
 				// Sleep before returning HasMore=true so the bridgev2 backfill
 				// queue doesn't tight-loop on this task and steal scheduler time
@@ -8485,7 +8500,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// Mark forward done only AFTER bridgev2 delivers this batch
 						// (not before send), so a forward-failed portal recovered here
 						// reaches a consistent fwd_backfill_done state — unblocking the
-						// scrub gate — without the mark-before-send anti-pattern.
+						// scrub gate — without the mark-before-send anti-pattern. This
+						// path is now reached only once the forward-backfill wave has
+						// drained and grace is exhausted (see the defer loop), so the
+						// portal's real forward backfill has genuinely failed/skipped
+						// rather than merely being queued — the mark is not premature.
 						CompleteCallback: func() {
 							c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
 						},
