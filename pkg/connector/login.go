@@ -339,8 +339,8 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 
 		nacNote := "Registration uses the hardware key for NAC validation (no Mac needed at runtime)."
 		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: LoginStepAppleIDPassword,
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       LoginStepAppleIDPassword,
 			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
