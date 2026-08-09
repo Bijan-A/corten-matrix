@@ -4783,8 +4783,15 @@ func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger
 // Called inline by forward backfill when a portal's deliverable rows were all
 // body-scrubbed before delivery — without repopulating them, conversion yields
 // nothing and the portal would be marked done empty (silent data loss).
-// Returns true if CloudKit repopulated at least one message. Bounded by its own
-// timeout so a slow/absent CloudKit fetch can't hang the portal event loop.
+// Returns true if CloudKit repopulated at least one message.
+//
+// This runs on the portal event loop while holding a forward-backfill slot, so
+// it uses only the TARGETED CloudKit fetch (bounded to 50 pages / 5k msgs for
+// this one chat) and disables the unfiltered whole-account fallback: that
+// fallback is a ctx-uninterruptible blocking CGO scan of every chat, and running
+// one per scrubbed portal inline would serialise the entire backfill. The
+// fetchCtx timeout is best-effort only (it cannot interrupt the in-flight CGO
+// call), which is why bounding the WORK via the targeted-only path matters.
 func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logger, portalID string) bool {
 	if c.cloudStore == nil || c.client == nil {
 		return false
@@ -4798,7 +4805,7 @@ func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logg
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(fetchCtx, log, portalID)
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(fetchCtx, log, portalID, false)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch failed")
 		return false
@@ -4965,7 +4972,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		}
 
 		attemptCtx, attemptCancel := context.WithTimeout(fetchCtx, 2*time.Minute)
-		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID)
+		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID, true)
 		attemptCancel()
 
 		if fetchCtx.Err() != nil {
@@ -5458,7 +5465,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 // fetchAndResyncRecoveredChat fetches messages from CloudKit for a recovered
 // chat, imports them into the local cache, then queues ChatResync.
 func (c *IMClient) fetchAndResyncRecoveredChat(log zerolog.Logger, portalKey networkid.PortalKey, portalID string) {
-	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID)
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID, true)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to import CloudKit messages for recovered chat")
 	} else {
@@ -5500,7 +5507,14 @@ func (c *IMClient) safeCloudFetchRecent(log zerolog.Logger, chatID *string, maxP
 // imports matched rows into cloud_message for the given portal.
 // Returns (importedCount, diagnostic, error). diagnostic is non-nil when the
 // unfiltered fallback ran (all targeted fetches returned 0).
-func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string) (int, *restoreFetchDiagnostic, error) {
+//
+// allowUnfilteredFallback controls the last-resort whole-account scan (50 pages
+// / 10k messages) that runs when every targeted fetch returns 0. That scan is
+// acceptable for a one-off user-initiated restore, but it is a blocking, ctx-
+// uninterruptible CGO call that must NOT run inline on the portal event loop
+// during mass backfill (see rehydrateScrubbedPortal) — one such scan per portal,
+// each holding a forward-backfill slot, would serialise the whole run.
+func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string, allowUnfilteredFallback bool) (int, *restoreFetchDiagnostic, error) {
 	if c.cloudStore == nil {
 		return 0, nil, fmt.Errorf("cloud store not initialized")
 	}
@@ -5626,6 +5640,11 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	var diag *restoreFetchDiagnostic
 	if len(matched) == 0 && ctx.Err() != nil {
 		return 0, nil, ctx.Err()
+	}
+	if len(matched) == 0 && !allowUnfilteredFallback {
+		log.Info().Str("portal_id", portalID).
+			Msg("All targeted fetches returned 0 — unfiltered fallback disabled for this caller, returning 0")
+		return 0, nil, nil
 	}
 	if len(matched) == 0 {
 		log.Info().Str("portal_id", portalID).
@@ -8673,11 +8692,16 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 				TargetPart: targetPart,
 			})
 		} else {
-			// Out-of-batch target (or a remove). Only queue if the target is
-			// actually delivered — otherwise bridgev2 drops it and we'd just be
-			// flooding the event loop. On a pre-check error deliveredTargets is
-			// nil and we queue unconditionally (old behavior).
-			if derr == nil && !deliveredTargets[targetGUID] {
+			// Reached for an out-of-batch target OR an in-batch REMOVE (removes
+			// can't use BackfillReaction, which only supports add, so they always
+			// fall back to QueueRemoteEvent here). Only the OUT-OF-BATCH case risks
+			// flooding the loop with "target not found": skip it unless the target
+			// is actually delivered. An IN-BATCH target — only possible for a
+			// remove — is delivered in this very batch, so it's always resolvable
+			// and must never be skipped (skipping it drops the remove, leaving an
+			// added-then-removed reaction rendered forever). On a pre-check error
+			// deliveredTargets is nil and we queue unconditionally (old behavior).
+			if !inBatch && derr == nil && !deliveredTargets[targetGUID] {
 				skippedOrphanReactions++
 				continue
 			}

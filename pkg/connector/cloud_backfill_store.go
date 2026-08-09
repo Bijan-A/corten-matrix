@@ -2787,18 +2787,24 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 
 // hasScrubbedBackfillableMessages reports whether a portal has non-deleted,
 // deliverable rows whose bodies were cleared by the privacy scrubber
-// (body_scrubbed=TRUE, has_body=TRUE, not a reaction). cloudRowToBackfillMessages
-// skips such rows, so a portal where ALL deliverable rows are scrubbed converts
-// to zero backfill messages — and the forward-backfill empty path would then mark
+// (body_scrubbed=TRUE, not a reaction). cloudRowToBackfillMessages skips EVERY
+// such row (see its `row.BodyScrubbed && !isCloudReactionRow` guard) regardless
+// of has_body, so a portal where ALL deliverable rows are scrubbed converts to
+// zero backfill messages — and the forward-backfill empty path would then mark
 // it done with nothing delivered (silent data loss). Forward backfill uses this
 // to decide whether to rehydrate from CloudKit before marking a portal done.
+//
+// The predicate must mirror conversion's skip exactly, so it deliberately does
+// NOT require has_body=TRUE: an attachment-only (photo/video) portal has
+// scrubbed rows with has_body=FALSE, and gating on has_body would let that
+// portal reach the empty path unguarded — the precise silent loss this catches.
 func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context, portalID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND body_scrubbed=TRUE AND has_body=TRUE
+		  AND body_scrubbed=TRUE
 		  AND (tapback_type IS NULL OR tapback_type < 2000)
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
@@ -2883,42 +2889,91 @@ func (s *cloudBackfillStore) guidsDeliveredInOtherRoom(ctx context.Context, brid
 
 // guidsWithDeliveredMessage returns the subset of guids that already have a
 // bridgev2 `message` row for this receiver (i.e. were delivered to Matrix).
-// bridgev2 resolves a reaction's target by message id == guid, so this matches
-// exactly the targets its reaction handler would find. Backfill uses it to drop
-// tapbacks whose target isn't present BEFORE queueing them: such reactions can't
-// render ("Target message for reaction not found") and, in reaction-heavy group
-// chats, queueing thousands of them floods the per-portal event loop (channel-full
-// storm). Filtering here yields the same rendering outcome without the flood.
-// room_id is intentionally not constrained — a target delivered under any room
-// for this receiver is resolvable, matching bridgev2's room-agnostic lookup.
+// Backfill uses it to drop tapbacks whose target isn't present BEFORE queueing
+// them: such reactions can't render ("Target message for reaction not found")
+// and, in reaction-heavy group chats, queueing thousands of them floods the
+// per-portal event loop (channel-full storm). Filtering here yields the same
+// rendering outcome without the flood. room_id is intentionally not constrained
+// — a target delivered under any room for this receiver is resolvable, matching
+// bridgev2's room-agnostic lookup.
+//
+// A target is "resolvable" if a message row exists whose id resolveTapbackTargetID
+// would land on: the bare guid (text/base part, id == guid) OR a balloon-part
+// suffix (id == "<guid>_attN") for a message delivered only as an attachment.
+// Guids are UUIDs (no underscores), so substr-to-first-underscore normalises a
+// suffixed id back to its bare guid; results are keyed by bare guid to match the
+// bare-guid keys the caller looks up.
+//
+// The input is deduped and chunked at the same 500 the rest of this file uses:
+// a reaction-heavy batch repeats the same few targets thousands of times, and an
+// un-deduped, unchunked IN-list would blow the driver's bind-variable ceiling
+// (SQLite defaults to 999, older builds; 32766, newer) at exactly the ~9k-reaction
+// scale this filter exists to handle — and the caller fails OPEN on error, so a
+// blown limit would resurrect the very flood this prevents.
 func (s *cloudBackfillStore) guidsWithDeliveredMessage(ctx context.Context, bridgeID string, guids []string) (map[string]bool, error) {
 	if len(guids) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(guids)+2)
-	args = append(args, bridgeID, string(s.loginID))
-	ph := make([]string, len(guids))
-	for i, g := range guids {
-		args = append(args, g)
-		ph[i] = fmt.Sprintf("$%d", i+3)
+	seen := make(map[string]struct{}, len(guids))
+	uniq := make([]string, 0, len(guids))
+	for _, g := range guids {
+		if g == "" {
+			continue
+		}
+		if _, dup := seen[g]; dup {
+			continue
+		}
+		seen[g] = struct{}{}
+		uniq = append(uniq, g)
 	}
-	query := `SELECT DISTINCT id FROM message
-		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
-		  AND id IN (` + strings.Join(ph, ", ") + `)`
-	rows, err := s.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool, len(guids))
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
+	out := make(map[string]bool, len(uniq))
+	instr := sqlInstrFunc(s.db)
+	const chunkSize = 500
+	for start := 0; start < len(uniq); start += chunkSize {
+		end := start + chunkSize
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		batch := uniq[start:end]
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, bridgeID, string(s.loginID))
+		ph := make([]string, len(batch))
+		for i, g := range batch {
+			args = append(args, g)
+			ph[i] = fmt.Sprintf("$%d", i+3)
+		}
+		inList := strings.Join(ph, ", ")
+		// The IN placeholders ($3..) are referenced twice; both dialects in use
+		// (Postgres, SQLite) bind a repeated numbered parameter to the same value.
+		query := strings.ReplaceAll(`SELECT DISTINCT id FROM message
+			WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+			  AND (
+			    id IN (`+inList+`)
+			    OR ({{INSTR}}(id, '_') > 0 AND substr(id, 1, {{INSTR}}(id, '_') - 1) IN (`+inList+`))
+			  )`, "{{INSTR}}", instr)
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
 			return nil, err
 		}
-		out[id] = true
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			bare := id
+			if i := strings.IndexByte(id, '_'); i > 0 {
+				bare = id[:i]
+			}
+			out[bare] = true
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *cloudBackfillStore) listBackwardMessages(

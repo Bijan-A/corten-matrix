@@ -137,6 +137,29 @@ func TestHasScrubbedBackfillableMessages(t *testing.T) {
 	} else if got {
 		t.Errorf("hasScrubbedBackfillableMessages(p-empty) = true for an empty portal, want false")
 	}
+
+	// A scrubbed ATTACHMENT-ONLY row (has_body=FALSE) MUST trigger: conversion
+	// skips every body_scrubbed non-reaction row regardless of has_body, so a
+	// photo-only portal whose rows were all scrubbed would otherwise reach the
+	// empty path unguarded (silent loss). The guard must not require has_body.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-PHOTO", PortalID: "p-photo", CloudChatID: "C3",
+		TimestampMS: now, Service: "iMessage", HasBody: false,
+		AttachmentsJSON: `[{"guid":"a"}]`,
+	}}); err != nil {
+		t.Fatalf("upsert photo: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET record_name='r', has_body=FALSE, body_scrubbed=TRUE WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-PHOTO",
+	); err != nil {
+		t.Fatalf("scrub G-PHOTO: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-photo"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-photo): %v", err)
+	} else if !got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-photo) = false for a scrubbed attachment-only row, want true")
+	}
 }
 
 // guidsWithDeliveredMessage backs 3b's reaction-flood mitigation: backfill uses
@@ -157,10 +180,16 @@ func TestGuidsWithDeliveredMessage(t *testing.T) {
 	// DELIVERED-A: normal delivered target. DELIVERED-B: delivered under empty
 	// room_receiver (appservice rows) — must still match. WRONG-LOGIN: belongs to
 	// a different receiver — must NOT match.
+	// PHOTO-ONLY: delivered only under a balloon-part suffix (id ==
+	// "<guid>_att0"), no bare-guid text part. A tapback on it resolves via
+	// resolveTapbackTargetID to the suffixed id, so it IS resolvable and must be
+	// reported delivered under its BARE guid. DUP is repeated in the input to
+	// exercise dedup.
 	for _, r := range []struct{ id, recv string }{
 		{"DELIVERED-A", string(testSQLLoginID)},
 		{"DELIVERED-B", ""},
 		{"WRONG-LOGIN", "someone-else"},
+		{"PHOTO-ONLY_att0", string(testSQLLoginID)},
 	} {
 		if _, err := db.Exec(ctx,
 			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
@@ -170,11 +199,11 @@ func TestGuidsWithDeliveredMessage(t *testing.T) {
 	}
 
 	got, err := store.guidsWithDeliveredMessage(ctx, bridgeID,
-		[]string{"DELIVERED-A", "DELIVERED-B", "WRONG-LOGIN", "NEVER-DELIVERED"})
+		[]string{"DELIVERED-A", "DELIVERED-A", "DELIVERED-B", "WRONG-LOGIN", "NEVER-DELIVERED", "PHOTO-ONLY"})
 	if err != nil {
 		t.Fatalf("guidsWithDeliveredMessage: %v", err)
 	}
-	want := map[string]bool{"DELIVERED-A": true, "DELIVERED-B": true}
+	want := map[string]bool{"DELIVERED-A": true, "DELIVERED-B": true, "PHOTO-ONLY": true}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
