@@ -65,6 +65,90 @@ var (
 // Register these in main.go's PostInit hook:
 //
 //	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
+// cmdSyncSpace joins the double puppet to every bridged room and files each into
+// the login's personal filtering space.
+//
+// bridgev2 does this per-portal via MarkInPortal during portal processing, but
+// MarkInPortal (a) only invites (not joins) when double puppeting is off, and
+// (b) short-circuits on an in-memory per-portal cache once it has run. So the
+// common "backfill with double puppeting OFF for correct dates, then enable it"
+// workflow leaves the whole backlog invited-but-not-joined and out of the space,
+// and enabling double puppeting afterward never re-sweeps it (the cache is
+// already populated). This command bypasses that cache by calling EnsureJoined +
+// AddPortalToSpace directly for every portal, paced to avoid hammering the
+// homeserver. Idempotent and safe to re-run.
+var cmdSyncSpace = &commands.FullHandler{
+	Name: "sync-space",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "Join and add all bridged rooms to your personal space. Use after enabling double-puppeting following an initial backfill run (the pending room-invite backlog isn't swept automatically).",
+		Args:        "",
+	},
+	RequiresLogin: true,
+	Func:          fnSyncSpace,
+}
+
+// syncSpacePacing throttles the per-room homeserver calls so a full sweep of
+// thousands of rooms doesn't overwhelm the homeserver.
+const syncSpacePacing = 40 * time.Millisecond
+
+func fnSyncSpace(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	dp := ce.User.DoublePuppet(ce.Ctx)
+	if dp == nil {
+		ce.Reply("Double puppeting is not enabled — run `login-matrix` first so the bridge can join rooms as you.")
+		return
+	}
+	portals, err := ce.Bridge.GetAllPortalsWithMXID(ce.Ctx)
+	if err != nil {
+		ce.Reply("Failed to list portals: %v", err)
+		return
+	}
+	mine := make([]*bridgev2.Portal, 0, len(portals))
+	for _, p := range portals {
+		if p.Receiver == login.ID && p.MXID != "" {
+			mine = append(mine, p)
+		}
+	}
+	if len(mine) == 0 {
+		ce.Reply("No bridged rooms found for this login.")
+		return
+	}
+	ce.Reply("Sweeping %d rooms — joining via double puppet and adding to your space. Running in the background; I'll report progress and a final summary.", len(mine))
+
+	// Detach from the command's request context so the sweep survives the command
+	// returning, but keep the log fields.
+	ctx := context.WithoutCancel(ce.Ctx)
+	go func() {
+		var joined, spaced, joinErr, spaceErr int
+		for i, p := range mine {
+			if err := dp.EnsureJoined(ctx, p.MXID); err != nil {
+				joinErr++
+			} else {
+				joined++
+			}
+			if up, err := ce.Bridge.DB.UserPortal.GetOrCreate(ctx, login.UserLogin, p.PortalKey); err != nil {
+				spaceErr++
+			} else if err := login.AddPortalToSpace(ctx, p, up); err != nil {
+				spaceErr++
+			} else {
+				spaced++
+			}
+			time.Sleep(syncSpacePacing)
+			if (i+1)%250 == 0 {
+				ce.Reply("Progress: %d/%d (joined %d, added to space %d, errors join=%d space=%d)…",
+					i+1, len(mine), joined, spaced, joinErr, spaceErr)
+			}
+		}
+		ce.Reply("✅ Sync-space complete: %d rooms processed — joined %d, added to space %d (errors: join=%d, space=%d).",
+			len(mine), joined, spaced, joinErr, spaceErr)
+	}()
+}
+
 func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 	cmds := []*commands.FullHandler{
 		cmdStartChat,
@@ -74,6 +158,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdSyncStatus,
+		cmdSyncSpace,
 		cmdContacts,
 		cmdClearIdentityCache,
 	}
