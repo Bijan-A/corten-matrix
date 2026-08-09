@@ -65,6 +65,7 @@ var (
 // Register these in main.go's PostInit hook:
 //
 //	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
+//
 // cmdSyncSpace joins the double puppet to every bridged room and files each into
 // the login's personal filtering space.
 //
