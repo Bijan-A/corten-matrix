@@ -2270,14 +2270,24 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
 	}
 
-	// One-time: re-key existing group cloud rows from gid:<UUID> to the
-	// participant key, so createPortalsFromCloudSync builds one room per group
-	// directly instead of one per rotated GUID. Runs before consolidation so the
-	// canonical key is already in place. No-op after the first run.
-	c.rekeyGroupPortalsToParticipantSet(ctx, log)
-
-	// Heal groups that GUID rotation sharded across many rooms (any group, not
-	// createPortalsFromCloudSync so the canonical portal is the one (re-)backfilled.
+	// Consolidate group portals that GUID rotation sharded across multiple
+	// gid:<UUID> keys into one room per participant set: re-key their cloud rows to
+	// the canonical participant key AND re-ID/merge the existing Matrix rooms. This
+	// also performs the one-time upgrade of legacy gid:<UUID> rows to participant
+	// keys — planGroupConsolidation returns any group whose stored key isn't
+	// already canonical, so a lone gid:<UUID> chat is re-keyed here too (its room,
+	// if any, re-ID'd; if none, its cloud rows are re-keyed for createPortals to
+	// build a participant room). Runs before createPortalsFromCloudSync so the
+	// canonical portal is the one (re-)backfilled.
+	//
+	// NOTE: there used to be a separate one-time rekeyGroupPortalsToParticipantSet
+	// migration that ran *before* this. It was removed: it collapsed every gid:
+	// cloud key to the participant key up front, which starved this consolidation
+	// pass of the distinct gid: keys it needs to find and merge pre-existing rooms
+	// (it reads cloud_chat) — leaving upgraders with orphaned old gid: rooms plus a
+	// new merged room. consolidateGroupPortals already does a superset of that
+	// migration's work (cloud re-key for every group member, including roomless
+	// and single-gid: ones) and, being budgeted, converges safely across startups.
 	c.consolidateGroupPortals(ctx, log)
 
 	// Create portals and queue forward backfill for all of them.
@@ -3895,84 +3905,6 @@ func planGroupConsolidation(entries []groupConsolidationEntry) []groupConsolidat
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].canonical < out[j].canonical })
 	return out
-}
-
-// groupPortalRekeyFlagKey guards the one-time cloud-data re-key migration below.
-const groupPortalRekeyFlagKey = database.Key("group_portal_participant_rekey_v1")
-
-// rekeyGroupPortalsToParticipantSet is a one-time migration that re-points
-// existing group cloud_chat/cloud_message rows from the old gid:<UUID> key to
-// the canonical participant-set key.
-//
-// The participant-keying change (resolvePortalIDForCloudChat) only affects
-// data ingested AFTER the upgrade — rows already stored under gid:<UUID> keep
-// them. Because iMessage rotates a group's GUID over time, one chat can hold
-// dozens of gid: variants; createPortalsFromCloudSync dedups by group_id, not
-// participants, so those variants would otherwise each spawn a room (and
-// re-upload media) before consolidateGroupPortals slowly merged them. Re-keying
-// the cloud rows in place collapses every variant onto one participant key up
-// front, so portal creation builds a single room per group directly.
-//
-// In-place UPDATEs only (no CloudKit re-download, no message re-ingest, so no
-// self-chat misrouting risk). Idempotent and gated by a KV flag so it runs
-// exactly once; on error the flag is left unset so it retries next start.
-func (c *IMClient) rekeyGroupPortalsToParticipantSet(ctx context.Context, log zerolog.Logger) {
-	if c.cloudStore == nil {
-		return
-	}
-	if c.Main.Bridge.DB.KV.Get(ctx, groupPortalRekeyFlagKey) != "" {
-		return
-	}
-	chats, err := c.cloudStore.listGroupChats(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Group portal re-key: failed to list group chats (will retry next start)")
-		return
-	}
-	rekeyed := 0
-	// Destination keys that received at least one re-keyed (merged) row. Each
-	// must have fwd_backfill_done reset across ALL its cloud_chat rows so the
-	// merged room forward-backfills the combined history — see the reset below.
-	destKeys := make(map[string]struct{})
-	for _, chat := range chats {
-		// Only re-key genuine groups; a degenerate roster (fewer than 2 non-self
-		// members) can't build a participant key, so leave its gid: fallback.
-		if c.countNonSelfMembers(chat.participants, nil) < 2 {
-			continue
-		}
-		newKey := strings.Join(c.buildCanonicalParticipantList(chat.participants), ",")
-		if newKey == "" || newKey == chat.portalID {
-			continue // already participant-keyed
-		}
-		if err := c.cloudStore.reKeyPortalID(ctx, chat.portalID, newKey); err != nil {
-			log.Warn().Err(err).Str("from", chat.portalID).Str("to", newKey).
-				Msg("Group portal re-key: failed to re-point cloud rows")
-			continue
-		}
-		destKeys[newKey] = struct{}{}
-		rekeyed++
-	}
-	// Reset fwd_backfill_done=FALSE across every merge destination key. reKeyPortalID
-	// already clears it on the rows it moves, but a destination key can also hold a
-	// row that was ALREADY participant-keyed (so the loop skipped it) carrying a
-	// stale fwd_backfill_done=TRUE from a previous backfill. isForwardBackfillDone
-	// uses EXISTS(...=TRUE), so a single stale TRUE among the now-merged rows makes
-	// the whole portal look done and suppresses forward backfill — the merged room
-	// would stay empty. Clearing the entire destination key guarantees the combined
-	// history is (re-)delivered.
-	reset := 0
-	for key := range destKeys {
-		if err := c.cloudStore.resetForwardBackfillDone(ctx, key); err != nil {
-			log.Warn().Err(err).Str("portal_id", key).
-				Msg("Group portal re-key: failed to reset fwd_backfill_done on merge destination")
-			continue
-		}
-		reset++
-	}
-	c.Main.Bridge.DB.KV.Set(ctx, groupPortalRekeyFlagKey, time.Now().Format(time.RFC3339))
-	if rekeyed > 0 {
-		log.Info().Int("chats_rekeyed", rekeyed).Int("dest_keys_reset", reset).
-			Msg("Group portal participant-key migration: re-pointed group cloud rows from gid:<UUID> to participant keys")
-	}
 }
 
 // consolidateGroupPortals collapses groups sharded across multiple
