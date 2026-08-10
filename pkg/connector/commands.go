@@ -1320,7 +1320,7 @@ func fnSyncStatus(ce *commands.Event) {
 		return
 	}
 
-	report, err := GetSyncStatus(ce.Ctx, client.Main.Bridge.DB.Database, string(client.Main.Bridge.ID))
+	report, err := GetSyncStatus(ce.Ctx, client.Main.Bridge.DB.Database, string(client.Main.Bridge.ID), client.Main.Bridge.Config.Backfill.MaxInitialMessages)
 	if err != nil {
 		ce.Reply("Failed to build sync status: %v", err)
 		return

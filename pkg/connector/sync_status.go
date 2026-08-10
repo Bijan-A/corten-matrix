@@ -127,18 +127,22 @@ type SyncStatusReport struct {
 
 	// DeliverableMessages/DeliveredMessages cover real messages only —
 	// reactions bridge into bridgev2's separate `reaction` table and are not
-	// counted here. DeliverableMessages is further restricted to messages the
-	// bridge can actually deliver: contentful and in a chat that has a Matrix
-	// room. Messages that can never be bridged in the current config (see
-	// UnbridgeableMessages) are excluded so the ratio can reach 100%.
+	// counted here. DeliverableMessages is the stable set the bridge will
+	// deliver: contentful, in a non-filtered chat, and (when max_initial_messages
+	// is capped) within the newest-N-per-portal window. It is NOT gated on the
+	// Matrix room existing yet — a bridgeable message whose room hasn't been
+	// created counts as deliverable-but-pending, so the ratio reflects real
+	// backfill progress and only reaches 100% when delivery is actually done.
+	// DeliveredMessages is a subset of DeliverableMessages by construction.
 	DeliverableMessages int
 	DeliveredMessages   int
 
 	// UnbridgeableMessages counts real messages that are NOT deliverable and
-	// never will be here: those in iMessage-filtered chats, in chats without a
-	// Matrix room, or with no content. Reported separately so a stable
-	// delivered/deliverable ratio reads as "backfill complete" rather than
-	// "stuck below 100%".
+	// never will be here: those in iMessage-filtered chats, empty/system rows,
+	// and (when capped) the older-than-cap tail. It shrinks only as filtered
+	// state changes, not as backfill progresses — "room not created yet" is NOT
+	// counted here (that's deliverable-but-pending). Reported separately so a
+	// stable delivered/deliverable ratio reads as "complete" rather than "stuck".
 	UnbridgeableMessages int
 
 	// LiveMessageCount/LiveMessageLastAt track steady-state APNs traffic
@@ -171,8 +175,14 @@ func (r *SyncStatusReport) PendingMessages() int {
 // deliverable message has reached Matrix — i.e. no backlog remains. Used
 // both by Format() and by runSyncCompletionNotifyLoop's one-time
 // management-room notice.
+//
+// It requires DeliverableMessages > 0: without that guard the "all 0 messages"
+// state early in a run (bootstrap done, no messages counted yet) would report
+// caught-up and fire the one-time "sync complete" notice mid-backfill, latching
+// it permanently. A login with genuinely zero bridgeable messages therefore
+// never trips the notice, which is the intended behaviour.
 func (r *SyncStatusReport) FullyCaughtUp() bool {
-	return r.BootstrapComplete && r.PendingMessages() == 0
+	return r.BootstrapComplete && r.DeliverableMessages > 0 && r.PendingMessages() == 0
 }
 
 // discoverLoginID finds the single user_login row for this bridge instance.
@@ -199,7 +209,11 @@ func discoverLoginID(ctx context.Context, db *dbutil.Database, bridgeID string) 
 // directly. It requires no running connector/client state, so it works both
 // from inside the daemon (management-room `sync-status` command) and from a
 // standalone CLI process that has only opened the configured database.
-func GetSyncStatus(ctx context.Context, db *dbutil.Database, bridgeID string) (*SyncStatusReport, error) {
+// maxInitialMessages is the bridge's Backfill.MaxInitialMessages (pass 0 or the
+// uncapped sentinel when there is no cap). When it is a real cap, only the newest
+// maxInitialMessages per portal are counted as deliverable — the rest is the tail
+// backfill never delivers.
+func GetSyncStatus(ctx context.Context, db *dbutil.Database, bridgeID string, maxInitialMessages int) (*SyncStatusReport, error) {
 	loginID, err := discoverLoginID(ctx, db, bridgeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to look up login: %w", err)
@@ -231,14 +245,16 @@ func GetSyncStatus(ctx context.Context, db *dbutil.Database, bridgeID string) (*
 	if report.TotalChats, err = store.debugTotalChatCount(ctx); err != nil {
 		return nil, fmt.Errorf("failed to count chats: %w", err)
 	}
-	if report.DeliverableMessages, err = store.deliverableMessageCount(ctx); err != nil {
+	if report.DeliverableMessages, err = store.deliverableMessageCount(ctx, maxInitialMessages); err != nil {
 		return nil, fmt.Errorf("failed to count deliverable messages: %w", err)
 	}
-	if report.DeliveredMessages, err = store.deliveredMessageCount(ctx, bridgeID); err != nil {
+	if report.DeliveredMessages, err = store.deliveredMessageCount(ctx, bridgeID, maxInitialMessages); err != nil {
 		return nil, fmt.Errorf("failed to count delivered messages: %w", err)
 	}
-	// Unbridgeable = all real messages minus the deliverable subset (filtered
-	// chats, chats without a room, empty/system messages).
+	// Unbridgeable = all real messages minus the deliverable subset: messages in
+	// iMessage-filtered chats, empty/system rows, and (when capped) the
+	// older-than-cap tail. Never "room not created yet" — that's now counted as
+	// deliverable-but-pending, not unbridgeable.
 	if candidate, cErr := store.candidateMessageCount(ctx); cErr != nil {
 		return nil, fmt.Errorf("failed to count candidate messages: %w", cErr)
 	} else if candidate > report.DeliverableMessages {
@@ -320,13 +336,13 @@ func (r *SyncStatusReport) Format(liveRunning *bool) string {
 
 	sb.WriteString("**Database -> Matrix delivery**\n")
 	pending := r.PendingMessages()
-	pct := 100.0
+	pct := 0.0
 	if r.DeliverableMessages > 0 {
 		pct = 100 * float64(r.DeliveredMessages) / float64(r.DeliverableMessages)
 	}
 	sb.WriteString(fmt.Sprintf("Delivered: %d / %d bridgeable messages (%.1f%%), %d pending\n", r.DeliveredMessages, r.DeliverableMessages, pct, pending))
 	if r.UnbridgeableMessages > 0 {
-		sb.WriteString(fmt.Sprintf("Not bridgeable here: %d messages — in iMessage-filtered chats, in chats without a Matrix room, or with no content (excluded from the total above).\n", r.UnbridgeableMessages))
+		sb.WriteString(fmt.Sprintf("Not bridgeable here: %d messages — in iMessage-filtered chats, empty/system rows, or (when a message cap is set) older messages beyond the cap (excluded from the total above).\n", r.UnbridgeableMessages))
 	}
 	if r.FullyCaughtUp() {
 		sb.WriteString("✅ Backfill complete — every bridgeable message has been delivered.\n\n")

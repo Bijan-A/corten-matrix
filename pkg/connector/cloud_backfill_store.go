@@ -3260,38 +3260,77 @@ func (s *cloudBackfillStore) debugTotalChatCount(ctx context.Context) (int, erro
 	return count, err
 }
 
-// deliverableMessageCount returns the number of non-deleted, non-reaction
-// cloud_message rows that are eligible to reach Matrix — i.e. the denominator
-// against which deliveredMessageCount's numerator is measured. Reactions
-// (tapback_type >= 2000) are excluded because they bridge into bridgev2's
-// separate `reaction` table, not `message`.
-// deliverableMessageCount counts messages the bridge can actually deliver to
-// Matrix: non-deleted, non-reaction, contentful (has text/attachments, or was
-// body-scrubbed after delivery), AND whose portal has a Matrix room. The
-// portal-has-room join is what makes this "deliverable" rather than merely
-// "present": it excludes iMessage-filtered chats and any chat without a room
-// (both unbridgeable in the current config), so the delivered/deliverable ratio
-// reflects genuine backfill progress instead of stalling below 100% forever on
-// messages that can never be bridged. See candidateMessageCount for the broader
-// "all real messages" total used to report the unbridgeable remainder.
-func (s *cloudBackfillStore) deliverableMessageCount(ctx context.Context) (int, error) {
+// bridgeableMessageWhere is the shared predicate (table alias `m`) for a
+// cloud_message row the bridge can and will deliver to Matrix: non-deleted,
+// non-reaction, with real content, in a chat that is neither iMessage-filtered
+// nor deleted.
+//
+// Content is has_body OR attachments OR text: has_body and attachments_json
+// survive the privacy scrubber (which only nulls text), so a delivered-then-
+// scrubbed message stays counted — without that the deliverable set would shrink
+// below the delivered set over time and the ratio would exceed 100%.
+//
+// The sender clause mirrors cloudRowToBackfillMessages' runtime skip of
+// no-resolvable-sender rows (sender==” && !is_from_me — iMessage system /
+// notification records stored without a sender). Those are never delivered, so
+// counting them as deliverable would peg the ratio below 100% forever and stop
+// FullyCaughtUp from ever firing. body_scrubbed=TRUE keeps a delivered-then-
+// scrubbed row in (the scrubber nulls sender too, so sender alone isn't stable);
+// a delivered message always satisfies sender<>” OR is_from_me OR body_scrubbed,
+// so this clause can never drop a row that was actually delivered.
+//
+// It deliberately does NOT depend on whether the Matrix room exists yet. Room
+// creation is a transient state during backfill; gating on it (the previous
+// portal-has-mxid join) made the deliverable set grow as rooms appeared, so the
+// delivered/deliverable ratio — and FullyCaughtUp — could hit 100% mid-backfill.
+// Filtered/roomless/empty rows fall out here and are reported as the unbridgeable
+// remainder (candidate - deliverable) instead.
+const bridgeableMessageWhere = `m.login_id=$1 AND m.deleted=FALSE AND m.record_name <> ''
+	  AND (m.tapback_type IS NULL OR m.tapback_type < 2000)
+	  AND (COALESCE(m.text,'') <> '' OR COALESCE(m.attachments_json,'') <> '' OR COALESCE(m.has_body, TRUE)=TRUE)
+	  AND (COALESCE(m.sender,'') <> '' OR m.is_from_me=TRUE OR m.body_scrubbed=TRUE)
+	  AND m.portal_id IN (
+	    SELECT portal_id FROM cloud_chat
+	    WHERE login_id=$1 AND deleted=FALSE AND COALESCE(is_filtered, 0)=0
+	  )`
+
+// initialMessagesCapped reports whether maxInitial is a real per-portal cap
+// rather than the "uncapped" sentinel the connector normalizes to
+// (math.MaxInt32). When capped, only the newest maxInitial messages per portal
+// are ever delivered, so the deliverable/delivered counts must window to that
+// tail — otherwise the older, never-bridged tail inflates the denominator and
+// the ratio can't reach 100% (the symptom this whole change is fixing).
+func initialMessagesCapped(maxInitial int) bool {
+	return maxInitial > 0 && maxInitial < 2147483647 // 2147483647 == math.MaxInt32
+}
+
+// deliverableMessageCount counts the bridgeable messages (see
+// bridgeableMessageWhere) — the stable denominator for the delivered/deliverable
+// ratio. When max_initial_messages is capped it counts only the newest maxInitial
+// per portal; pass 0 (or the uncapped sentinel) to count all. Reactions bridge
+// into bridgev2's separate `reaction` table and are excluded.
+func (s *cloudBackfillStore) deliverableMessageCount(ctx context.Context, maxInitial int) (int, error) {
+	var query string
+	if initialMessagesCapped(maxInitial) {
+		query = fmt.Sprintf(`SELECT COUNT(*) FROM (
+			SELECT ROW_NUMBER() OVER (PARTITION BY m.portal_id ORDER BY m.timestamp_ms DESC, m.guid DESC) AS rn
+			FROM cloud_message m
+			WHERE %s
+		) t WHERE t.rn <= %d`, bridgeableMessageWhere, maxInitial)
+	} else {
+		query = `SELECT COUNT(*) FROM cloud_message m WHERE ` + bridgeableMessageWhere
+	}
 	var count int
-	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM cloud_message m
-		JOIN portal p ON p.id = m.portal_id AND p.receiver = $1 AND p.mxid <> ''
-		WHERE m.login_id=$1 AND m.deleted=FALSE AND m.record_name <> ''
-		  AND (m.tapback_type IS NULL OR m.tapback_type < 2000)
-		  AND (COALESCE(m.text,'') <> '' OR COALESCE(m.attachments_json,'') <> '' OR m.body_scrubbed=TRUE)
-	`, s.loginID).Scan(&count)
+	err := s.db.QueryRow(ctx, query, s.loginID).Scan(&count)
 	return count, err
 }
 
-// candidateMessageCount counts all real (non-deleted, non-reaction) messages
-// regardless of whether they can be bridged. Subtracting deliverableMessageCount
-// from this yields the "unbridgeable" remainder — messages in iMessage-filtered
-// chats, in chats without a Matrix room, or with no content — which sync-status
-// reports separately so a stable delivered/deliverable ratio reads as "complete"
-// rather than "stuck".
+// candidateMessageCount counts every real (non-deleted, non-reaction) message
+// regardless of whether it can be bridged. candidate - deliverable is the
+// "unbridgeable" remainder: messages in iMessage-filtered chats, empty/system
+// rows, and (when capped) the older-than-cap tail — none of which will ever be
+// delivered here. sync-status reports it separately so a stable delivered/
+// deliverable ratio reads as "complete" rather than "stuck".
 func (s *cloudBackfillStore) candidateMessageCount(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
@@ -3302,27 +3341,34 @@ func (s *cloudBackfillStore) candidateMessageCount(ctx context.Context) (int, er
 	return count, err
 }
 
-// deliveredMessageCount returns how many of those deliverable cloud_message
-// rows have actually reached Matrix, i.e. have a matching row in bridgev2's
-// `message` table. Mirrors the membership check in scrubBridgedBodies (same
-// part-suffix normalization, same UPPER() case-fold), so "deliverable minus
-// delivered" is exactly the set scrubBridgedBodies is still waiting on.
-func (s *cloudBackfillStore) deliveredMessageCount(ctx context.Context, bridgeID string) (int, error) {
-	instr := sqlInstrFunc(s.db)
-	query := strings.ReplaceAll(`
-		SELECT COUNT(*) FROM cloud_message
-		WHERE login_id=$1 AND deleted=FALSE AND record_name <> ''
-		  AND (tapback_type IS NULL OR tapback_type < 2000)
-		  AND (COALESCE(text,'') <> '' OR COALESCE(attachments_json,'') <> '' OR body_scrubbed=TRUE)
-		  AND UPPER(guid) IN (
-		    SELECT UPPER(id) FROM message
-		    WHERE bridge_id=$2 AND (room_receiver=$1 OR room_receiver='')
-		    UNION
-		    SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		    WHERE bridge_id=$2 AND {{INSTR}}(id, '_') > 0
-		      AND (room_receiver=$1 OR room_receiver='')
-		  )
-	`, "{{INSTR}}", instr)
+// deliveredMessageCount counts how many bridgeable messages have actually reached
+// Matrix (have a row in bridgev2's `message` table). It applies the SAME
+// bridgeable predicate — and, when capped, the same per-portal cap window — as
+// deliverableMessageCount before the membership test, so delivered is by
+// construction a subset of deliverable: the ratio can never exceed 100% and
+// PendingMessages() is always >= 0. Membership uses the part-suffix normalization
+// and UPPER() case-fold that scrubBridgedBodies uses.
+func (s *cloudBackfillStore) deliveredMessageCount(ctx context.Context, bridgeID string, maxInitial int) (int, error) {
+	// $2 = bridgeID. Selected (not standalone) so it composes into an IN (...).
+	msgMembership := `UPPER(id) FROM message
+			WHERE bridge_id=$2 AND (room_receiver=$1 OR room_receiver='')
+			UNION
+			SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+			WHERE bridge_id=$2 AND {{INSTR}}(id, '_') > 0
+			  AND (room_receiver=$1 OR room_receiver='')`
+	var query string
+	if initialMessagesCapped(maxInitial) {
+		query = fmt.Sprintf(`SELECT COUNT(*) FROM (
+			SELECT m.guid AS guid,
+			       ROW_NUMBER() OVER (PARTITION BY m.portal_id ORDER BY m.timestamp_ms DESC, m.guid DESC) AS rn
+			FROM cloud_message m
+			WHERE %s
+		) t WHERE t.rn <= %d AND UPPER(t.guid) IN (SELECT %s)`, bridgeableMessageWhere, maxInitial, msgMembership)
+	} else {
+		query = `SELECT COUNT(*) FROM cloud_message m WHERE ` + bridgeableMessageWhere +
+			` AND UPPER(m.guid) IN (SELECT ` + msgMembership + `)`
+	}
+	query = strings.ReplaceAll(query, "{{INSTR}}", sqlInstrFunc(s.db))
 	var count int
 	err := s.db.QueryRow(ctx, query, s.loginID, bridgeID).Scan(&count)
 	return count, err

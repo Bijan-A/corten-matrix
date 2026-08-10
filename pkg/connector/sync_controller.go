@@ -2037,7 +2037,7 @@ func (c *IMClient) runSyncCompletionNotifyLoop(log zerolog.Logger, stopChan <-ch
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		report, err := GetSyncStatus(ctx, c.Main.Bridge.DB.Database, string(c.Main.Bridge.ID))
+		report, err := GetSyncStatus(ctx, c.Main.Bridge.DB.Database, string(c.Main.Bridge.ID), c.Main.Bridge.Config.Backfill.MaxInitialMessages)
 		if err != nil {
 			log.Warn().Err(err).Msg("Sync-completion check: failed to build sync status")
 			return
