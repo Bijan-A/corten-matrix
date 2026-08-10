@@ -43,7 +43,7 @@ func openTestSyncDB(t *testing.T) *dbutil.Database {
 		login_id TEXT, guid TEXT, record_name TEXT, portal_id TEXT,
 		deleted BOOLEAN, tapback_type INTEGER, timestamp_ms INTEGER,
 		updated_ts INTEGER, sender TEXT, is_from_me BOOLEAN DEFAULT 0,
-		text TEXT, attachments_json TEXT, has_body BOOLEAN DEFAULT 1,
+		text TEXT, subject TEXT, attachments_json TEXT, has_body BOOLEAN DEFAULT 1,
 		body_scrubbed BOOLEAN DEFAULT 0
 	);
 	CREATE TABLE portal (id TEXT, receiver TEXT, mxid TEXT);

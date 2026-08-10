@@ -3265,10 +3265,15 @@ func (s *cloudBackfillStore) debugTotalChatCount(ctx context.Context) (int, erro
 // non-reaction, with real content, in a chat that is neither iMessage-filtered
 // nor deleted.
 //
-// Content is has_body OR attachments OR text: has_body and attachments_json
-// survive the privacy scrubber (which only nulls text), so a delivered-then-
-// scrubbed message stays counted — without that the deliverable set would shrink
-// below the delivered set over time and the ratio would exceed 100%.
+// Content must be RENDERABLE (see renderableContentClause): real text after
+// stripping the ￼ attachment-placeholder glyph and whitespace, a subject, real
+// attachment JSON, or a body_scrubbed row. has_body alone is NOT sufficient — an
+// orphaned attachment placeholder (text is just ￼, the attachment was never
+// captured) or an empty system row carries has_body=TRUE yet the converter emits
+// nothing for it, so counting those pegged the delivered/deliverable ratio below
+// 100% forever. body_scrubbed=TRUE keeps a delivered-then-scrubbed row counted
+// (the scrubber nulls its text), so the deliverable set never shrinks below the
+// delivered set.
 //
 // The sender clause mirrors cloudRowToBackfillMessages' runtime skip of
 // no-resolvable-sender rows (sender==” && !is_from_me — iMessage system /
@@ -3285,9 +3290,20 @@ func (s *cloudBackfillStore) debugTotalChatCount(ctx context.Context) (int, erro
 // delivered/deliverable ratio — and FullyCaughtUp — could hit 100% mid-backfill.
 // Filtered/roomless/empty rows fall out here and are reported as the unbridgeable
 // remainder (candidate - deliverable) instead.
+// renderableContentClause (alias `m`) is TRUE when the message converter would
+// emit something: real text (after stripping the ￼ attachment-placeholder glyph
+// and whitespace via portable nested REPLACE — the control chars are literal
+// bytes, so no dialect-specific btrim is needed), a subject, real attachment
+// JSON, or a body_scrubbed row (which was delivered and rendered before its text
+// was cleared).
+const renderableContentClause = `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(m.text,''),'￼',''),' ',''),'` + "\n" + `',''),'` + "\t" + `',''),'` + "\r" + `','') <> ''
+	  OR COALESCE(m.subject,'') <> ''
+	  OR COALESCE(m.attachments_json,'') NOT IN ('','[]','null')
+	  OR m.body_scrubbed=TRUE`
+
 const bridgeableMessageWhere = `m.login_id=$1 AND m.deleted=FALSE AND m.record_name <> ''
 	  AND (m.tapback_type IS NULL OR m.tapback_type < 2000)
-	  AND (COALESCE(m.text,'') <> '' OR COALESCE(m.attachments_json,'') <> '' OR COALESCE(m.has_body, TRUE)=TRUE)
+	  AND (` + renderableContentClause + `)
 	  AND (COALESCE(m.sender,'') <> '' OR m.is_from_me=TRUE OR m.body_scrubbed=TRUE)
 	  AND m.portal_id IN (
 	    SELECT portal_id FROM cloud_chat
