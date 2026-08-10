@@ -1039,44 +1039,6 @@ func safeRestoreTokenProvider(
 	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
 }
 
-// verifySpaceRoom clears a stale personal-filtering-space pointer at startup.
-// bridgev2's GetSpaceRoom returns the stored SpaceRoom without checking that it
-// still exists, and only creates a new space when the pointer is empty. If the
-// space room was deleted server-side (e.g. a bulk @bot room purge), every
-// AddPortalToSpace then fails with M_FORBIDDEN ("bot not in room") and no new
-// space is ever created — leaving all rooms unfiled and sync-space a no-op.
-// Detect a gone/inaccessible space room here and clear the pointer so
-// GetSpaceRoom mints a fresh one on next use. Runs synchronously before sync
-// starts so it can't race GetSpaceRoom, and only clears on a definitive
-// M_NOT_FOUND/M_FORBIDDEN — a transient error leaves a possibly-valid pointer.
-func (c *IMClient) verifySpaceRoom(ctx context.Context) {
-	if c.UserLogin == nil || c.UserLogin.SpaceRoom == "" || !c.Main.Bridge.Config.PersonalFilteringSpaces {
-		return
-	}
-	// EnsureJoined both probes and remediates: for a live space room the bot
-	// re-confirms membership (self-healing a stray kick so AddPortalToSpace's
-	// SendState won't 403), and for a deleted room it returns M_NOT_FOUND /
-	// M_FORBIDDEN, which is our signal to clear the pointer.
-	err := c.Main.Bridge.Bot.EnsureJoined(ctx, c.UserLogin.SpaceRoom)
-	if err == nil {
-		return // space room exists and the bot is joined
-	}
-	if !errors.Is(err, mautrix.MNotFound) && !errors.Is(err, mautrix.MForbidden) {
-		c.UserLogin.Log.Warn().Err(err).Stringer("space_room", c.UserLogin.SpaceRoom).
-			Msg("Could not verify personal-filtering space room; leaving pointer as-is")
-		return
-	}
-	stale := c.UserLogin.SpaceRoom
-	c.UserLogin.SpaceRoom = ""
-	if saveErr := c.UserLogin.Save(ctx); saveErr != nil {
-		c.UserLogin.SpaceRoom = stale
-		c.UserLogin.Log.Warn().Err(saveErr).Msg("Failed to clear stale space_room pointer")
-		return
-	}
-	c.UserLogin.Log.Warn().Stringer("stale_space_room", stale).
-		Msg("Cleared stale personal-filtering-space pointer (room gone/inaccessible) — a fresh space will be created on next use")
-}
-
 func (c *IMClient) Connect(ctx context.Context) {
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
@@ -1104,10 +1066,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 		})
 		return
 	}
-
-	// Self-heal a stale personal-filtering-space pointer (e.g. the space room was
-	// deleted in a server-side @bot room purge) before any space operations run.
-	c.verifySpaceRoom(ctx)
 
 	// Restore token provider from persisted credentials if not already set
 	if c.tokenProvider == nil || *c.tokenProvider == nil {
