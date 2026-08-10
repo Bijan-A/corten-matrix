@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -47,25 +48,6 @@ var (
 	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
 )
 
-// BridgeCommands returns the custom slash commands for the iMessage bridge.
-// Pass disableFaceTime=true to skip every facetime* handler — used by
-// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
-// keep the bridge's FT wrapper out of their chat.
-//
-// Invocation conventions for users:
-//
-//   - Management room (the bot DM): type the command bare, e.g. `logout`.
-//   - Portal rooms (bridged chats): prefix with the bridge tag, e.g.
-//     `!im logout`.
-//
-// User-facing reply strings should use `$cmdprefix` (substituted by bridgev2
-// at render time) instead of a hard-coded `!` so the rendered example matches
-// whichever room the user is in.
-//
-// Register these in main.go's PostInit hook:
-//
-//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
-//
 // cmdSyncSpace joins the double puppet to every bridged room and files each into
 // the login's personal filtering space.
 //
@@ -93,6 +75,12 @@ var cmdSyncSpace = &commands.FullHandler{
 // thousands of rooms doesn't overwhelm the homeserver.
 const syncSpacePacing = 40 * time.Millisecond
 
+// syncSpaceInFlight guards against a second concurrent sweep for the same login
+// (keyed by UserLoginID). The command runs for minutes with no output, so an
+// impatient re-run is easy; a second goroutine would double homeserver load and
+// defeat the pacing.
+var syncSpaceInFlight sync.Map
+
 func fnSyncSpace(ce *commands.Event) {
 	login := ce.User.GetDefaultLogin()
 	if login == nil {
@@ -102,6 +90,14 @@ func fnSyncSpace(ce *commands.Event) {
 	dp := ce.User.DoublePuppet(ce.Ctx)
 	if dp == nil {
 		ce.Reply("Double puppeting is not enabled — run `login-matrix` first so the bridge can join rooms as you.")
+		return
+	}
+	// AddPortalToSpace is a silent no-op when personal filtering spaces are
+	// disabled — the login then has no space room, so the sweep would send zero
+	// m.space.child events yet report "added to space N". Refuse up front rather
+	// than hand back a confident wrong number.
+	if !ce.Bridge.Config.PersonalFilteringSpaces {
+		ce.Reply("Personal filtering spaces are disabled (`personal_filtering_spaces` in the bridge config), so there is no space to file rooms into. Enable it and restart before running sync-space.")
 		return
 	}
 	portals, err := ce.Bridge.GetAllPortalsWithMXID(ce.Ctx)
@@ -119,23 +115,39 @@ func fnSyncSpace(ce *commands.Event) {
 		ce.Reply("No bridged rooms found for this login.")
 		return
 	}
+	// Refuse a second concurrent sweep for this login (see syncSpaceInFlight).
+	if _, running := syncSpaceInFlight.LoadOrStore(login.ID, struct{}{}); running {
+		ce.Reply("A sync-space sweep is already running for this login — wait for it to finish before starting another.")
+		return
+	}
 	ce.Reply("Sweeping %d rooms — joining via double puppet and adding to your space. Running in the background; I'll report progress and a final summary.", len(mine))
 
 	// Detach from the command's request context so the sweep survives the command
 	// returning, but keep the log fields.
 	ctx := context.WithoutCancel(ce.Ctx)
+	log := ce.Log
 	go func() {
+		defer syncSpaceInFlight.Delete(login.ID)
 		var joined, spaced, joinErr, spaceErr int
 		for i, p := range mine {
 			if err := dp.EnsureJoined(ctx, p.MXID); err != nil {
 				joinErr++
+				log.Err(err).Str("room_id", p.MXID.String()).Str("portal_id", string(p.ID)).
+					Msg("sync-space: failed to join room via double puppet")
 			} else {
 				joined++
 			}
+			// Pass CopyWithoutValues: AddPortalToSpace writes the row back via
+			// Put, so passing the live row would roll back a last_read/preferred
+			// update that landed during this multi-minute sweep.
 			if up, err := ce.Bridge.DB.UserPortal.GetOrCreate(ctx, login.UserLogin, p.PortalKey); err != nil {
 				spaceErr++
-			} else if err := login.AddPortalToSpace(ctx, p, up); err != nil {
+				log.Err(err).Str("portal_id", string(p.ID)).
+					Msg("sync-space: failed to get/create user portal row")
+			} else if err := login.AddPortalToSpace(ctx, p, up.CopyWithoutValues()); err != nil {
 				spaceErr++
+				log.Err(err).Str("room_id", p.MXID.String()).Str("portal_id", string(p.ID)).
+					Msg("sync-space: failed to add portal to space")
 			} else {
 				spaced++
 			}
@@ -150,6 +162,24 @@ func fnSyncSpace(ce *commands.Event) {
 	}()
 }
 
+// BridgeCommands returns the custom slash commands for the iMessage bridge.
+// Pass disableFaceTime=true to skip every facetime* handler — used by
+// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
+// keep the bridge's FT wrapper out of their chat.
+//
+// Invocation conventions for users:
+//
+//   - Management room (the bot DM): type the command bare, e.g. `logout`.
+//   - Portal rooms (bridged chats): prefix with the bridge tag, e.g.
+//     `!im logout`.
+//
+// User-facing reply strings should use `$cmdprefix` (substituted by bridgev2
+// at render time) instead of a hard-coded `!` so the rendered example matches
+// whichever room the user is in.
+//
+// Register these in main.go's PostInit hook:
+//
+//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
 func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 	cmds := []*commands.FullHandler{
 		cmdStartChat,
