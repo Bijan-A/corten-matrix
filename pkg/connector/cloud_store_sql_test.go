@@ -3,7 +3,9 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -588,6 +590,172 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 	}
 	if scrubbedText.Valid {
 		t.Errorf("text = %q after scrub, want NULL", scrubbedText.String)
+	}
+}
+
+// TestReconcileGappedPortalsFlagsUndeliveredContent guards the startup
+// reconciliation that recovers messages stranded when content lands in a portal
+// after its backfill completed (participant-set re-key / late sync) — the
+// anchor-limited backward path can't reach them. reconcileGappedPortals must
+// flag ONLY roomed portals whose bridgeable count exceeds delivered rows by at
+// least minGap, and must ignore complete portals, sub-threshold gaps, and
+// roomless portals.
+func TestReconcileGappedPortalsFlagsUndeliveredContent(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const bridgeID = "" // matches production single-bridge (portal.bridge_id='')
+	const now = int64(1_700_000_000_000)
+
+	// Minimal stand-ins for the bridgev2 tables the reconcile query joins; the
+	// cloud store's ensureSchema doesn't own these, so create just the columns
+	// the query reads.
+	for _, ddl := range []string{
+		`CREATE TABLE portal (bridge_id TEXT, id TEXT, receiver TEXT, mxid TEXT)`,
+		`CREATE TABLE message (bridge_id TEXT, room_id TEXT, room_receiver TEXT, id TEXT)`,
+	} {
+		if _, err := db.Exec(ctx, ddl); err != nil {
+			t.Fatalf("create table: %v", err)
+		}
+	}
+	chat := func(portal string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,0,0)`,
+			testSQLLoginID, "c-"+portal, portal, now); err != nil {
+			t.Fatalf("insert chat %s: %v", portal, err)
+		}
+	}
+	bridgeable := func(portal string, n int) {
+		for i := 0; i < n; i++ {
+			guid := fmt.Sprintf("%s-g%d", portal, i)
+			if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+				GUID: guid, PortalID: portal, CloudChatID: "c-" + portal, TimestampMS: now,
+				Text: "hi", Service: "iMessage", HasBody: true, Sender: "tel:+15550001111",
+			}}); err != nil {
+				t.Fatalf("upsert msg %s: %v", guid, err)
+			}
+			if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1 AND guid=$2`,
+				testSQLLoginID, guid); err != nil {
+				t.Fatalf("set record_name %s: %v", guid, err)
+			}
+		}
+	}
+	room := func(portal string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO portal (bridge_id, id, receiver, mxid) VALUES ($1,$2,$3,$4)`,
+			bridgeID, portal, string(testSQLLoginID), "!room-"+portal+":hs"); err != nil {
+			t.Fatalf("insert portal %s: %v", portal, err)
+		}
+	}
+	// deliverMatching inserts message rows whose id equals the first n bridgeable
+	// guids of the portal — i.e. those n messages ARE delivered.
+	deliverMatching := func(portal string, n int) {
+		for i := 0; i < n; i++ {
+			if _, err := db.Exec(ctx,
+				`INSERT INTO message (bridge_id, room_id, room_receiver, id) VALUES ($1,$2,$3,$4)`,
+				bridgeID, portal, string(testSQLLoginID), fmt.Sprintf("%s-g%d", portal, i)); err != nil {
+				t.Fatalf("insert message %s: %v", portal, err)
+			}
+		}
+	}
+	// deliverUnrelated inserts n message rows with ids that DON'T match any
+	// bridgeable guid — a count comparison would treat them as progress, but
+	// per-guid matching correctly counts zero of the portal's messages delivered.
+	deliverUnrelated := func(portal string, n int) {
+		for i := 0; i < n; i++ {
+			if _, err := db.Exec(ctx,
+				`INSERT INTO message (bridge_id, room_id, room_receiver, id) VALUES ($1,$2,$3,$4)`,
+				bridgeID, portal, string(testSQLLoginID), fmt.Sprintf("unrelated-%s-%d", portal, i)); err != nil {
+				t.Fatalf("insert message %s: %v", portal, err)
+			}
+		}
+	}
+
+	// p_gap: 15 bridgeable; 13 delivered rows, but with UNRELATED ids so NONE of
+	// the 15 guids actually match → precise gap 15. A count comparison would see
+	// 15−13=2 and (at minGap 3) wrongly skip it; per-guid matching flags it.
+	chat("p_gap")
+	bridgeable("p_gap", 15)
+	room("p_gap")
+	deliverUnrelated("p_gap", 13)
+	// p_complete: 12 bridgeable, all 12 delivered by matching guid → gap 0.
+	chat("p_complete")
+	bridgeable("p_complete", 12)
+	room("p_complete")
+	deliverMatching("p_complete", 12)
+	// p_small: 10 bridgeable, 8 delivered by matching guid → gap 2 < minGap 3.
+	chat("p_small")
+	bridgeable("p_small", 10)
+	room("p_small")
+	deliverMatching("p_small", 8)
+	// p_noroom: 15 bridgeable, 0 delivered, but NO Matrix room → not flagged
+	// (handled by portal creation / forward backfill, not reconciliation).
+	chat("p_noroom")
+	bridgeable("p_noroom", 15)
+	// p_placeholder: 20 undelivered rows whose text is ONLY the ￼ attachment-
+	// placeholder glyph with no attachment data — has_body=TRUE but nothing the
+	// converter can render. Must NOT be flagged: counting these is the churn /
+	// denominator bug the renderable predicate fixes. Also proves the ￼-stripping
+	// REPLACE behaves on SQLite (not just Postgres).
+	chat("p_placeholder")
+	for i := 0; i < 20; i++ {
+		guid := fmt.Sprintf("p_placeholder-g%d", i)
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: "p_placeholder", CloudChatID: "c-p_placeholder", TimestampMS: now,
+			Text: "￼", Service: "iMessage", HasBody: true, Sender: "tel:+15550001111",
+		}}); err != nil {
+			t.Fatalf("upsert placeholder %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid); err != nil {
+			t.Fatalf("set record_name %s: %v", guid, err)
+		}
+	}
+	room("p_placeholder")
+	// p_case: 4 bridgeable guids, all delivered via APNs-style UPPERCASE ids
+	// (finding 4). Must NOT be flagged — a case-sensitive exact `x.id=guid` would
+	// miss all four and flag it; the fix also matches x.id=UPPER(guid).
+	chat("p_case")
+	bridgeable("p_case", 4)
+	room("p_case")
+	for i := 0; i < 4; i++ {
+		if _, err := db.Exec(ctx, `INSERT INTO message (bridge_id, room_id, room_receiver, id) VALUES ($1,$2,$3,$4)`,
+			bridgeID, "p_case", string(testSQLLoginID), strings.ToUpper(fmt.Sprintf("p_case-g%d", i))); err != nil {
+			t.Fatalf("insert uppercase message: %v", err)
+		}
+	}
+
+	got, err := store.reconcileGappedPortals(ctx, bridgeID, 3)
+	if err != nil {
+		t.Fatalf("reconcileGappedPortals: %v", err)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, p := range got {
+		seen[p] = true
+	}
+	if !seen["p_gap"] {
+		t.Error("p_gap (15 guids, none delivered — only unrelated rows) must be flagged; per-guid matching, not row count")
+	}
+	if seen["p_complete"] {
+		t.Error("p_complete (all guids delivered) must NOT be flagged")
+	}
+	if seen["p_small"] {
+		t.Error("p_small (gap 2 < minGap 3) must NOT be flagged")
+	}
+	if seen["p_noroom"] {
+		t.Error("p_noroom (no Matrix room) must NOT be flagged — it's handled by portal creation")
+	}
+	if seen["p_placeholder"] {
+		t.Error("p_placeholder (only ￼ attachment-placeholder rows, nothing renderable) must NOT be flagged")
+	}
+	if seen["p_case"] {
+		t.Error("p_case (all guids delivered via UPPERCASE ids) must NOT be flagged — x.id=UPPER(guid) case-fold match")
+	}
+	if len(got) != 1 {
+		t.Errorf("expected exactly 1 flagged portal (p_gap), got %d: %v", len(got), got)
 	}
 }
 
