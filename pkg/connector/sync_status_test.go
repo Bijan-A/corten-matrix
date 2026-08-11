@@ -84,6 +84,11 @@ func TestGetSyncStatus(t *testing.T) {
 	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted, is_filtered) VALUES (?, 'p_noroom', 0, 0)`, loginID)
 	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted, is_filtered) VALUES (?, 'p_filtered', 0, 1)`, loginID)
 	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted, is_filtered) VALUES (?, 'p_deleted', 1, 0)`, loginID)
+	// p_noroom also gets a FILTERED sibling chat row (same portal_id): participant-
+	// set keying collapses a filtered + non-filtered chat onto one portal_id. The
+	// portal is still bridged, so its message must stay deliverable — a bare
+	// NOT EXISTS(is_filtered) membership test would wrongly drop it.
+	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted, is_filtered) VALUES (?, 'p_noroom', 0, 1)`, loginID)
 
 	// Deliverability does NOT require a Matrix room: a bridgeable message in a
 	// roomless-but-unfiltered chat (guid-nr) is deliverable-but-pending, which is
@@ -102,17 +107,18 @@ func TestGetSyncStatus(t *testing.T) {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, loginID, guid, rec, portal, sender, fromMe, deleted, tb, hasBody, text, scrubbed, now, now)
 	}
 	//    guid,      rec,     portal,        sender,    fromMe del tap  body text     scrub
-	ins("guid-a", "rec-a", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)         // deliverable, delivered (direct)
-	ins("guid-b", "rec-b", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)         // deliverable, delivered (part-suffix)
-	ins("guid-c", "rec-c", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)         // deliverable, pending
-	ins("guid-s", "rec-s", "p1", "", 0, 0, 0, 1, "", 1)                 // deliverable (has_body+scrubbed), delivered
-	ins("guid-nr", "rec-nr", "p_noroom", "tel:+2", 0, 0, 0, 1, "hi", 0) // deliverable (no room yet), pending
-	ins("guid-r", "rec-r", "p1", "tel:+1", 0, 0, 2000, 1, "react", 0)   // reaction — excluded
-	ins("guid-d", "rec-d", "p1", "tel:+1", 0, 1, 0, 1, "hi", 0)         // deleted message — excluded
-	ins("guid-e", "rec-e", "p_filtered", "tel:+3", 0, 0, 0, 1, "hi", 0) // filtered chat — unbridgeable
-	ins("guid-f", "rec-f", "p1", "tel:+5", 0, 0, 0, 0, "", 0)           // empty/system (no content) — unbridgeable
-	ins("guid-g", "rec-g", "p_deleted", "tel:+4", 0, 0, 0, 1, "hi", 0)  // deleted chat — unbridgeable
-	ins("guid-sys", "rec-sys", "p1", "", 0, 0, 0, 1, "sysnote", 0)      // no sender, not from-me — unbridgeable
+	ins("guid-a", "rec-a", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)             // deliverable, delivered (direct)
+	ins("guid-b", "rec-b", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)             // deliverable, delivered (part-suffix)
+	ins("guid-c", "rec-c", "p1", "tel:+1", 0, 0, 0, 1, "hi", 0)             // deliverable, pending
+	ins("guid-s", "rec-s", "p1", "", 0, 0, 0, 1, "", 1)                     // deliverable (has_body+scrubbed), delivered
+	ins("guid-nr", "rec-nr", "p_noroom", "tel:+2", 0, 0, 0, 1, "hi", 0)     // deliverable (no room yet), pending
+	ins("guid-r", "rec-r", "p1", "tel:+1", 0, 0, 2000, 1, "react", 0)       // reaction — excluded
+	ins("guid-d", "rec-d", "p1", "tel:+1", 0, 1, 0, 1, "hi", 0)             // deleted message — excluded
+	ins("guid-e", "rec-e", "p_filtered", "tel:+3", 0, 0, 0, 1, "hi", 0)     // filtered chat — unbridgeable
+	ins("guid-f", "rec-f", "p1", "tel:+5", 0, 0, 0, 0, "", 0)               // empty/system (no content) — unbridgeable
+	ins("guid-g", "rec-g", "p_deleted", "tel:+4", 0, 0, 0, 1, "hi", 0)      // deleted chat — unbridgeable
+	ins("guid-sys", "rec-sys", "p1", "", 0, 0, 0, 1, "sysnote", 0)          // no sender, not from-me — unbridgeable
+	ins("guid-nochat", "rec-nc", "p_nochat", "tel:+9", 0, 0, 0, 1, "hi", 0) // NO cloud_chat row — deliverable, pending (finding 1: the row is inserted only after delivery)
 
 	exec(`INSERT INTO message (id, bridge_id, room_receiver) VALUES ('GUID-A', ?, ?)`, bridgeID, loginID)
 	exec(`INSERT INTO message (id, bridge_id, room_receiver) VALUES ('guid-b_1', ?, ?)`, bridgeID, loginID)
@@ -126,11 +132,11 @@ func TestGetSyncStatus(t *testing.T) {
 	if !report.BootstrapComplete {
 		t.Errorf("BootstrapComplete = false, want true")
 	}
-	if report.TotalChats != 3 {
-		t.Errorf("TotalChats = %d, want 3 (p1, p_noroom, p_filtered; p_deleted excluded)", report.TotalChats)
+	if report.TotalChats != 4 {
+		t.Errorf("TotalChats = %d, want 4 (p1, p_noroom ×2 incl. filtered sibling, p_filtered; p_deleted excluded)", report.TotalChats)
 	}
-	if report.DeliverableMessages != 5 {
-		t.Errorf("DeliverableMessages = %d, want 5 (guid-a,b,c,s,nr; excludes reaction, deleted msg, filtered chat, empty, deleted chat)", report.DeliverableMessages)
+	if report.DeliverableMessages != 6 {
+		t.Errorf("DeliverableMessages = %d, want 6 (guid-a,b,c,s,nr,nochat; guid-nr stays despite p_noroom's filtered sibling [mixed-filtered], guid-nochat counts with no chat row; excludes reaction, deleted msg, filtered chat, empty, deleted chat)", report.DeliverableMessages)
 	}
 	if report.DeliveredMessages != 3 {
 		t.Errorf("DeliveredMessages = %d, want 3 (guid-a direct, guid-b part-suffix, guid-s scrubbed-but-delivered)", report.DeliveredMessages)
@@ -138,8 +144,8 @@ func TestGetSyncStatus(t *testing.T) {
 	if report.UnbridgeableMessages != 4 {
 		t.Errorf("UnbridgeableMessages = %d, want 4 (filtered-chat, empty, deleted-chat, no-sender system)", report.UnbridgeableMessages)
 	}
-	if got := report.PendingMessages(); got != 2 {
-		t.Errorf("PendingMessages() = %d, want 2 (guid-c, guid-nr)", got)
+	if got := report.PendingMessages(); got != 3 {
+		t.Errorf("PendingMessages() = %d, want 3 (guid-c, guid-nr, guid-nochat)", got)
 	}
 	if report.FullyCaughtUp() {
 		t.Errorf("FullyCaughtUp() = true, want false (2 messages still pending)")
@@ -169,6 +175,46 @@ func TestGetSyncStatus(t *testing.T) {
 	out := report.Format(nil)
 	if out == "" {
 		t.Errorf("Format() returned empty string")
+	}
+}
+
+// TestGetSyncStatusCappedWindowRanksDeliveryPopulation guards the capped-mode
+// window: it must rank over the population listLatestMessages delivers from
+// (deleted=FALSE AND record_name<>”), then apply the bridgeable filter — NOT
+// rank the bridgeable subset. Portal has three messages; the middle one (by
+// time) is non-bridgeable (no sender). With max_initial=2 the newest two by
+// delivery order are the newest bridgeable + the non-bridgeable middle, so only
+// one is deliverable. Ranking the bridgeable subset would instead pick the two
+// bridgeable ends and report two — reaching further back than delivery ever does.
+func TestGetSyncStatusCappedWindowRanksDeliveryPopulation(t *testing.T) {
+	ctx := context.Background()
+	db := openTestSyncDB(t)
+	const loginID = "login1"
+	const bridgeID = ""
+	now := time.Now().UnixMilli()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.RawDB.Exec(q, args...); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+	exec(`INSERT INTO user_login (id, bridge_id) VALUES (?, ?)`, loginID, bridgeID)
+	exec(`INSERT INTO cloud_chat (login_id, portal_id, deleted, is_filtered) VALUES (?, 'p_cap', 0, 0)`, loginID)
+	msg := func(guid, rec, sender string, fromMe int, text string, ts int64) {
+		exec(`INSERT INTO cloud_message (login_id, guid, record_name, portal_id, sender, is_from_me, deleted, tapback_type, has_body, text, body_scrubbed, timestamp_ms, updated_ts)
+			VALUES (?, ?, ?, 'p_cap', ?, ?, 0, NULL, 1, ?, 0, ?, ?)`, loginID, guid, rec, sender, fromMe, text, ts, ts)
+	}
+	// Newest→oldest: bridgeable, NON-bridgeable (no sender, not from-me), bridgeable.
+	msg("m-new", "r1", "tel:+1", 0, "hi", now)
+	msg("m-mid", "r2", "", 0, "hi", now-1000)
+	msg("m-old", "r3", "tel:+1", 0, "hi", now-2000)
+
+	report, err := GetSyncStatus(ctx, db, bridgeID, 2) // capped at 2 per portal
+	if err != nil {
+		t.Fatalf("GetSyncStatus: %v", err)
+	}
+	if report.DeliverableMessages != 1 {
+		t.Errorf("DeliverableMessages = %d, want 1 (newest-2 by delivery order are m-new + non-bridgeable m-mid; only m-new is bridgeable). Ranking the bridgeable subset would wrongly give 2 (m-new + m-old).", report.DeliverableMessages)
 	}
 }
 
