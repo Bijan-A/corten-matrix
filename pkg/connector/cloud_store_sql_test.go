@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -756,6 +757,73 @@ func TestReconcileGappedPortalsFlagsUndeliveredContent(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Errorf("expected exactly 1 flagged portal (p_gap), got %d: %v", len(got), got)
+	}
+}
+
+// TestOrphanedGroupRoomPortalIDs guards the issue-#9 rediscovery query: a
+// group's room move deferred past groupRoomMoveBudgetPerStartup gets its
+// cloud_chat rows re-keyed to canonical on the SAME startup (reKeyGroupCloudData
+// runs unbudgeted for every group), so on the NEXT startup listGroupChats (which
+// reads cloud_chat.portal_id) no longer sees it as needing a move — its Matrix
+// room is stuck at the old gid:<UUID> key forever. orphanedGroupRoomPortalIDs
+// must find that stale room by joining on cloud_chat.group_id, which
+// reKeyPortalID never rewrites (only portal_id is re-keyed).
+func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const bridgeID = "" // matches production single-bridge (portal.bridge_id='')
+	const now = int64(1_700_000_000_000)
+
+	if _, err := db.Exec(ctx, `CREATE TABLE portal (bridge_id TEXT, id TEXT, receiver TEXT, mxid TEXT)`); err != nil {
+		t.Fatalf("create portal table: %v", err)
+	}
+	chat := func(cid, groupID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,0,0)`,
+			testSQLLoginID, cid, groupID, portalID, now); err != nil {
+			t.Fatalf("insert chat %s: %v", cid, err)
+		}
+	}
+	room := func(portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO portal (bridge_id, id, receiver, mxid) VALUES ($1,$2,$3,$4)`,
+			bridgeID, portalID, string(testSQLLoginID), "!room-"+portalID+":hs"); err != nil {
+			t.Fatalf("insert portal %s: %v", portalID, err)
+		}
+	}
+
+	// p_orphan: Matrix room still at gid:aaaa, but its cloud_chat row was
+	// already re-keyed (by a prior startup's reKeyGroupCloudData) to the
+	// canonical participant key — must be flagged, gid:aaaa -> canonical.
+	room("gid:aaaa")
+	chat("c-orphan", "aaaa", "tel:+1,tel:+2")
+
+	// p_current: room and cloud_chat both still at gid:bbbb (never
+	// consolidated at all) — not an orphan; the normal participant-key path
+	// (listGroupChats) handles this one, nothing to rediscover here.
+	room("gid:bbbb")
+	chat("c-current", "bbbb", "gid:bbbb")
+
+	// p_done: room already re-ID'd onto the canonical key (consolidation
+	// already finished) — excluded by the `id LIKE 'gid:%'` filter.
+	room("tel:+3,tel:+4")
+	chat("c-done", "cccc", "tel:+3,tel:+4")
+
+	// p_noroom: cloud_chat re-keyed, but no bridgev2 portal/room row at all —
+	// nothing to rediscover (handled by portal creation, not a room move).
+	chat("c-noroom", "dddd", "tel:+5,tel:+6")
+
+	got, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
+	if err != nil {
+		t.Fatalf("orphanedGroupRoomPortalIDs: %v", err)
+	}
+	want := map[string]string{"gid:aaaa": "tel:+1,tel:+2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("orphanedGroupRoomPortalIDs() = %#v, want %#v", got, want)
 	}
 }
 
