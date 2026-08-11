@@ -22,6 +22,9 @@ type syncStatusConfig struct {
 		Type string `yaml:"type"`
 		URI  string `yaml:"uri"`
 	} `yaml:"database"`
+	Backfill struct {
+		MaxInitialMessages int `yaml:"max_initial_messages"`
+	} `yaml:"backfill"`
 }
 
 // runSyncStatus implements `corten-matrix sync-status` (and `sync-status 1`
@@ -54,9 +57,16 @@ func runSyncStatus(args []string) {
 	}
 	defer db.RawDB.Close()
 
+	// Mirror the connector's normalization: max_initial_messages < 100 is
+	// treated as uncapped (connector.go forces it to math.MaxInt32 in PostInit),
+	// so the CLI reports the same deliverable set the running bridge delivers.
+	maxInitial := cfg.Backfill.MaxInitialMessages
+	if maxInitial < 100 {
+		maxInitial = 0
+	}
 	// bridgeID is always "" — corten-matrix never overrides bridgev2's
 	// default bridge ID (see mxmain's NewBridge("", ...) call).
-	report, err := connector.GetSyncStatus(context.Background(), db, "")
+	report, err := connector.GetSyncStatus(context.Background(), db, "", maxInitial)
 	if err != nil {
 		die("Could not read sync status (has the bridge logged in yet?): %v", err)
 	}
