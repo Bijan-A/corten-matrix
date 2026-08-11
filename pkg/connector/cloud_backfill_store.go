@@ -3852,6 +3852,68 @@ func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Cont
 	return skip, rows.Err()
 }
 
+// reconcileGappedPortals returns portal_ids that have a Matrix room but at least
+// minGap bridgeable cloud_message rows with no matching delivered message row —
+// content that landed in the portal AFTER its backfill completed (participant-set
+// re-key / late sync) and that the "fully backfilled, nothing new" skip list
+// would otherwise perpetuate. The controller keeps these OUT of that skip list so
+// their normal backfill task is re-dispatched (see IMClient.reconcilePortals).
+//
+// This is a DETECTOR, not a delivery path: it identifies portals worth re-running
+// a normal backfill for. It does not itself force-deliver a gap the backward path
+// can't reach (content newer than the portal's anchor, or interleaved) — that is
+// delivered by forward backfill of the (re-keyed) rooms. So a false positive only
+// costs a wasted re-dispatch, never a wrong count or a duplicate.
+//
+// Delivery is detected per message: a bridgeable guid is delivered iff a message
+// row exists in that room with id = guid OR id = UPPER(guid). Both are equality
+// tests (index-usable), so the correlated NOT EXISTS — scoped by room_id — stays
+// a few seconds over the whole table, acceptable for a once-per-startup pass. The
+// UPPER(guid) branch covers the case mismatch scrubBridgedBodies/deliveredMessageCount
+// also handle: APNs-delivered ids are uppercase while CloudKit guids are mixed-case.
+// (A case-folding UPPER(x.id) or a LIKE prefix would be correct but non-sargable —
+// a startup-latency regression — so equality against both spellings is used instead.)
+// A count comparison would NOT be good enough here (attachments store one row per
+// part and rooms accumulate non-bridgeable rows, so a count gap understates real
+// stranding); the trade is that a message delivered only as an attachment part
+// (id = guid_attN, no base row) reads as undelivered and may over-flag its portal —
+// harmless for a re-dispatch nudge. message.room_id IS the portal networkid, so it
+// joins directly to cloud_message.portal_id and portal.id.
+func (s *cloudBackfillStore) reconcileGappedPortals(ctx context.Context, bridgeID string, minGap int) ([]string, error) {
+	query := `
+		SELECT sub.portal_id FROM (
+			SELECT m.portal_id AS portal_id, COUNT(*) AS gap
+			FROM cloud_message m
+			WHERE ` + bridgeableMessageWhere + `
+			  AND EXISTS (
+			    SELECT 1 FROM portal p
+			    WHERE p.bridge_id=$2 AND p.id=m.portal_id AND p.receiver=$1 AND p.mxid <> ''
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM message x
+			    WHERE x.bridge_id=$2 AND x.room_id=m.portal_id
+			      AND (x.id=m.guid OR x.id=UPPER(m.guid))
+			  )
+			GROUP BY m.portal_id
+		) sub
+		WHERE sub.gap >= $3
+	`
+	rows, err := s.db.Query(ctx, query, s.loginID, bridgeID, minGap)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			return nil, err
+		}
+		out = append(out, pid)
+	}
+	return out, rows.Err()
+}
+
 // loadDeadAttachments returns every record_name tombstoned as permanently
 // un-downloadable for this login. The caller seeds an in-memory set so
 // pre-upload and the portal loop skip these without touching CloudKit.

@@ -527,6 +527,18 @@ type IMClient struct {
 	backwardDeferMu     sync.Mutex
 	backwardDeferCounts map[string]int
 
+	// reconcilePortals is the set of portal_ids a startup reconciliation
+	// (reconcileGappedPortals) found to have undelivered bridgeable cloud_message
+	// content despite looking done. The controller keeps these OUT of the "fully
+	// backfilled, nothing new" skip list (see isReconcile) so their normal backfill
+	// task is re-dispatched — rescuing portals the skip list would otherwise
+	// perpetuate. This does NOT force-deliver a gap the normal backward path can't
+	// reach (content newer than the portal's anchor, or interleaved): that is
+	// delivered by forward backfill of the (re-keyed) rooms, not from here.
+	// reconcileMu guards the map.
+	reconcileMu      sync.Mutex
+	reconcilePortals map[string]bool
+
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
 	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
@@ -8035,6 +8047,35 @@ type cloudBackfillCursor struct {
 // portal defers for AT LEAST this long, and longer while forward work is still
 // in flight; only a genuinely stalled/failed forward backfill hits recovery.
 const maxBackwardDeferAttempts = 20
+
+// reconcileMinGap is the minimum number of precisely-undelivered bridgeable
+// messages (see reconcileGappedPortals) for a portal to be flagged. Detection is
+// per-guid exact, so a gap of 1 is a genuine stranded message.
+const reconcileMinGap = 1
+
+// setReconcilePortals seeds the startup reconciliation set (see reconcilePortals).
+// The controller calls this once, before it queues backfill tasks, with the
+// portal_ids reconcileGappedPortals flagged as having undelivered bridgeable
+// content.
+func (c *IMClient) setReconcilePortals(portalIDs []string) {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+	if c.reconcilePortals == nil {
+		c.reconcilePortals = make(map[string]bool, len(portalIDs))
+	}
+	for _, pid := range portalIDs {
+		c.reconcilePortals[pid] = true
+	}
+}
+
+// isReconcile reports whether a portal was flagged by the startup reconciliation.
+// The controller uses it to keep flagged portals OUT of the "fully backfilled,
+// nothing new" skip list so their normal backfill task is re-dispatched.
+func (c *IMClient) isReconcile(portalID string) bool {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+	return c.reconcilePortals[portalID]
+}
 
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()

@@ -4292,6 +4292,28 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 	skippedChatResync := 0
 
+	// Startup reconciliation: flag portals that look "done" to skipUnchanged above
+	// but still have undelivered bridgeable content (e.g. a participant-set re-key
+	// or late sync landed messages after backfill completed). Flagged portals are
+	// kept OUT of the skip set below so their normal backfill task is re-dispatched
+	// — rescuing portals the "nothing new" skip list would otherwise perpetuate.
+	// See reconcileGappedPortals and IMClient.reconcilePortals.
+	//
+	// Skip entirely when max_initial_messages is capped: reconcileGappedPortals
+	// counts over full history with no cap window, so on a capped install almost
+	// every portal has "undelivered" (older-than-cap) content and would be flagged,
+	// dropped from the skip list, and re-dispatched on every startup — a full
+	// ChatResync wave each boot for no benefit (the capped tail is never delivered).
+	if initialMessagesCapped(c.Main.Bridge.Config.Backfill.MaxInitialMessages) {
+		log.Debug().Msg("max_initial_messages is capped — skipping startup backfill reconciliation")
+	} else if reconcileIDs, rErr := c.cloudStore.reconcileGappedPortals(ctx, string(c.Main.Bridge.ID), reconcileMinGap); rErr != nil {
+		log.Warn().Err(rErr).Msg("Failed to compute portals needing backfill reconciliation; skipping reconciliation this run")
+	} else if len(reconcileIDs) > 0 {
+		c.setReconcilePortals(reconcileIDs)
+		log.Info().Int("count", len(reconcileIDs)).
+			Msg("Flagged portals with undelivered backfill content for re-dispatch")
+	}
+
 	// Set pendingInitialBackfills BEFORE queuing any portals.
 	// bridgev2 processes ChatResync events concurrently (QueueRemoteEvent is
 	// async), so FetchMessages(Forward=true) calls — and their
@@ -4320,7 +4342,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		// (see skipUnchanged above). Their rooms exist (is_done implies a room)
 		// and offline messages would have excluded them from the set, so there's
 		// nothing to catch up. New/changed portals fall through and re-queue.
-		if skipUnchanged[portalID] {
+		if skipUnchanged[portalID] && !c.isReconcile(portalID) {
 			skippedChatResync++
 			continue
 		}
@@ -4404,7 +4426,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	skippedNoRoom := 0
 	skippedAlreadyDone := 0
 	for _, portalID := range ordered {
-		if skipUnchanged[portalID] {
+		if skipUnchanged[portalID] && !c.isReconcile(portalID) {
 			skippedAlreadyDone++
 			continue
 		}
