@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -77,6 +78,241 @@ func TestForwardBackfillDoneLifecycle(t *testing.T) {
 	store.markForwardBackfillDone(ctx, portalID)
 	if !store.isForwardBackfillDone(ctx, portalID) {
 		t.Fatalf("isForwardBackfillDone = false after second markForwardBackfillDone (update path), want true")
+	}
+}
+
+// hasScrubbedBackfillableMessages is the trigger for forward backfill's
+// rehydrate-before-marking-done guard. It must fire only for deliverable rows
+// whose bodies were cleared by the privacy scrubber (body_scrubbed=TRUE,
+// has_body=TRUE, non-reaction) — not for genuinely-empty portals, non-scrubbed
+// rows, deleted rows, or scrubbed reactions.
+func TestHasScrubbedBackfillableMessages(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const now = int64(1_000_000)
+
+	// A live (non-scrubbed) contentful row must NOT trigger rehydration.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-LIVE", PortalID: "p-live", CloudChatID: "C1",
+		TimestampMS: now, Text: "hello", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert live: %v", err)
+	}
+	// Give it a record_name so it counts as backfillable (matches the guard's
+	// record_name <> '' predicate).
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1`, testSQLLoginID); err != nil {
+		t.Fatalf("set record_name: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-live"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-live): %v", err)
+	} else if got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-live) = true for a live contentful row, want false")
+	}
+
+	// A scrubbed, has_body, non-reaction row on p-scrub MUST trigger.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-SCRUB", PortalID: "p-scrub", CloudChatID: "C2",
+		TimestampMS: now, Text: "will be scrubbed", Service: "iMessage", HasBody: true,
+	}}); err != nil {
+		t.Fatalf("upsert scrub: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET record_name='r', text=NULL, body_scrubbed=TRUE WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-SCRUB",
+	); err != nil {
+		t.Fatalf("scrub G-SCRUB: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-scrub"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-scrub): %v", err)
+	} else if !got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-scrub) = false for a scrubbed deliverable row, want true")
+	}
+
+	// A portal with no rows at all must NOT trigger.
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-empty"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-empty): %v", err)
+	} else if got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-empty) = true for an empty portal, want false")
+	}
+
+	// A scrubbed ATTACHMENT-ONLY row (has_body=FALSE) MUST trigger: conversion
+	// skips every body_scrubbed non-reaction row regardless of has_body, so a
+	// photo-only portal whose rows were all scrubbed would otherwise reach the
+	// empty path unguarded (silent loss). The guard must not require has_body.
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+		GUID: "G-PHOTO", PortalID: "p-photo", CloudChatID: "C3",
+		TimestampMS: now, Service: "iMessage", HasBody: false,
+		AttachmentsJSON: `[{"guid":"a"}]`,
+	}}); err != nil {
+		t.Fatalf("upsert photo: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET record_name='r', has_body=FALSE, body_scrubbed=TRUE WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-PHOTO",
+	); err != nil {
+		t.Fatalf("scrub G-PHOTO: %v", err)
+	}
+	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-photo"); err != nil {
+		t.Fatalf("hasScrubbedBackfillableMessages(p-photo): %v", err)
+	} else if !got {
+		t.Errorf("hasScrubbedBackfillableMessages(p-photo) = false for a scrubbed attachment-only row, want true")
+	}
+}
+
+// guidsWithDeliveredMessage backs 3b's reaction-flood mitigation: backfill uses
+// it to skip queueing tapbacks whose target message was never delivered (which
+// would otherwise flood the per-portal event loop as "target not found"). It must
+// return exactly the guids that have a bridgev2 `message` row for this receiver.
+func TestGuidsWithDeliveredMessage(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
+		id TEXT NOT NULL, bridge_id TEXT NOT NULL,
+		room_receiver TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create message table: %v", err)
+	}
+	const bridgeID = "test-bridge"
+	// DELIVERED-A: normal delivered target. DELIVERED-B: delivered under empty
+	// room_receiver (appservice rows) — must still match. WRONG-LOGIN: belongs to
+	// a different receiver — must NOT match.
+	// PHOTO-ONLY: delivered only under a balloon-part suffix (id ==
+	// "<guid>_att0"), no bare-guid text part. A tapback on it resolves via
+	// resolveTapbackTargetID to the suffixed id, so it IS resolvable and must be
+	// reported delivered under its BARE guid. DUP is repeated in the input to
+	// exercise dedup.
+	for _, r := range []struct{ id, recv string }{
+		{"DELIVERED-A", string(testSQLLoginID)},
+		{"DELIVERED-B", ""},
+		{"WRONG-LOGIN", "someone-else"},
+		{"PHOTO-ONLY_att0", string(testSQLLoginID)},
+	} {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			r.id, bridgeID, r.recv); err != nil {
+			t.Fatalf("insert message %s: %v", r.id, err)
+		}
+	}
+
+	got, err := store.guidsWithDeliveredMessage(ctx, bridgeID,
+		[]string{"DELIVERED-A", "DELIVERED-A", "DELIVERED-B", "WRONG-LOGIN", "NEVER-DELIVERED", "PHOTO-ONLY"})
+	if err != nil {
+		t.Fatalf("guidsWithDeliveredMessage: %v", err)
+	}
+	want := map[string]bool{"DELIVERED-A": true, "DELIVERED-B": true, "PHOTO-ONLY": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for g := range want {
+		if !got[g] {
+			t.Errorf("guid %q missing from delivered set %v", g, got)
+		}
+	}
+	if got["WRONG-LOGIN"] {
+		t.Error("WRONG-LOGIN (different receiver) must not be reported delivered")
+	}
+	if got["NEVER-DELIVERED"] {
+		t.Error("NEVER-DELIVERED (no message row) must not be reported delivered")
+	}
+
+	// Empty input must not error or query.
+	if m, err := store.guidsWithDeliveredMessage(ctx, bridgeID, nil); err != nil || len(m) != 0 {
+		t.Errorf("empty guids: got (%v, %v), want (empty, nil)", m, err)
+	}
+}
+
+// TestScrubBridgedBodiesBackfillGate covers the fwd_backfill_done gate on
+// scrubBridgedBodies (PR #3 finding 1): the "wait for forward backfill" gate
+// must apply ONLY when backfill is the delivery mechanism, and NULL-portal rows
+// must bypass it — otherwise plaintext is retained forever whenever forward
+// backfill never runs.
+func TestScrubBridgedBodiesBackfillGate(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS message (
+		id TEXT NOT NULL, bridge_id TEXT NOT NULL,
+		room_receiver TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create message table: %v", err)
+	}
+	const bridgeID = "test-bridge"
+	// A tiny fixed timestamp is safely older than any real (now - graceWindow)
+	// cutoff, so every seeded row is past the grace window.
+	const aged = int64(1_000_000)
+
+	// seed inserts a delivered (bridged), aged, unscrubbed row whose portal has
+	// fwd_backfill_done unset.
+	seed := func(guid, portalID string) {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: portalID, CloudChatID: "C-" + guid,
+			TimestampMS: aged, Text: "secret", Service: "iMessage", HasBody: true,
+		}}); err != nil {
+			t.Fatalf("upsert %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx,
+			`UPDATE cloud_message SET record_name='r', updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+			aged, testSQLLoginID, guid); err != nil {
+			t.Fatalf("age %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			guid, bridgeID, string(testSQLLoginID)); err != nil {
+			t.Fatalf("insert message %s: %v", guid, err)
+		}
+	}
+	isScrubbed := func(guid string) bool {
+		var text sql.NullString
+		if err := db.QueryRow(ctx,
+			`SELECT text FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid).Scan(&text); err != nil {
+			t.Fatalf("read %s: %v", guid, err)
+		}
+		return !text.Valid
+	}
+
+	// Case 1: backfill DISABLED — a delivered row must scrub even though its
+	// portal's fwd_backfill_done is FALSE. Nothing will ever set it, so gating
+	// would retain plaintext forever.
+	seed("G-DISABLED", "p-disabled")
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, false); err != nil {
+		t.Fatalf("scrubBridgedBodies (backfill disabled): %v", err)
+	}
+	if !isScrubbed("G-DISABLED") {
+		t.Error("delivered row not scrubbed with backfill disabled — plaintext retained forever (privacy regression)")
+	}
+
+	// Case 2: backfill ACTIVE but portal_id IS NULL — no portal whose backfill to
+	// wait on, so it must scrub.
+	seed("G-NULLPORTAL", "placeholder")
+	if _, err := db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=NULL WHERE login_id=$1 AND guid=$2`,
+		testSQLLoginID, "G-NULLPORTAL"); err != nil {
+		t.Fatalf("null portal: %v", err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, true); err != nil {
+		t.Fatalf("scrubBridgedBodies (null portal): %v", err)
+	}
+	if !isScrubbed("G-NULLPORTAL") {
+		t.Error("delivered NULL-portal row not scrubbed with backfill active — should bypass the fwd_backfill_done wait")
+	}
+
+	// Case 3: backfill ACTIVE, real portal, fwd_backfill_done FALSE — must NOT
+	// scrub (the race gate still holds where it matters).
+	seed("G-WAIT", "p-wait")
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil, true); err != nil {
+		t.Fatalf("scrubBridgedBodies (waiting): %v", err)
+	}
+	if isScrubbed("G-WAIT") {
+		t.Error("row scrubbed before fwd_backfill_done with backfill active — reopens the scrub-vs-backfill race")
 	}
 }
 

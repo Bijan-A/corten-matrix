@@ -140,6 +140,22 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// instead of requiring a full re-login.
 	c.tryAutoRestore(ctx)
 
+	// On homeservers without Beeper's batch-send extension, bridgev2's own
+	// backfill queue (RunBackfillQueue) never starts, so the backward-backfill
+	// tasks this connector enqueues would never drain and historical delivery
+	// stalls partway. Run our own drain loop in that case. Started here (once
+	// per process, tied to br.BackgroundCtx which is cancelled on bridge Stop)
+	// rather than per login: the queue is bridge-global and unclaimed, so a
+	// second loop would double-process tasks, and a login-scoped loop would die
+	// when that login logs out. A single loop serves every login because
+	// DoBackfillTask routes each task by its stored user_login_id. On Beeper
+	// (batch send available) bridgev2's queue handles it and this must stay off
+	// to avoid double-processing the same task.
+	if c.Config.UseCloudKitBackfill() && !c.Bridge.Matrix.GetCapabilities().BatchSending {
+		drainLog := c.Bridge.Log.With().Str("component", "backfill_drain").Logger()
+		go c.runSynapseBackfillDrainLoop(c.Bridge.BackgroundCtx, drainLog)
+	}
+
 	return nil
 }
 
@@ -397,6 +413,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		lastGroupForMember:      make(map[string]networkid.PortalKey),
 		restorePipelines:        make(map[string]bool),
 		forwardBackfillSem:      make(chan struct{}, 3),
+		backwardDeferCounts:     make(map[string]int),
 	}
 
 	login.Client = client

@@ -2785,6 +2785,34 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
+// hasScrubbedBackfillableMessages reports whether a portal has non-deleted,
+// deliverable rows whose bodies were cleared by the privacy scrubber
+// (body_scrubbed=TRUE, not a reaction). cloudRowToBackfillMessages skips EVERY
+// such row (see its `row.BodyScrubbed && !isCloudReactionRow` guard) regardless
+// of has_body, so a portal where ALL deliverable rows are scrubbed converts to
+// zero backfill messages — and the forward-backfill empty path would then mark
+// it done with nothing delivered (silent data loss). Forward backfill uses this
+// to decide whether to rehydrate from CloudKit before marking a portal done.
+//
+// The predicate must mirror conversion's skip exactly, so it deliberately does
+// NOT require has_body=TRUE: an attachment-only (photo/video) portal has
+// scrubbed rows with has_body=FALSE, and gating on has_body would let that
+// portal reach the empty path unguarded — the precise silent loss this catches.
+func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		  AND body_scrubbed=TRUE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+	`, s.loginID, portalID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // countBackfillableMessages returns the number of rows FetchMessages can read
 // for a portal (deleted=FALSE and record_name <> ”).
 // When requireContentful is true, only rows with text or attachments count.
@@ -2857,6 +2885,95 @@ func (s *cloudBackfillStore) guidsDeliveredInOtherRoom(ctx context.Context, brid
 		out[id] = roomID
 	}
 	return out, rows.Err()
+}
+
+// guidsWithDeliveredMessage returns the subset of guids that already have a
+// bridgev2 `message` row for this receiver (i.e. were delivered to Matrix).
+// Backfill uses it to drop tapbacks whose target isn't present BEFORE queueing
+// them: such reactions can't render ("Target message for reaction not found")
+// and, in reaction-heavy group chats, queueing thousands of them floods the
+// per-portal event loop (channel-full storm). Filtering here yields the same
+// rendering outcome without the flood. room_id is intentionally not constrained
+// — a target delivered under any room for this receiver is resolvable, matching
+// bridgev2's room-agnostic lookup.
+//
+// A target is "resolvable" if a message row exists whose id resolveTapbackTargetID
+// would land on: the bare guid (text/base part, id == guid) OR a balloon-part
+// suffix (id == "<guid>_attN") for a message delivered only as an attachment.
+// Guids are UUIDs (no underscores), so substr-to-first-underscore normalises a
+// suffixed id back to its bare guid; results are keyed by bare guid to match the
+// bare-guid keys the caller looks up.
+//
+// The input is deduped and chunked at the same 500 the rest of this file uses:
+// a reaction-heavy batch repeats the same few targets thousands of times, and an
+// un-deduped, unchunked IN-list would blow the driver's bind-variable ceiling
+// (SQLite defaults to 999, older builds; 32766, newer) at exactly the ~9k-reaction
+// scale this filter exists to handle — and the caller fails OPEN on error, so a
+// blown limit would resurrect the very flood this prevents.
+func (s *cloudBackfillStore) guidsWithDeliveredMessage(ctx context.Context, bridgeID string, guids []string) (map[string]bool, error) {
+	if len(guids) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(guids))
+	uniq := make([]string, 0, len(guids))
+	for _, g := range guids {
+		if g == "" {
+			continue
+		}
+		if _, dup := seen[g]; dup {
+			continue
+		}
+		seen[g] = struct{}{}
+		uniq = append(uniq, g)
+	}
+	out := make(map[string]bool, len(uniq))
+	instr := sqlInstrFunc(s.db)
+	const chunkSize = 500
+	for start := 0; start < len(uniq); start += chunkSize {
+		end := start + chunkSize
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		batch := uniq[start:end]
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, bridgeID, string(s.loginID))
+		ph := make([]string, len(batch))
+		for i, g := range batch {
+			args = append(args, g)
+			ph[i] = fmt.Sprintf("$%d", i+3)
+		}
+		inList := strings.Join(ph, ", ")
+		// The IN placeholders ($3..) are referenced twice; both dialects in use
+		// (Postgres, SQLite) bind a repeated numbered parameter to the same value.
+		query := strings.ReplaceAll(`SELECT DISTINCT id FROM message
+			WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+			  AND (
+			    id IN (`+inList+`)
+			    OR ({{INSTR}}(id, '_') > 0 AND substr(id, 1, {{INSTR}}(id, '_') - 1) IN (`+inList+`))
+			  )`, "{{INSTR}}", instr)
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			bare := id
+			if i := strings.IndexByte(id, '_'); i > 0 {
+				bare = id[:i]
+			}
+			out[bare] = true
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
 }
 
 func (s *cloudBackfillStore) listBackwardMessages(
@@ -3914,7 +4031,7 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 //
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
 // may scrub the entire backlog of already-delivered messages at once.
-func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string) (int64, error) {
+func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string, backfillActive bool) (int64, error) {
 	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
 	if debugDisablePrivacy {
 		return 0, nil
@@ -3960,6 +4077,33 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
 	// CloudKit-mixed-case matching the EXISTS form had.
 	// instr() is SQLite-only; Postgres spells the same function strpos().
+	//
+	// backfillGate decides WHEN a delivered (bridged) row may be scrubbed. The
+	// UPPER(guid) IN (message set) clause below already proves the row is bridged
+	// to Matrix; this gate adds the "wait for forward backfill" protection ONLY
+	// when backfill is actually the delivery mechanism (backfillActive):
+	//   - Without the gate the periodic scrubber can race ahead of an in-progress
+	//     (or not-yet-run) forward backfill — it clears the body of a row that
+	//     briefly had a `message` row from an earlier attempt, then
+	//     cloudRowToBackfillMessages' body_scrubbed skip drops it and the
+	//     forward-backfill empty path marks the portal done with nothing
+	//     delivered (silent data loss). fwd_backfill_done is set only after
+	//     delivery completes, so gating on it closes that race.
+	//   - But when backfill is DISABLED, forward backfill never runs and
+	//     fwd_backfill_done is never set, so gating on it unconditionally would
+	//     retain plaintext for every bridged row forever (a privacy regression).
+	//     In that mode there is nothing to wait for, so scrub delivered rows now.
+	//   - Rows with a NULL portal_id have no portal whose backfill to wait on, so
+	//     they bypass the wait even while backfill is active.
+	// The deleted=TRUE branch stays ungated in both modes — user-deleted content
+	// must be scrubbed for privacy regardless of backfill state.
+	backfillGate := "TRUE"
+	if backfillActive {
+		backfillGate = `(portal_id IS NULL OR portal_id IN (
+		            SELECT portal_id FROM cloud_chat
+		            WHERE login_id=$1 AND fwd_backfill_done=TRUE
+		          ))`
+	}
 	query := strings.ReplaceAll(`
 		UPDATE cloud_message
 		SET text=NULL,
@@ -3978,13 +4122,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		      AND updated_ts < $2
 		      AND (
 		        deleted=TRUE
-		        OR UPPER(guid) IN (
-		          SELECT UPPER(id) FROM message
-		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
-		          UNION
-		          SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		          WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
-		            AND (room_receiver=$1 OR room_receiver='')
+		        OR (
+		          UPPER(guid) IN (
+		            SELECT UPPER(id) FROM message
+		            WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
+		            UNION
+		            SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		            WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
+		              AND (room_receiver=$1 OR room_receiver='')
+		          )
+		          AND `+backfillGate+`
 		        )
 		      )`+exclusionSQL+`
 		    LIMIT `+limitPlaceholder+`
@@ -4136,8 +4283,21 @@ func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPort
 		exclude[pid] = struct{}{}
 	}
 
-	// Only portals whose contentful row count exceeds the cap have an
-	// unreachable tail; the rest are entirely within the backfill window.
+	// Only portals whose row count exceeds the cap have an unreachable tail; the
+	// rest are entirely within the backfill window.
+	//
+	// This deliberately does NOT restrict to fwd_backfill_done portals. The tail
+	// is "unreachable" independently of backfill state: the per-portal threshold
+	// below is computed with the IDENTICAL predicate and ordering that
+	// listLatestMessages uses to deliver the newest `count` rows in capped mode
+	// (deleted=FALSE AND record_name <> '', ORDER BY timestamp_ms DESC, guid
+	// DESC), and we scrub only rows strictly OLDER than that threshold. So the
+	// newest keepPerPortal rows — everything forward backfill could ever deliver
+	// — are provably never in the scrubbed set, whether or not forward backfill
+	// has run yet. Gating on fwd_backfill_done here was redundant for that safety
+	// and left filtered / never-bridged chats (which have cloud_chat + message
+	// rows but never get a portal, so fwd_backfill_done stays FALSE forever)
+	// retaining their entire plaintext history — the regression this removes.
 	rows, err := s.db.Query(ctx, `
 		SELECT portal_id FROM cloud_message
 		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL

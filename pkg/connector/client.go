@@ -516,6 +516,17 @@ type IMClient struct {
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
 
+	// backwardDeferCounts bounds how long a backward-backfill task waits for
+	// forward backfill to produce an anchor. Forward backfill runs once at portal
+	// creation; if its send fails (e.g. a transient "failed to ensure joined"
+	// during a room-join burst) CompleteCallback/markForwardBackfillDone never
+	// fires, so the room stays empty and backward backfill would defer forever.
+	// Counting consecutive no-anchor deferrals per portal lets FetchMessages give
+	// up waiting after maxBackwardDeferAttempts and self-heal via a recovery
+	// backfill instead of stranding the portal until the next process restart.
+	backwardDeferMu     sync.Mutex
+	backwardDeferCounts map[string]int
+
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
 	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
@@ -1582,15 +1593,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// Notify the management room once CloudKit backfill and Matrix
 		// delivery are fully caught up — see runSyncCompletionNotifyLoop.
 		go c.runSyncCompletionNotifyLoop(log.With().Str("component", "sync_completion").Logger(), c.stopChan)
-		// On homeservers without Beeper's batch-send extension, bridgev2's own
-		// backfill queue (RunBackfillQueue) never starts, so the backward-
-		// backfill tasks this connector enqueues would never drain and
-		// historical delivery stalls partway. Run our own drain loop in that
-		// case. On Beeper (batch send available) bridgev2's queue handles it and
-		// this must stay off to avoid double-processing the same task.
-		if !c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-			go c.runSynapseBackfillDrainLoop(log.With().Str("component", "backfill_drain").Logger(), c.stopChan)
-		}
+		// The Synapse backward-backfill drain loop is no longer started here: it
+		// is bridge-global (one per process, tied to the bridge lifetime, not a
+		// login's stopChan) and is started once from IMConnector.Start. See
+		// runSynapseBackfillDrainLoop.
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -4772,6 +4778,42 @@ func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger
 	}
 }
 
+// rehydrateScrubbedPortal clears the body_scrubbed flag for a portal and
+// re-fetches its messages from CloudKit so scrubbed rows regain their text.
+// Called inline by forward backfill when a portal's deliverable rows were all
+// body-scrubbed before delivery — without repopulating them, conversion yields
+// nothing and the portal would be marked done empty (silent data loss).
+// Returns true if CloudKit repopulated at least one message.
+//
+// This runs on the portal event loop while holding a forward-backfill slot, so
+// it uses only the TARGETED CloudKit fetch (bounded to 50 pages / 5k msgs for
+// this one chat) and disables the unfiltered whole-account fallback: that
+// fallback is a ctx-uninterruptible blocking CGO scan of every chat, and running
+// one per scrubbed portal inline would serialise the entire backfill. The
+// fetchCtx timeout is best-effort only (it cannot interrupt the in-flight CGO
+// call), which is why bounding the WORK via the targeted-only path matters.
+func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logger, portalID string) bool {
+	if c.cloudStore == nil || c.client == nil {
+		return false
+	}
+	if cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID); err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Msg("Rehydrate: failed to clear body_scrubbed flag")
+		return false
+	} else {
+		log.Info().Int("cleared", cleared).Str("portal_id", portalID).
+			Msg("Rehydrate: cleared body_scrubbed, re-fetching from CloudKit")
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(fetchCtx, log, portalID, false)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch failed")
+		return false
+	}
+	log.Info().Int("imported", imported).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch complete")
+	return imported > 0
+}
+
 func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
 	if opts.Notify == nil {
 		return
@@ -4930,7 +4972,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		}
 
 		attemptCtx, attemptCancel := context.WithTimeout(fetchCtx, 2*time.Minute)
-		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID)
+		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID, true)
 		attemptCancel()
 
 		if fetchCtx.Err() != nil {
@@ -5423,7 +5465,7 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 // fetchAndResyncRecoveredChat fetches messages from CloudKit for a recovered
 // chat, imports them into the local cache, then queues ChatResync.
 func (c *IMClient) fetchAndResyncRecoveredChat(log zerolog.Logger, portalKey networkid.PortalKey, portalID string) {
-	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID)
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID, true)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to import CloudKit messages for recovered chat")
 	} else {
@@ -5465,7 +5507,14 @@ func (c *IMClient) safeCloudFetchRecent(log zerolog.Logger, chatID *string, maxP
 // imports matched rows into cloud_message for the given portal.
 // Returns (importedCount, diagnostic, error). diagnostic is non-nil when the
 // unfiltered fallback ran (all targeted fetches returned 0).
-func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string) (int, *restoreFetchDiagnostic, error) {
+//
+// allowUnfilteredFallback controls the last-resort whole-account scan (50 pages
+// / 10k messages) that runs when every targeted fetch returns 0. That scan is
+// acceptable for a one-off user-initiated restore, but it is a blocking, ctx-
+// uninterruptible CGO call that must NOT run inline on the portal event loop
+// during mass backfill (see rehydrateScrubbedPortal) — one such scan per portal,
+// each holding a forward-backfill slot, would serialise the whole run.
+func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string, allowUnfilteredFallback bool) (int, *restoreFetchDiagnostic, error) {
 	if c.cloudStore == nil {
 		return 0, nil, fmt.Errorf("cloud store not initialized")
 	}
@@ -5591,6 +5640,11 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	var diag *restoreFetchDiagnostic
 	if len(matched) == 0 && ctx.Err() != nil {
 		return 0, nil, ctx.Err()
+	}
+	if len(matched) == 0 && !allowUnfilteredFallback {
+		log.Info().Str("portal_id", portalID).
+			Msg("All targeted fetches returned 0 — unfiltered fallback disabled for this caller, returning 0")
+		return 0, nil, nil
 	}
 	if len(matched) == 0 {
 		log.Info().Str("portal_id", portalID).
@@ -7971,6 +8025,17 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
+// maxBackwardDeferAttempts is the MINIMUM no-anchor grace a backward-backfill
+// task gives forward backfill before it may give up. Each deferral sleeps 30s,
+// so this is ~10 min. It is a floor, not a ceiling: the give-up also requires
+// the forward-backfill wave to have fully drained (len(forwardBackfillSem)==0)
+// — otherwise, under the 3-slot forward semaphore across thousands of portals,
+// a portal whose forward backfill is merely queued would be wrongly declared
+// failed and prematurely recovered (see the FetchMessages defer loop). So a
+// portal defers for AT LEAST this long, and longer while forward work is still
+// in flight; only a genuinely stalled/failed forward backfill hits recovery.
+const maxBackwardDeferAttempts = 20
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8173,6 +8238,43 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
 
 		if len(allMessages) == 0 {
+			// CORRECTNESS: before marking the portal done, guard against the
+			// silent-data-loss path. cloudRowToBackfillMessages skips body_scrubbed
+			// rows, so if the privacy scrubber cleared a portal's bodies before
+			// backfill delivered them, conversion produces zero messages here and
+			// marking done would strand real history permanently. Detect that case
+			// and rehydrate from CloudKit, then retry conversion once.
+			if c.cloudStore != nil {
+				if scrubbed, _ := c.cloudStore.hasScrubbedBackfillableMessages(ctx, portalID); scrubbed {
+					log.Warn().Str("portal_id", portalID).
+						Msg("Forward backfill: 0 messages but portal has body-scrubbed deliverable rows — rehydrating from CloudKit before marking done")
+					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
+						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
+						if queryErr != nil {
+							log.Err(queryErr).Str("portal_id", portalID).Msg("Forward backfill: re-query after rehydrate FAILED")
+							return nil, queryErr
+						}
+						for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+							rows[i], rows[j] = rows[j], rows[i]
+						}
+						c.preUploadChunkAttachments(ctx, rows, *log)
+						allRows = rows
+						totalRows = len(rows)
+						allMessages = c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
+					}
+					if len(allMessages) == 0 {
+						// CloudKit had no copy to restore — the scrubbed content is
+						// genuinely unrecoverable. Surface the loss loudly (it was
+						// silent before) and mark done so the backward-backfill queue
+						// doesn't loop forever on an anchor that will never appear.
+						log.Error().Str("portal_id", portalID).
+							Msg("Forward backfill: body-scrubbed rows could not be rehydrated from CloudKit — history unrecoverable, marking done (VISIBLE data loss)")
+					}
+				}
+			}
+		}
+
+		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
 			// Use context.Background() — if the bridge is shutting down, ctx
 			// may be cancelled but we still need to persist the flag.
@@ -8291,15 +8393,45 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// creates an infinite retry loop.
 		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
 			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
-			if hasMessages {
+			if !hasMessages {
 				log.Info().Str("portal_id", portalID).
+					Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
+				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			}
+			// The portal has messages but no anchor yet. Forward backfill runs
+			// exactly once at portal creation, so a missing anchor means it's
+			// either still in progress OR its send failed (e.g. a transient
+			// "failed to ensure joined" during a room-join burst) so
+			// CompleteCallback/markForwardBackfillDone never fired. Bound the wait:
+			// defer for a while (once forward delivers even one message an anchor
+			// exists and this branch is no longer hit), but after
+			// maxBackwardDeferAttempts treat forward as failed and fall through to
+			// the recovery backfill below rather than deferring forever and
+			// permanently stranding the portal. Re-delivery is GUID-deduped, so a
+			// delayed forward backfill later running too is harmless.
+			c.backwardDeferMu.Lock()
+			c.backwardDeferCounts[portalID]++
+			deferCount := c.backwardDeferCounts[portalID]
+			c.backwardDeferMu.Unlock()
+			// Keep deferring while EITHER we're still within the grace bound OR the
+			// forward-backfill wave is still draining. Under a 3-slot semaphore
+			// across thousands of portals, a portal's forward backfill can sit
+			// queued for far longer than the ~10-min grace — so a purely
+			// time-based bound would declare a slow-but-alive portal "failed" and
+			// run a recovery backfill that marks fwd_backfill_done before its real
+			// forward backfill ran (reopening the scrub-gate and group-merge
+			// races). len(forwardBackfillSem) > 0 means forward backfills are still
+			// executing, so ours is plausibly just waiting its turn: don't give up.
+			// Only once the wave has fully drained AND grace is exhausted do we
+			// treat forward as genuinely failed and fall through to recovery.
+			forwardWaveActive := len(c.forwardBackfillSem) > 0
+			if deferCount <= maxBackwardDeferAttempts || forwardWaveActive {
+				log.Info().Str("portal_id", portalID).Int("attempt", deferCount).
+					Bool("forward_wave_active", forwardWaveActive).
 					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
 				// Sleep before returning HasMore=true so the bridgev2 backfill
-				// queue doesn't tight-loop on this task and steal scheduler
-				// time from forward backfill (which we're waiting on). Each
-				// tight-loop iteration was ~1s of pure no-op — with 30+
-				// deferred portals, that's 30+ CPU-seconds per second burned
-				// waiting for a state change that takes minutes to happen.
+				// queue doesn't tight-loop on this task and steal scheduler time
+				// from forward backfill (which we're waiting on).
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -8307,14 +8439,19 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				}
 				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
 			}
-			log.Info().Str("portal_id", portalID).
-				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			log.Warn().Str("portal_id", portalID).Int("attempts", deferCount).
+				Msg("Backward backfill: forward backfill produced no anchor after repeated deferrals — treating it as failed and doing a recovery backfill")
+			c.backwardDeferMu.Lock()
+			delete(c.backwardDeferCounts, portalID)
+			c.backwardDeferMu.Unlock()
+			// fall through to the recovery backfill below
 		}
-		// No anchor but forward backfill is done — this happens for recovered
-		// portals where the room already exists but has no messages (e.g. chat
-		// was deleted and recovered). Fetch the latest messages forward-style
-		// so the portal gets populated.
+		// No anchor, and either forward backfill is done or it failed (the
+		// deferral bound above was exceeded). Either way the room exists but has no
+		// messages — a recovered/deleted chat, or a portal whose forward backfill
+		// send failed. Fetch the latest messages forward-style so the portal gets
+		// populated; the CompleteCallback marks forward done after delivery so the
+		// forward-failed case reaches a consistent, scrubbable state.
 		if c.cloudStore != nil {
 			if hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID); hasMessages {
 				log.Info().Str("portal_id", portalID).
@@ -8360,6 +8497,17 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						Cursor:   nextCursor,
 						HasMore:  hasMore,
 						Forward:  false,
+						// Mark forward done only AFTER bridgev2 delivers this batch
+						// (not before send), so a forward-failed portal recovered here
+						// reaches a consistent fwd_backfill_done state — unblocking the
+						// scrub gate — without the mark-before-send anti-pattern. This
+						// path is now reached only once the forward-backfill wave has
+						// drained and grace is exhausted (see the defer loop), so the
+						// portal's real forward backfill has genuinely failed/skipped
+						// rather than merely being queued — the mark is not premature.
+						CompleteCallback: func() {
+							c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
+						},
 					}, nil
 				}
 			}
@@ -8490,8 +8638,36 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		}
 	}
 
-	// Pass 2: resolve tapbacks — attach to target if in this batch,
-	// otherwise fall back to QueueRemoteEvent.
+	// Pass 2a: pre-resolve which out-of-batch tapback targets are actually
+	// present in bridgev2's message table. A tapback whose target isn't in this
+	// batch AND isn't already delivered can never render — bridgev2 logs "Target
+	// message for reaction not found" and drops it. Queueing those anyway floods
+	// the per-portal event loop (a reaction-heavy group chat produced ~9k such
+	// events → channel-full storm). Batch one query instead of thousands of
+	// doomed QueueRemoteEvents; the rendering outcome is identical because
+	// bridgev2 resolves reaction targets by the same message id == guid.
+	var outOfBatchTargets []string
+	for _, row := range tapbackRows {
+		targetGUID := tapbackTargetGUID(row.TapbackTargetGUID)
+		if targetGUID == "" {
+			continue
+		}
+		if _, inBatch := messageByGUID[targetGUID]; !inBatch {
+			outOfBatchTargets = append(outOfBatchTargets, targetGUID)
+		}
+	}
+	deliveredTargets, derr := c.cloudStore.guidsWithDeliveredMessage(ctx, string(c.Main.Bridge.ID), outOfBatchTargets)
+	if derr != nil {
+		// On query error, fall back to the old behavior (queue everything) rather
+		// than silently drop reactions — correctness over the flood mitigation.
+		log := zerolog.Ctx(ctx)
+		log.Warn().Err(derr).Msg("Tapback target pre-check failed — queueing out-of-batch reactions unfiltered")
+	}
+
+	// Pass 2b: resolve tapbacks — attach to target if in this batch, queue for
+	// out-of-batch targets that are delivered, skip out-of-batch targets that
+	// aren't (they'd be dropped as "target not found" anyway).
+	skippedOrphanReactions := 0
 	for _, row := range tapbackRows {
 		sender := c.makeCloudSender(row)
 		if sender.Sender == "" && !sender.IsFromMe {
@@ -8535,12 +8711,38 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 				TargetPart: targetPart,
 			})
 		} else {
-			// Fall back to QueueRemoteEvent for removes and out-of-batch targets.
+			// Reached for an out-of-batch target OR an in-batch REMOVE (removes
+			// can't use BackfillReaction, which only supports add, so they always
+			// fall back to QueueRemoteEvent here). Only the OUT-OF-BATCH case risks
+			// flooding the loop with "target not found": skip it unless the target
+			// is actually delivered. An IN-BATCH target — only possible for a
+			// remove — is delivered in this very batch, so it's always resolvable
+			// and must never be skipped (skipping it drops the remove, leaving an
+			// added-then-removed reaction rendered forever). On a pre-check error
+			// deliveredTargets is nil and we queue unconditionally (old behavior).
+			if !inBatch && derr == nil && !deliveredTargets[targetGUID] {
+				skippedOrphanReactions++
+				continue
+			}
 			c.cloudTapbackToBackfill(row, sender, time.UnixMilli(row.TimestampMS))
 		}
 	}
+	if skippedOrphanReactions > 0 {
+		zerolog.Ctx(ctx).Debug().
+			Int("skipped", skippedOrphanReactions).
+			Msg("Skipped backfill reactions whose target message was never delivered (would flood event loop as 'target not found')")
+	}
 
 	return messages
+}
+
+// tapbackTargetGUID extracts the bare target GUID from a tapback target field,
+// which may be in "p:N/GUID" balloon-part form.
+func tapbackTargetGUID(raw string) string {
+	if parts := strings.SplitN(raw, "/", 2); len(parts) == 2 {
+		return parts[1]
+	}
+	return raw
 }
 
 // cloudReactionMinType is the lowest tapback_type that denotes a real reaction.
