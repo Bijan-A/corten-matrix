@@ -38,6 +38,20 @@ type IMConfig struct {
 	// chat.db (requires Full Disk Access).
 	BackfillSource string `yaml:"backfill_source"`
 
+	// BridgeFilteredChats controls whether chats iCloud marks "Filtered" (its
+	// Unknown Senders bucket — CloudKit's cloud_chat.is_filtered) get bridged.
+	// This is inherited from the user's iCloud settings, not something set in
+	// the bridge, and it silently drops real content: on one real account this
+	// was ~33k messages across ~2,194 chats — SMS short codes (2FA/OTP),
+	// toll-free/automated senders, and Exchange DN addresses, some of which
+	// (delivery notices, OTPs) users may actually want in Matrix. When false
+	// (default), filtered chats are skipped exactly as before — no portal or
+	// room is created for a chat whose cloud_chat rows are ALL filtered
+	// (a chat that shares a portal_id with a non-filtered sibling via
+	// participant-set keying already bridges regardless of this setting).
+	// When true, filtered chats are treated identically to any other chat.
+	BridgeFilteredChats bool `yaml:"bridge_filtered_chats"`
+
 	// VideoTranscoding enables automatic remuxing/transcoding of non-MP4
 	// videos (e.g. QuickTime .mov) to MP4 for broad Matrix client
 	// compatibility.  Requires ffmpeg to be installed.  Default is false.
@@ -237,6 +251,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "backfill_source")
+	helper.Copy(up.Bool, "bridge_filtered_chats")
 	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
