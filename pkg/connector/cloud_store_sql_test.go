@@ -595,6 +595,72 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 // where every one of the seven queries used literal "?" placeholders. GetDue
 // runs on the attachment retrier's 10s tick, so a broken statement there is a
 // continuous error in production rather than a rare one.
+// TestListPortalCandidatesIncludesMixedFilteredPortal guards the portal-creation
+// candidate query against the mixed-is_filtered stranding bug: participant-set
+// keying can collapse a filtered and a non-filtered iMessage chat onto one
+// portal_id, and a bare "exclude if ANY filtered row" dropped the whole portal —
+// stranding the non-filtered chat's messages (no room, never backfilled). The
+// portal must be a candidate as long as one non-filtered, non-deleted chat row
+// exists; a portal whose only chat rows are filtered must still be excluded.
+func TestListPortalCandidatesIncludesMixedFilteredPortal(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const now = int64(1_700_000_000_000)
+
+	chat := func(cid, portal string, filtered, deleted int) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,$6)`,
+			testSQLLoginID, cid, portal, now, filtered, deleted); err != nil {
+			t.Fatalf("insert chat %s: %v", cid, err)
+		}
+	}
+	msg := func(guid, portal string) {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: portal, CloudChatID: "c", TimestampMS: now,
+			Text: "hi", Service: "iMessage", HasBody: true,
+		}}); err != nil {
+			t.Fatalf("upsert msg %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid); err != nil {
+			t.Fatalf("set record_name %s: %v", guid, err)
+		}
+	}
+
+	// p_mixed: one filtered + one non-filtered chat row, and messages → candidate.
+	chat("cm-filtered", "p_mixed", 1, 0)
+	chat("cm-clean", "p_mixed", 0, 0)
+	msg("g-mixed", "p_mixed")
+	// p_allfiltered: only a filtered chat row → excluded.
+	chat("cf", "p_allfiltered", 1, 0)
+	msg("g-af", "p_allfiltered")
+	// p_clean: one non-filtered chat row → candidate.
+	chat("cc", "p_clean", 0, 0)
+	msg("g-clean", "p_clean")
+
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, p := range got {
+		seen[p.PortalID] = true
+	}
+	if !seen["p_mixed"] {
+		t.Error("p_mixed (has a filtered AND a non-filtered chat row) missing from candidates — mixed-filtered stranding bug")
+	}
+	if !seen["p_clean"] {
+		t.Error("p_clean (non-filtered) missing from candidates")
+	}
+	if seen["p_allfiltered"] {
+		t.Error("p_allfiltered (only filtered chat rows) must be excluded")
+	}
+}
+
 func TestPendingAttachmentStoreRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)

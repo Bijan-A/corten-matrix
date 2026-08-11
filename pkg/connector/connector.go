@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -31,6 +32,14 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
+
+	// drainLoopStarted guards the Synapse backfill drain loop so it starts at
+	// most once per process. Start is invoked once per process by bridgev2 today,
+	// but the queue is bridge-global and unclaimed, so a second loop would
+	// double-process tasks (the duplicate-delivery bug the bridge-scoping fix
+	// prevents). Making the single-start structural rather than relying on the
+	// call-once invariant keeps that guarantee if Start is ever re-invoked.
+	drainLoopStarted sync.Once
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
@@ -152,8 +161,10 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// (batch send available) bridgev2's queue handles it and this must stay off
 	// to avoid double-processing the same task.
 	if c.Config.UseCloudKitBackfill() && !c.Bridge.Matrix.GetCapabilities().BatchSending {
-		drainLog := c.Bridge.Log.With().Str("component", "backfill_drain").Logger()
-		go c.runSynapseBackfillDrainLoop(c.Bridge.BackgroundCtx, drainLog)
+		c.drainLoopStarted.Do(func() {
+			drainLog := c.Bridge.Log.With().Str("component", "backfill_drain").Logger()
+			go c.runSynapseBackfillDrainLoop(c.Bridge.BackgroundCtx, drainLog)
+		})
 	}
 
 	return nil

@@ -3133,9 +3133,22 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
 			)
 		) sub
-		WHERE NOT EXISTS (
-			SELECT 1 FROM cloud_chat fc
-			WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
+		WHERE (
+			-- Skip genuinely-filtered chats, but ONLY when every cloud_chat row for
+			-- this portal is filtered. Participant-set keying can collapse two
+			-- distinct iMessage chats with the same members onto one portal_id — one
+			-- iCloud-filtered, one not. A bare "NOT EXISTS filtered" then suppressed
+			-- creation of the whole portal on the filtered sibling, stranding the
+			-- non-filtered chat's messages (no room, never backfilled). Create the
+			-- portal whenever at least one non-filtered, non-deleted chat row exists.
+			NOT EXISTS (
+				SELECT 1 FROM cloud_chat fc
+				WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
+			)
+			OR EXISTS (
+				SELECT 1 FROM cloud_chat fc
+				WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) = 0 AND fc.deleted = FALSE
+			)
 		)
 		GROUP BY sub.portal_id
 		ORDER BY newest_ts DESC
