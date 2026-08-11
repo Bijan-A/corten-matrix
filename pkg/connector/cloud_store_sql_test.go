@@ -810,7 +810,7 @@ func TestListPortalCandidatesIncludesMixedFilteredPortal(t *testing.T) {
 	chat("cc", "p_clean", 0, 0)
 	msg("g-clean", "p_clean")
 
-	got, err := store.listPortalIDsWithNewestTimestamp(ctx)
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx, false)
 	if err != nil {
 		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
 	}
@@ -826,6 +826,63 @@ func TestListPortalCandidatesIncludesMixedFilteredPortal(t *testing.T) {
 	}
 	if seen["p_allfiltered"] {
 		t.Error("p_allfiltered (only filtered chat rows) must be excluded")
+	}
+}
+
+// TestListPortalCandidatesBridgeFilteredChatsTrue guards the
+// BridgeFilteredChats=true path (issue #5): is_filtered must stop excluding
+// portals altogether, both in the messaged and the chat-only (no messages yet)
+// branch of the query.
+func TestListPortalCandidatesBridgeFilteredChatsTrue(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const now = int64(1_700_000_000_000)
+
+	chat := func(cid, portal string, filtered, deleted int) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,$6)`,
+			testSQLLoginID, cid, portal, now, filtered, deleted); err != nil {
+			t.Fatalf("insert chat %s: %v", cid, err)
+		}
+	}
+	msg := func(guid, portal string) {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: portal, CloudChatID: "c", TimestampMS: now,
+			Text: "hi", Service: "iMessage", HasBody: true,
+		}}); err != nil {
+			t.Fatalf("upsert msg %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid); err != nil {
+			t.Fatalf("set record_name %s: %v", guid, err)
+		}
+	}
+
+	// p_allfiltered: only a filtered chat row, with a message — excluded when
+	// bridgeFilteredChats=false, must be a candidate when true.
+	chat("cf", "p_allfiltered", 1, 0)
+	msg("g-af", "p_allfiltered")
+	// p_chatonly_filtered: filtered chat row, NO messages yet — exercises the
+	// chat-only branch's is_filtered gate specifically.
+	chat("cf2", "p_chatonly_filtered", 1, 0)
+
+	got, err := store.listPortalIDsWithNewestTimestamp(ctx, true)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, p := range got {
+		seen[p.PortalID] = true
+	}
+	if !seen["p_allfiltered"] {
+		t.Error("p_allfiltered must be a candidate when bridgeFilteredChats=true")
+	}
+	if !seen["p_chatonly_filtered"] {
+		t.Error("p_chatonly_filtered (filtered, no messages) must be a candidate when bridgeFilteredChats=true")
 	}
 }
 

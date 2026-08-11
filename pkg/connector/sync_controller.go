@@ -4143,7 +4143,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// from cloud_chat (with 0 messages). Chat-only portals are included so
 	// conversations synced from CloudKit without any resolved messages still
 	// get bridge portals created.
-	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
+	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Config.BridgeFilteredChats)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return

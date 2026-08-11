@@ -13,6 +13,13 @@ cloudkit_backfill: false
 # "chatdb" reads the local macOS chat.db (requires Full Disk Access).
 backfill_source: cloudkit
 
+# Bridge chats iCloud marks "Filtered" (its Unknown Senders bucket). This is
+# inherited from your iCloud settings, not a bridge setting, and when false
+# (default) it silently drops real content — SMS short codes (2FA/OTP),
+# toll-free/automated senders, and unknown-sender messages never get a room.
+# Set to true to bridge these chats like any other.
+bridge_filtered_chats: false
+
 # Enable automatic video transcoding/remuxing of non-MP4 videos (e.g.
 # QuickTime .mov) to MP4 for broad Matrix client compatibility.
 # Requires ffmpeg to be installed on the system.

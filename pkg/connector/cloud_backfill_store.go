@@ -3113,27 +3113,16 @@ type portalWithNewestMessage struct {
 // and chat records, ordered by newest message timestamp descending (most
 // recent activity first). Chat-only portals (no messages) are included with
 // their updated_ts from the cloud_chat table so they still get portals created.
-func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT sub.portal_id, MAX(sub.newest_ts) AS newest_ts, SUM(sub.msg_count) AS msg_count FROM (
-			SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
-			FROM cloud_message
-			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE AND record_name <> ''
-			GROUP BY portal_id
-
-			UNION ALL
-
-			SELECT cc.portal_id, COALESCE(cc.updated_ts, 0) AS newest_ts, 0 AS msg_count
-			FROM cloud_chat cc
-			WHERE cc.login_id=$1 AND cc.portal_id IS NOT NULL AND cc.portal_id <> ''
-			AND COALESCE(cc.is_filtered, 0) = 0
-			AND cc.deleted = FALSE
-			AND cc.portal_id NOT IN (
-				SELECT DISTINCT cm.portal_id FROM cloud_message cm
-				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
-			)
-		) sub
-		WHERE (
+//
+// bridgeFilteredChats mirrors IMConfig.BridgeFilteredChats: when false
+// (default), portals whose cloud_chat rows are ALL iCloud-filtered
+// (unknown-sender/junk) are excluded — a chat sharing a portal_id with a
+// non-filtered sibling via participant-set keying still bridges either way,
+// since that's not "genuinely" filtered (see the comment below). When true,
+// is_filtered is ignored entirely and every chat is a portal candidate.
+func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context, bridgeFilteredChats bool) ([]portalWithNewestMessage, error) {
+	chatOnlyFilteredClause := "AND COALESCE(cc.is_filtered, 0) = 0\n\t\t\t"
+	filteredExclusionClause := `WHERE (
 			-- Skip genuinely-filtered chats, but ONLY when every cloud_chat row for
 			-- this portal is filtered. Participant-set keying can collapse two
 			-- distinct iMessage chats with the same members onto one portal_id — one
@@ -3149,10 +3138,35 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 				SELECT 1 FROM cloud_chat fc
 				WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) = 0 AND fc.deleted = FALSE
 			)
-		)
+		)`
+	if bridgeFilteredChats {
+		chatOnlyFilteredClause = ""
+		filteredExclusionClause = "WHERE TRUE"
+	}
+	query := fmt.Sprintf(`
+		SELECT sub.portal_id, MAX(sub.newest_ts) AS newest_ts, SUM(sub.msg_count) AS msg_count FROM (
+			SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+			FROM cloud_message
+			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE AND record_name <> ''
+			GROUP BY portal_id
+
+			UNION ALL
+
+			SELECT cc.portal_id, COALESCE(cc.updated_ts, 0) AS newest_ts, 0 AS msg_count
+			FROM cloud_chat cc
+			WHERE cc.login_id=$1 AND cc.portal_id IS NOT NULL AND cc.portal_id <> ''
+			%s
+			AND cc.deleted = FALSE
+			AND cc.portal_id NOT IN (
+				SELECT DISTINCT cm.portal_id FROM cloud_message cm
+				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
+			)
+		) sub
+		%s
 		GROUP BY sub.portal_id
 		ORDER BY newest_ts DESC
-	`, s.loginID)
+	`, chatOnlyFilteredClause, filteredExclusionClause)
+	rows, err := s.db.Query(ctx, query, s.loginID)
 	if err != nil {
 		return nil, err
 	}
