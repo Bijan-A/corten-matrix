@@ -1,5 +1,26 @@
 # Dev notes
 
+## Filing GitHub issues / sharing debug output
+
+**Never paste real contact data into an issue, PR, or commit** — phone numbers,
+email addresses, Apple IDs, or iMessage handles belonging to an actual person
+(including your own). This applies to pasted logs, config file excerpts,
+screenshots, and crash reports.
+
+Before filing an issue or attaching debug output:
+- Scrub `pkg/imconfig`-style YAML/JSON of real `+1XXXXXXXXXX` phone numbers,
+  `user@domain` emails, or Apple ID handles — replace with placeholders like
+  `+15555550100` / `user@example.com`.
+- Redact device/session/push tokens the same way as credentials — treat them
+  as secrets even though they aren't API keys.
+- Prefer reproducing the bug with test/throwaway account data over your own
+  real contacts when possible.
+
+If real personal data does end up in a filed issue: edit it immediately to
+redact it, and flag it to a maintainer — GitHub keeps edit history on issues,
+so a plain edit isn't enough; the sensitive revisions need to be purged
+separately (via GitHub support or admin-level history deletion).
+
 ## FFI boundary (Go ↔ Rust)
 
 **Never hand-edit** `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h`. Always regenerate.
