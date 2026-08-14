@@ -95,6 +95,83 @@ func TestPlanGroupConsolidation(t *testing.T) {
 	}
 }
 
+// TestMergeOrphanedGroupRooms guards the issue-#9 fix: a group deferred by
+// groupRoomMoveBudgetPerStartup gets its cloud rows re-keyed to canonical on
+// the SAME startup (reKeyGroupCloudData runs unbudgeted), so on the NEXT
+// startup planGroupConsolidation no longer sees it — its cloud_chat rows
+// already present a single canonical key. mergeOrphanedGroupRooms folds the
+// orphaned gid: room (found by orphanedGroupRoomPortalIDs, keyed by the
+// group's stable group_id rather than its mutable portal_id) back into the
+// plan so moveGroupRooms still re-IDs/tombstones it.
+func TestMergeOrphanedGroupRooms(t *testing.T) {
+	const comma = "tel:+15551111111,tel:+15552222222"
+	const commaB = "tel:+15553333333,tel:+15554444444"
+
+	tests := []struct {
+		name    string
+		groups  []groupConsolidationGroup
+		orphans map[string]string
+		want    []groupConsolidationGroup
+	}{
+		{
+			name:    "no orphans leaves the plan untouched",
+			groups:  []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa"}}},
+			orphans: map[string]string{},
+			want:    []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa"}}},
+		},
+		{
+			// The deferred-then-orphaned case this issue is about: the
+			// participant-key path found nothing (the group's cloud rows are
+			// already canonical), but its old gid: room is still out there.
+			name:    "orphan with no matching group creates a new one",
+			groups:  nil,
+			orphans: map[string]string{"gid:stale": comma},
+			want:    []groupConsolidationGroup{{canonical: comma, members: []string{"gid:stale"}}},
+		},
+		{
+			name:    "orphan folds into an existing group for the same canonical",
+			groups:  []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa"}}},
+			orphans: map[string]string{"gid:stale": comma},
+			want:    []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa", "gid:stale"}}},
+		},
+		{
+			name:    "orphan already present as a member is not duplicated",
+			groups:  []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa", "gid:stale"}}},
+			orphans: map[string]string{"gid:stale": comma},
+			want:    []groupConsolidationGroup{{canonical: comma, members: []string{"gid:aaaa", "gid:stale"}}},
+		},
+		{
+			name: "mixed: one folds in, one creates a new group, sorted by canonical",
+			groups: []groupConsolidationGroup{
+				{canonical: commaB, members: []string{"gid:bbbb"}},
+			},
+			orphans: map[string]string{
+				"gid:stale-b": commaB,
+				"gid:stale-a": comma,
+			},
+			want: []groupConsolidationGroup{
+				{canonical: comma, members: []string{"gid:stale-a"}},
+				{canonical: commaB, members: []string{"gid:bbbb", "gid:stale-b"}},
+			},
+		},
+		{
+			name:    "an orphan mapped to itself (no stale room) is ignored",
+			groups:  nil,
+			orphans: map[string]string{comma: comma},
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeOrphanedGroupRooms(tt.groups, tt.orphans)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("mergeOrphanedGroupRooms() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPlanGroupRoomMoves(t *testing.T) {
 	const comma = "tel:+15551111111,tel:+15552222222"
 

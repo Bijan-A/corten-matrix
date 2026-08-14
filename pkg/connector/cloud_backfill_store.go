@@ -2381,6 +2381,55 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 	return out, rows.Err()
 }
 
+// orphanedGroupRoomPortalIDs finds group Matrix rooms whose bridgev2 portal id
+// is still the old gid:<UUID> key but whose cloud_chat rows for that group_id
+// have already been re-keyed to a different (canonical, participant-set)
+// portal_id — see issue #9. This happens when a group's room move is deferred
+// past groupRoomMoveBudgetPerStartup: reKeyGroupCloudData re-keys every group's
+// cloud rows unbudgeted on every startup, but moveGroupRooms (the actual
+// re-ID/tombstone) is budgeted, so a deferred group's cloud rows become
+// canonical before its room is ever moved. After that, planGroupConsolidation —
+// which discovers groups by reading cloud_chat — no longer sees the group as
+// needing a move (its rows already present a single canonical key), so the
+// gid: room is orphaned permanently: never re-ID'd/tombstoned, and its stale
+// existence makes the canonical portal's own backward backfill collide on
+// message_real_pkey with messages that already live in the gid: room.
+//
+// Rediscovering from the portal side survives the re-key: a gid: portal's UUID
+// is embedded in its own id (see resolveConversationID), and cloud_chat.group_id
+// is never rewritten by reKeyPortalID (only portal_id is), so joining on it
+// finds the group's current canonical portal_id no matter how many times its
+// cloud rows have moved. Returns gid: portal_id -> canonical portal_id for every
+// such stale room; the caller merges these into the normal consolidation plan so
+// the existing budgeted moveGroupRooms path handles the actual room move.
+func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string) (map[string]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT p.id, MIN(cc.portal_id) AS canonical
+		FROM portal p
+		JOIN cloud_chat cc
+		  ON cc.login_id = $1
+		 AND cc.group_id <> ''
+		 AND LOWER(cc.group_id) = LOWER(SUBSTR(p.id, 5))
+		WHERE p.bridge_id = $2 AND p.receiver = $1 AND p.mxid <> '' AND p.id LIKE 'gid:%'
+		  AND cc.portal_id <> p.id
+		GROUP BY p.id
+	`, s.loginID, bridgeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]string)
+	for rows.Next() {
+		var gidPortal, canonical string
+		if err := rows.Scan(&gidPortal, &canonical); err != nil {
+			return nil, err
+		}
+		out[gidPortal] = canonical
+	}
+	return out, rows.Err()
+}
+
 // reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
 // to newPortalID and resets forward-backfill state so the re-keyed messages
 // re-backfill into the new portal's room. updated_ts is bumped so the portal

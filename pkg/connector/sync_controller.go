@@ -3906,6 +3906,44 @@ func planGroupConsolidation(entries []groupConsolidationEntry) []groupConsolidat
 	return out
 }
 
+// mergeOrphanedGroupRooms folds gid: rooms discovered by
+// orphanedGroupRoomPortalIDs into the consolidation plan produced by
+// planGroupConsolidation. Each orphan maps a stale gid: portal to the
+// canonical portal_id its cloud rows already point to (see issue #9): if a
+// group for that canonical already exists (found via the participant-key
+// path), the orphan is folded in as an extra member; otherwise a new group is
+// created with the orphan as its sole member, so moveGroupRooms re-IDs it onto
+// the canonical key on the next budgeted pass. Pure logic — the testable core
+// of the rediscovery this fixes.
+func mergeOrphanedGroupRooms(groups []groupConsolidationGroup, orphans map[string]string) []groupConsolidationGroup {
+	byCanonical := make(map[string]int, len(groups))
+	for i, g := range groups {
+		byCanonical[g.canonical] = i
+	}
+	gidPortals := make([]string, 0, len(orphans))
+	for gidPortal := range orphans {
+		gidPortals = append(gidPortals, gidPortal)
+	}
+	sort.Strings(gidPortals)
+	for _, gidPortal := range gidPortals {
+		canonical := orphans[gidPortal]
+		if canonical == "" || gidPortal == canonical {
+			continue
+		}
+		if i, ok := byCanonical[canonical]; ok {
+			if !containsString(groups[i].members, gidPortal) {
+				groups[i].members = append(groups[i].members, gidPortal)
+				sort.Strings(groups[i].members)
+			}
+			continue
+		}
+		byCanonical[canonical] = len(groups)
+		groups = append(groups, groupConsolidationGroup{canonical: canonical, members: []string{gidPortal}})
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].canonical < groups[j].canonical })
+	return groups
+}
+
 // consolidateGroupPortals collapses groups sharded across multiple
 // gid: rooms into one room per participant set: re-keys each duplicate's cloud
 // rows to the canonical participant key, merges the rooms, and lets ChatResync
@@ -3922,9 +3960,6 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 		log.Warn().Err(err).Msg("Failed to list group chats for consolidation")
 		return
 	}
-	if len(chats) == 0 {
-		return
-	}
 
 	entries := make([]groupConsolidationEntry, 0, len(chats))
 	for _, chat := range chats {
@@ -3938,6 +3973,21 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 	}
 
 	groups := planGroupConsolidation(entries)
+
+	// Rediscover gid: rooms whose move was deferred on a prior startup: their
+	// cloud rows are already canonical (so the participant-key path above no
+	// longer sees them as needing anything), but their Matrix room was never
+	// re-ID'd/tombstoned onto the canonical key. Checked even when the
+	// participant-key path above found nothing to do, since an orphan can be
+	// the only thing left to consolidate. See orphanedGroupRoomPortalIDs.
+	if orphans, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID)); oErr != nil {
+		log.Warn().Err(oErr).Msg("Failed to look up orphaned gid: group rooms")
+	} else if len(orphans) > 0 {
+		groups = mergeOrphanedGroupRooms(groups, orphans)
+		log.Info().Int("orphaned_rooms", len(orphans)).
+			Msg("Found gid: group rooms orphaned by a prior deferred consolidation")
+	}
+
 	if len(groups) == 0 {
 		return
 	}
