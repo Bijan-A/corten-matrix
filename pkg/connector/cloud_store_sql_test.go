@@ -767,7 +767,8 @@ func TestReconcileGappedPortalsFlagsUndeliveredContent(t *testing.T) {
 // reads cloud_chat.portal_id) no longer sees it as needing a move — its Matrix
 // room is stuck at the old gid:<UUID> key forever. orphanedGroupRoomPortalIDs
 // must find that stale room by joining on cloud_chat.group_id, which
-// reKeyPortalID never rewrites (only portal_id is re-keyed).
+// reKeyPortalID never rewrites (only portal_id is re-keyed) — and on
+// cloud_chat_id, since a legacy room's UUID may be the chat_id instead.
 func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
@@ -817,11 +818,29 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	// nothing to rediscover (handled by portal creation, not a room move).
 	chat("c-noroom", "dddd", "tel:+5,tel:+6")
 
+	// p_chatkeyed: legacy room keyed by the chat_id rather than the group_id.
+	// normalizeGroupChatPortalIDs moved this row's portal_id off gid:<chat_id>
+	// without touching the room, then re-keying carried it to canonical — so
+	// the room is orphaned exactly like p_orphan, but is only reachable by
+	// matching cloud_chat_id. Joining on group_id alone leaves it stranded.
+	room("gid:eeee")
+	chat("eeee", "ffff", "tel:+7,tel:+8")
+
+	// p_normalized: also chat_id-keyed, but its rows are still at
+	// gid:<group_id> — not yet consolidated onto a participant key. Out of
+	// scope here: the canonical would itself be a gid: key. Excluded by the
+	// `portal_id NOT LIKE 'gid:%'` guard, left to the participant-key path.
+	room("gid:gggg")
+	chat("gggg", "hhhh", "gid:hhhh")
+
 	got, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
 	if err != nil {
 		t.Fatalf("orphanedGroupRoomPortalIDs: %v", err)
 	}
-	want := map[string]string{"gid:aaaa": "tel:+1,tel:+2"}
+	want := map[string]string{
+		"gid:aaaa": "tel:+1,tel:+2",
+		"gid:eeee": "tel:+7,tel:+8",
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("orphanedGroupRoomPortalIDs() = %#v, want %#v", got, want)
 	}

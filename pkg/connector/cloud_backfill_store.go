@@ -2402,6 +2402,19 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 // cloud rows have moved. Returns gid: portal_id -> canonical portal_id for every
 // such stale room; the caller merges these into the normal consolidation plan so
 // the existing budgeted moveGroupRooms path handles the actual room move.
+//
+// The UUID in a legacy gid: room can be the chat_id rather than the group_id:
+// normalizeGroupChatPortalIDs rewrites cloud_chat.portal_id from gid:<chat_id>
+// to gid:<group_id> but never touches the portal table, so the room keeps the
+// chat_id key while its rows move on without it. getGroupIDForPortalID carries
+// the same cloud_chat_id fallback for the same reason; without it here, those
+// rooms stay orphaned by the very query meant to rescue them.
+//
+// The join is deliberately restricted to rows whose portal_id has already left
+// gid: space (NOT LIKE 'gid:%'). A chat_id-keyed room whose rows are still at
+// gid:<group_id> is a different problem — its canonical target would itself be
+// a gid: key, which is not what moveGroupRooms is being handed here — and is
+// left for the normal participant-key path rather than widened into this one.
 func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string) (map[string]string, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT p.id, MIN(cc.portal_id) AS canonical
@@ -2409,9 +2422,11 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 		JOIN cloud_chat cc
 		  ON cc.login_id = $1
 		 AND cc.group_id <> ''
-		 AND LOWER(cc.group_id) = LOWER(SUBSTR(p.id, 5))
+		 AND (LOWER(cc.group_id) = LOWER(SUBSTR(p.id, 5))
+		      OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(p.id, 5)))
 		WHERE p.bridge_id = $2 AND p.receiver = $1 AND p.mxid <> '' AND p.id LIKE 'gid:%'
 		  AND cc.portal_id <> p.id
+		  AND cc.portal_id NOT LIKE 'gid:%'
 		GROUP BY p.id
 	`, s.loginID, bridgeID)
 	if err != nil {
