@@ -192,6 +192,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdSyncSpace,
 		cmdContacts,
 		cmdClearIdentityCache,
+		cmdSplitChats,
 	}
 	if !disableFaceTime {
 		cmds = append(cmds,
@@ -1646,4 +1647,109 @@ func fnMsgDebug(ce *commands.Event) {
 	}
 
 	ce.Reply(sb.String())
+}
+
+// cmdSplitChats reports conversations that have been bridged into more than one
+// portal, keyed on the iMessage group_id (see issue #10).
+//
+// Read-only by design. Merging two POPULATED rooms is not a room move: on a
+// homeserver without MSC2716 batch-send, historical events can only be
+// appended, so the survivor has to be rebuilt oldest-to-newest into a fresh
+// room. That is a much larger change, and it needs the DP-off ghost-sent
+// backfill from issue #7 to interleave the user's own messages correctly. This
+// command exists to size and verify the problem in the meantime — and to tell
+// the cheap cases (one populated room plus empty shells) apart from the
+// expensive ones before any of that is built.
+var cmdSplitChats = &commands.FullHandler{
+	Name:          "split-chats",
+	Func:          fnSplitChats,
+	RequiresLogin: true,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "List conversations bridged into more than one room.",
+	},
+}
+
+func fnSplitChats(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("Not logged in.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	if client.cloudStore == nil {
+		ce.Reply("CloudKit backfill not enabled — nothing to check.")
+		return
+	}
+
+	splits, err := client.cloudStore.findSplitConversations(ce.Ctx, string(client.Main.Bridge.ID))
+	if err != nil {
+		ce.Reply("Failed to look for split conversations: %v", err)
+		return
+	}
+	ce.Reply(formatSplitConversations(splits))
+}
+
+// formatSplitConversations renders the report. Split out from the handler so
+// the wording is testable without a bridge.
+//
+// Conversations are grouped by what a merge would actually cost, because that
+// is the decision the report exists to inform: rooms that are partitioned need
+// a rebuild, empty shells do not.
+func formatSplitConversations(splits []splitConversation) string {
+	if len(splits) == 0 {
+		return "No split conversations: every iMessage `group_id` maps to a single portal."
+	}
+
+	var rebuild, shells []splitConversation
+	for _, split := range splits {
+		if split.NeedsRebuild() {
+			rebuild = append(rebuild, split)
+		} else {
+			shells = append(shells, split)
+		}
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "**%d conversation(s) bridged into more than one room.**\n\n", len(splits))
+
+	if len(rebuild) > 0 {
+		fmt.Fprintf(&sb, "**Partitioned — %d.** Content is spread across rooms, so no single room "+
+			"holds the full history. Merging these means rebuilding into a fresh room "+
+			"(historical events can only be appended on Synapse), so they are reported, not repaired.\n\n", len(rebuild))
+		for _, split := range rebuild {
+			writeSplitConversation(&sb, split)
+		}
+	}
+
+	if len(shells) > 0 {
+		fmt.Fprintf(&sb, "**Empty duplicates — %d.** One room holds everything and the rest are empty "+
+			"shells; these are the cheap case, absorbable by a room move.\n\n", len(shells))
+		for _, split := range shells {
+			writeSplitConversation(&sb, split)
+		}
+	}
+
+	sb.WriteString("_Handles and room IDs below are your own data — scrub them before pasting into an issue._")
+	return sb.String()
+}
+
+func writeSplitConversation(sb *strings.Builder, split splitConversation) {
+	kind := "group"
+	if split.IsDirect() {
+		kind = "direct"
+	}
+	fmt.Fprintf(sb, "- `%s` (%s)\n", split.GroupID, kind)
+	for _, shard := range split.Shards {
+		room := string(shard.MXID)
+		if room == "" {
+			room = "no room"
+		}
+		fmt.Fprintf(sb, "    - `%s` — %d msg — %s\n", shard.PortalID, shard.Messages, room)
+	}
+	sb.WriteString("\n")
 }
