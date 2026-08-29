@@ -79,10 +79,56 @@ func (s splitConversation) NeedsRebuild() bool {
 	return s.PopulatedShards() > 1
 }
 
-// splitConversationRow is one (group_id, portal_id) pair as stored.
+// splitConversationRow is one (group_id, portal_id) pair as stored, with the
+// iCloud "Filtered" (unknown-sender/junk) flag that decides whether the bridge
+// would ever give that portal a room.
 type splitConversationRow struct {
 	GroupID  string
 	PortalID string
+	Filtered bool
+}
+
+// splitConversationReport is what the diagnostic returns.
+type splitConversationReport struct {
+	Splits []splitConversation
+	// FilteredPortalsExcluded counts portals left out because iCloud marks
+	// every one of their chats "Filtered" and bridge_filtered_chats is off, so
+	// the bridge never creates a room for them. Surfaced rather than silently
+	// dropped: "you have a filtered sibling" is a different situation from
+	// "this conversation is whole", and the reader should be able to tell.
+	FilteredPortalsExcluded int
+}
+
+// filterUnbridgedPortals drops rows belonging to portals the bridge would never
+// create a room for, so a chat that was never meant to be bridged is not
+// reported as a duplicate of one that was.
+//
+// Mirrors listPortalIDsWithNewestTimestamp's rule, which is per-PORTAL and not
+// per-row: participant-set keying can collapse two distinct iMessage chats onto
+// one portal_id, one filtered and one not, and such a portal still bridges. So a
+// portal is only excluded when every one of its live rows is filtered. When
+// bridge_filtered_chats is on, is_filtered is ignored entirely, exactly as it is
+// there.
+func filterUnbridgedPortals(rows []splitConversationRow, bridgeFilteredChats bool) (kept []splitConversationRow, excludedPortals int) {
+	if bridgeFilteredChats {
+		return rows, 0
+	}
+	anyUnfiltered := make(map[string]bool)
+	for _, row := range rows {
+		if !row.Filtered {
+			anyUnfiltered[row.PortalID] = true
+		}
+	}
+	excluded := make(map[string]bool)
+	kept = make([]splitConversationRow, 0, len(rows))
+	for _, row := range rows {
+		if anyUnfiltered[row.PortalID] {
+			kept = append(kept, row)
+			continue
+		}
+		excluded[row.PortalID] = true
+	}
+	return kept, len(excluded)
 }
 
 // groupSplitConversations folds flat rows into one entry per group_id that maps
@@ -148,37 +194,46 @@ func sortShards(shards []splitConversationShard) {
 // problem described in issue #10 before any merging is attempted, and to let a
 // repair be verified afterwards.
 //
+// bridgeFilteredChats mirrors IMConfig.BridgeFilteredChats so the report
+// describes the portals this bridge actually creates: with it off (the
+// default), a chat iCloud marks "Filtered" never gets a room, and counting it
+// as a duplicate of one that did would be a false positive.
+//
 // Deliberately three small queries rather than one join. cloud_chat is small,
 // so the discovery pass is cheap; the counts and room lookups are then scoped
 // to just the handful of portals actually involved, which keeps them on the
 // (login_id, portal_id, ...) index instead of aggregating over the whole of
 // cloud_message — hundreds of thousands of rows on a real account.
-func (s *cloudBackfillStore) findSplitConversations(ctx context.Context, bridgeID string) ([]splitConversation, error) {
+func (s *cloudBackfillStore) findSplitConversations(ctx context.Context, bridgeID string, bridgeFilteredChats bool) (splitConversationReport, error) {
+	var report splitConversationReport
 	rows, err := s.db.Query(ctx, `
-		SELECT group_id, portal_id FROM cloud_chat
+		SELECT group_id, portal_id, COALESCE(is_filtered, 0) FROM cloud_chat
 		 WHERE login_id=$1 AND deleted=FALSE AND group_id <> '' AND portal_id <> ''`,
 		s.loginID,
 	)
 	if err != nil {
-		return nil, err
+		return report, err
 	}
 	var flat []splitConversationRow
 	for rows.Next() {
 		var row splitConversationRow
-		if err := rows.Scan(&row.GroupID, &row.PortalID); err != nil {
+		var filtered int
+		if err := rows.Scan(&row.GroupID, &row.PortalID, &filtered); err != nil {
 			rows.Close()
-			return nil, err
+			return report, err
 		}
+		row.Filtered = filtered != 0
 		flat = append(flat, row)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return report, err
 	}
 
+	flat, report.FilteredPortalsExcluded = filterUnbridgedPortals(flat, bridgeFilteredChats)
 	splits := groupSplitConversations(flat)
 	if len(splits) == 0 {
-		return nil, nil
+		return report, nil
 	}
 
 	portalIDs := make([]string, 0, len(splits)*2)
@@ -190,11 +245,11 @@ func (s *cloudBackfillStore) findSplitConversations(ctx context.Context, bridgeI
 
 	counts, err := s.messageCountsByPortal(ctx, portalIDs)
 	if err != nil {
-		return nil, err
+		return report, err
 	}
 	mxids, err := s.roomIDsByPortal(ctx, bridgeID, portalIDs)
 	if err != nil {
-		return nil, err
+		return report, err
 	}
 	for i := range splits {
 		for j := range splits[i].Shards {
@@ -204,7 +259,8 @@ func (s *cloudBackfillStore) findSplitConversations(ctx context.Context, bridgeI
 		}
 		sortShards(splits[i].Shards)
 	}
-	return splits, nil
+	report.Splits = splits
+	return report, nil
 }
 
 // inPlaceholders renders a portable "IN ($3, $4, ...)" list starting at the

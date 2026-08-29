@@ -132,11 +132,11 @@ func TestInPlaceholders(t *testing.T) {
 // TestFormatSplitConversations checks the report separates the expensive cases
 // from the cheap ones, since that split is the point of running it.
 func TestFormatSplitConversations(t *testing.T) {
-	if got := formatSplitConversations(nil); !strings.Contains(got, "No split conversations") {
+	if got := formatSplitConversations(splitConversationReport{}); !strings.Contains(got, "No split conversations") {
 		t.Errorf("empty report = %q, want the all-clear wording", got)
 	}
 
-	report := formatSplitConversations([]splitConversation{
+	report := formatSplitConversations(splitConversationReport{Splits: []splitConversation{
 		{GroupID: "g-partitioned", Shards: []splitConversationShard{
 			{PortalID: "tel:+15551230000", Messages: 6916, MXID: "!a:hs"},
 			{PortalID: "mailto:sam@example.com", Messages: 3125, MXID: "!b:hs"},
@@ -145,7 +145,7 @@ func TestFormatSplitConversations(t *testing.T) {
 			{PortalID: "gid:abcd", Messages: 812, MXID: "!c:hs"},
 			{PortalID: "tel:+1,tel:+2", Messages: 0},
 		}},
-	})
+	}})
 	for _, want := range []string{
 		"2 conversation(s)", "Partitioned — 1", "Empty duplicates — 1",
 		"g-partitioned", "g-shell", "6916", "no room", "(direct)", "(group)",
@@ -184,6 +184,13 @@ func TestFindSplitConversationsRunsOnSQLite(t *testing.T) {
 			t.Fatalf("insert chat %s: %v", cid, err)
 		}
 	}
+	filteredChat := func(cid, groupID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,1,0)`,
+			testSQLLoginID, cid, groupID, portalID, now); err != nil {
+			t.Fatalf("insert filtered chat %s: %v", cid, err)
+		}
+	}
 	room := func(portalID string) {
 		if _, err := db.Exec(ctx,
 			`INSERT INTO portal (bridge_id, id, receiver, mxid) VALUES ($1,$2,$3,$4)`,
@@ -220,14 +227,24 @@ func TestFindSplitConversationsRunsOnSQLite(t *testing.T) {
 	chat("c-whole", "g-whole", "gid:abcd")
 	room("gid:abcd")
 
-	got, err := store.findSplitConversations(ctx, bridgeID)
+	// Not a split either: the second portal's only chat is iCloud-filtered, so
+	// with bridge_filtered_chats off the bridge never gives it a room. Counting
+	// it as a duplicate of the bridged one would be a false positive.
+	chat("c-known", "g-filtered", "tel:+15559990000")
+	room("tel:+15559990000")
+	filteredChat("c-junk", "g-filtered", "tel:+15559991111")
+
+	got, err := store.findSplitConversations(ctx, bridgeID, false)
 	if err != nil {
 		t.Fatalf("findSplitConversations: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("found %d split conversations, want 1: %+v", len(got), got)
+	if got.FilteredPortalsExcluded != 1 {
+		t.Errorf("FilteredPortalsExcluded = %d, want 1", got.FilteredPortalsExcluded)
 	}
-	split := got[0]
+	if len(got.Splits) != 1 {
+		t.Fatalf("found %d split conversations, want 1: %+v", len(got.Splits), got.Splits)
+	}
+	split := got.Splits[0]
 	if split.GroupID != "g-direct" {
 		t.Errorf("group_id = %q, want g-direct", split.GroupID)
 	}
@@ -249,5 +266,69 @@ func TestFindSplitConversationsRunsOnSQLite(t *testing.T) {
 	}
 	if split.Shards[0].MXID != "!room-tel:+15551230000:hs" {
 		t.Errorf("shard[0].MXID = %q, want the portal's room", split.Shards[0].MXID)
+	}
+}
+
+// TestFilterUnbridgedPortals pins the filtered-chat rule, which is per-PORTAL
+// and not per-row.
+//
+// Participant-set keying can collapse two distinct iMessage chats onto one
+// portal_id, one iCloud-filtered and one not; such a portal still bridges, so
+// dropping rows individually would wrongly hide it. Only a portal whose every
+// live row is filtered is excluded.
+func TestFilterUnbridgedPortals(t *testing.T) {
+	rows := []splitConversationRow{
+		{GroupID: "g", PortalID: "p-clean", Filtered: false},
+		{GroupID: "g", PortalID: "p-junk", Filtered: true},
+		// Mixed: one filtered chat and one not, sharing a portal. Bridges.
+		{GroupID: "g", PortalID: "p-mixed", Filtered: true},
+		{GroupID: "g", PortalID: "p-mixed", Filtered: false},
+	}
+
+	kept, excluded := filterUnbridgedPortals(rows, false)
+	if excluded != 1 {
+		t.Errorf("excluded = %d, want 1 (only p-junk)", excluded)
+	}
+	seen := map[string]bool{}
+	for _, row := range kept {
+		seen[row.PortalID] = true
+	}
+	if seen["p-junk"] {
+		t.Error("p-junk survived; a portal whose every row is filtered is never bridged")
+	}
+	if !seen["p-clean"] || !seen["p-mixed"] {
+		t.Errorf("kept = %v, want p-clean and p-mixed", seen)
+	}
+
+	// With the option on, is_filtered is ignored entirely.
+	kept, excluded = filterUnbridgedPortals(rows, true)
+	if excluded != 0 || len(kept) != len(rows) {
+		t.Errorf("bridgeFilteredChats=true: kept %d/%d rows, excluded %d; want all kept, none excluded",
+			len(kept), len(rows), excluded)
+	}
+}
+
+// TestFormatSplitConversationsNotesFilteredExclusions makes sure a count that
+// looks lower than expected carries its reason, in both the all-clear and the
+// populated report.
+func TestFormatSplitConversationsNotesFilteredExclusions(t *testing.T) {
+	clean := formatSplitConversations(splitConversationReport{FilteredPortalsExcluded: 3})
+	if !strings.Contains(clean, "3 portal(s) were excluded") || !strings.Contains(clean, "bridge_filtered_chats") {
+		t.Errorf("all-clear report should explain the exclusions:\n%s", clean)
+	}
+
+	withSplits := formatSplitConversations(splitConversationReport{
+		Splits: []splitConversation{{GroupID: "g", Shards: []splitConversationShard{
+			{PortalID: "tel:+1", Messages: 2}, {PortalID: "tel:+2", Messages: 1},
+		}}},
+		FilteredPortalsExcluded: 2,
+	})
+	if !strings.Contains(withSplits, "2 portal(s) were excluded") {
+		t.Errorf("populated report should explain the exclusions:\n%s", withSplits)
+	}
+
+	none := formatSplitConversations(splitConversationReport{})
+	if strings.Contains(none, "were excluded") {
+		t.Errorf("no exclusions should mean no note:\n%s", none)
 	}
 }

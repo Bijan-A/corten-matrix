@@ -1686,12 +1686,13 @@ func fnSplitChats(ce *commands.Event) {
 		return
 	}
 
-	splits, err := client.cloudStore.findSplitConversations(ce.Ctx, string(client.Main.Bridge.ID))
+	report, err := client.cloudStore.findSplitConversations(
+		ce.Ctx, string(client.Main.Bridge.ID), client.Main.Config.BridgeFilteredChats)
 	if err != nil {
 		ce.Reply("Failed to look for split conversations: %v", err)
 		return
 	}
-	ce.Reply(formatSplitConversations(splits))
+	ce.Reply(formatSplitConversations(report))
 }
 
 // formatSplitConversations renders the report. Split out from the handler so
@@ -1700,9 +1701,11 @@ func fnSplitChats(ce *commands.Event) {
 // Conversations are grouped by what a merge would actually cost, because that
 // is the decision the report exists to inform: rooms that are partitioned need
 // a rebuild, empty shells do not.
-func formatSplitConversations(splits []splitConversation) string {
+func formatSplitConversations(report splitConversationReport) string {
+	splits := report.Splits
 	if len(splits) == 0 {
-		return "No split conversations: every iMessage `group_id` maps to a single portal."
+		return "No split conversations: every iMessage `group_id` maps to a single bridged portal." +
+			formatFilteredNote(report.FilteredPortalsExcluded)
 	}
 
 	var rebuild, shells []splitConversation
@@ -1734,8 +1737,24 @@ func formatSplitConversations(splits []splitConversation) string {
 		}
 	}
 
-	sb.WriteString("_Handles and room IDs below are your own data — scrub them before pasting into an issue._")
+	sb.WriteString(strings.TrimPrefix(formatFilteredNote(report.FilteredPortalsExcluded), " "))
+	if report.FilteredPortalsExcluded > 0 {
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("_Handles and room IDs above are your own data — scrub them before pasting into an issue._")
 	return sb.String()
+}
+
+// formatFilteredNote explains portals the report deliberately left out, so a
+// count that looks lower than expected has a visible reason rather than looking
+// like the diagnostic missed something.
+func formatFilteredNote(excluded int) string {
+	if excluded == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" %d portal(s) were excluded because iCloud marks every one of their chats "+
+		"\"Filtered\" and `bridge_filtered_chats` is off, so the bridge never creates a room for them. "+
+		"Set that option to true if you want them bridged and counted here.", excluded)
 }
 
 func writeSplitConversation(sb *strings.Builder, split splitConversation) {
