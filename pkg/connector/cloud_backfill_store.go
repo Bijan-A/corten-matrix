@@ -4265,22 +4265,66 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	return count > 0, nil
 }
 
-// pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
-// record_name is not referenced by any live (non-deleted) cloud_message row.
-// This prevents unbounded growth after portal deletions or message tombstones
-// remove the messages that originally needed those cached attachments.
-func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
-	result, err := s.db.Exec(ctx, `
-		DELETE FROM cloud_attachment_cache
-		WHERE login_id=$1
-		  AND record_name NOT IN (
+// referencedAttachmentRecordNames returns the subquery selecting every
+// record_name still referenced by a live cloud_message row's attachments_json.
+//
+// There is no portable spelling. SQLite's JSON1 exposes json_each() as a table
+// function straight over a TEXT column, with json_extract() paths; Postgres has
+// json_each(json) — so a TEXT column fails to resolve at all ("function
+// json_each(text) does not exist") — and no json_extract() whatsoever, wanting
+// jsonb_array_elements() over an explicit cast and the ->> operator instead.
+// This shipped SQLite-only, so the prune has never run on Postgres and the
+// cache has been growing unchecked there.
+//
+// Two things the obvious Postgres translation gets wrong:
+//
+//   - The IS NOT NULL guard is load-bearing and must survive. The caller uses
+//     NOT IN, and a single NULL anywhere in this result makes NOT IN evaluate
+//     to NULL for every row, so the DELETE silently removes nothing. Dropping
+//     the guard would swap one silent no-op for another.
+//
+//   - NULLIF is not decoration. A set-returning function in FROM is expanded
+//     before WHERE filters it, so the empty-string guard in the WHERE clause
+//     below cannot protect the cast: casting an empty string to jsonb raises
+//     "invalid input syntax for type json" and aborts the whole statement.
+//     NULLIF turns it into NULL first, and jsonb_array_elements is strict, so
+//     a NULL yields no rows.
+func referencedAttachmentRecordNames(db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return `
+			SELECT DISTINCT je->>'record_name'
+			FROM cloud_message,
+			     jsonb_array_elements(NULLIF(cloud_message.attachments_json, '')::jsonb) AS je
+			WHERE cloud_message.login_id=$1
+			  AND cloud_message.deleted=FALSE
+			  AND cloud_message.attachments_json IS NOT NULL
+			  AND cloud_message.attachments_json <> ''
+			  AND je->>'record_name' IS NOT NULL`
+	}
+	return `
 			SELECT DISTINCT json_extract(je.value, '$.record_name')
 			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
 			WHERE cloud_message.login_id=$1
 			  AND cloud_message.deleted=FALSE
 			  AND cloud_message.attachments_json IS NOT NULL
 			  AND cloud_message.attachments_json <> ''
-			  AND json_extract(je.value, '$.record_name') IS NOT NULL
+			  AND json_extract(je.value, '$.record_name') IS NOT NULL`
+}
+
+// pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
+// record_name is not referenced by any live (non-deleted) cloud_message row.
+// This prevents unbounded growth after portal deletions or message tombstones
+// remove the messages that originally needed those cached attachments.
+//
+// Both dialects still assume attachments_json holds a valid JSON array when it
+// is non-empty, which the writer guarantees (it is either "" or the marshalled
+// []cloudAttachmentRow). A malformed row would abort the statement on either
+// database, exactly as it did before.
+func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
+	result, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_attachment_cache
+		WHERE login_id=$1
+		  AND record_name NOT IN (`+referencedAttachmentRecordNames(s.db)+`
 		  )
 	`, s.loginID)
 	if err != nil {
