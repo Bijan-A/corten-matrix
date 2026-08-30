@@ -8169,6 +8169,99 @@ func (c *IMClient) isReconcile(portalID string) bool {
 	return c.reconcilePortals[portalID]
 }
 
+// dropAlreadyBridgedElsewhere removes backfill messages whose GUID already has
+// a bridgev2 `message` row under a DIFFERENT room for this login.
+//
+// Such a message can never be saved. The uniqueness constraint is
+// room-agnostic —
+//
+//	message_real_pkey UNIQUE (bridge_id, room_receiver, id, part_id)
+//
+// — deliberately so (upgrade 05 dropped the old constraint to add
+// room_receiver; room_id has never been part of it). A GUID can therefore be
+// persisted only once per login, whatever room it lands in.
+//
+// bridgev2 sends each part to Matrix BEFORE inserting its row (portal.go:2889
+// then 2909) and only logs the insert error, so when the insert collides the
+// Matrix event survives with no `message` row behind it. The next startup's
+// backfill still finds no record of that GUID for this portal, sends it again,
+// and collides again: one visible duplicate per restart, forever, and nothing
+// dedupes them afterwards because none of them has a row.
+//
+// The precondition is one remote conversation split across two portals, which
+// happens two ways here: self-chats, where iMessage keeps a single thread
+// across every handle on the account but the portal is keyed per handle; and
+// contact-merged DMs, where resolveContactPortalID redirects an incoming DM to
+// an existing portal for another of the contact's handles while the cloud rows
+// keep the original key. Both leave cloud_message.portal_id and message.room_id
+// permanently disagreeing.
+//
+// Dropping here rather than reacting to the failed insert is the difference
+// between never creating the duplicate and having to redact it: the insert
+// itself is inside bridgev2, where this connector cannot intervene.
+//
+// Deliberately scoped to rows in a DIFFERENT room. A row in THIS portal is the
+// ordinary already-delivered case that the existing skip/reconcile logic owns,
+// and suppressing those here would silently change re-dispatch behaviour (see
+// reconcileGappedPortals) for a bug that is not about them.
+//
+// Fails open: a lookup error leaves the message in the batch, so a database
+// blip degrades to today's behaviour rather than dropping history.
+func (c *IMClient) dropAlreadyBridgedElsewhere(
+	ctx context.Context, log zerolog.Logger, portal networkid.PortalKey, msgs []*bridgev2.BackfillMessage,
+) []*bridgev2.BackfillMessage {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	kept := msgs[:0:0]
+	dropped := 0
+	var firstDropped networkid.MessageID
+	for _, msg := range msgs {
+		if msg == nil || msg.ID == "" {
+			kept = append(kept, msg)
+			continue
+		}
+		// Indexed seek on message_real_pkey's leading columns, so this stays
+		// cheap per message even across a full-history batch.
+		parts, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msg.ID)
+		if err != nil {
+			log.Debug().Err(err).Str("message_id", string(msg.ID)).
+				Msg("Could not check whether message is already bridged elsewhere — keeping it")
+			kept = append(kept, msg)
+			continue
+		}
+		if len(parts) == 0 || messagePartsInRoom(parts, portal.ID) {
+			kept = append(kept, msg)
+			continue
+		}
+		if dropped == 0 {
+			firstDropped = msg.ID
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		log.Warn().
+			Str("portal_id", string(portal.ID)).
+			Int("dropped", dropped).
+			Int("kept", len(kept)).
+			Str("first_dropped_id", string(firstDropped)).
+			Msg("Skipped backfill messages already bridged into another portal — sending them would post a duplicate that cannot be saved (one per restart)")
+	}
+	return kept
+}
+
+// messagePartsInRoom reports whether any of the stored parts belongs to the
+// given portal. Existence in THIS room means the ordinary delivered/redelivery
+// path owns the message; existence only elsewhere is the cross-portal case.
+func messagePartsInRoom(parts []*database.Message, portalID networkid.PortalID) bool {
+	for _, part := range parts {
+		if part != nil && part.Room.ID == portalID {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8407,6 +8500,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			}
 		}
 
+		// Applied after the body-scrubbed rehydration above, so it sees the
+		// final set. A message already bridged into ANOTHER portal cannot be
+		// saved here (the uniqueness constraint is room-agnostic), and bridgev2
+		// sends before it saves — so sending it would post a duplicate that
+		// then fails to persist, and would do so again on every restart.
+		allMessages = c.dropAlreadyBridgedElsewhere(ctx, *log, params.Portal.PortalKey, allMessages)
+
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
 			// Use context.Background() — if the bridge is shutting down, ctx
@@ -8599,6 +8699,10 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						rows[i], rows[j] = rows[j], rows[i]
 					}
 					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					// Same room-agnostic collision as the forward path: this
+					// recovery batch is drawn from the same cloud rows, so it can
+					// carry a GUID already bridged into another portal.
+					allMessages = c.dropAlreadyBridgedElsewhere(ctx, *log, params.Portal.PortalKey, allMessages)
 					// Recovery only fetched the newest `count` messages. If we got
 					// a full batch, older history remains — signal HasMore and hand
 					// back a cursor at the oldest fetched message so the next batch
