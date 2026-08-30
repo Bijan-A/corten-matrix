@@ -1583,6 +1583,32 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 // them, fast enough that nobody watching a first connect notices.
 const ghostReconcilePacing = 80 * time.Millisecond
 
+// ghostProfileWouldChange predicts whether UpdateInfo is about to write
+// something that reaches Matrix, so the reconcile paces only the writes rather
+// than every iteration.
+//
+// Mirrors the leading conditions of bridgev2's own gates — prepareName
+// (ghost.go:151) returns false only when the name matches AND NameSet is
+// already true, and prepareAvatar (ghost.go:172) likewise for the avatar ID and
+// AvatarSet. Identifiers are deliberately not considered: they land in
+// ExtraProfile and do not emit the m.room.member event this pacing exists to
+// spread out.
+//
+// Errs toward true. A false positive costs one 80ms sleep; a false negative
+// puts back the burst the pacing is here to prevent.
+func ghostProfileWouldChange(ghost *bridgev2.Ghost, info *bridgev2.UserInfo) bool {
+	if ghost == nil || info == nil {
+		return false
+	}
+	if info.Name != nil && (*info.Name != ghost.Name || !ghost.NameSet) {
+		return true
+	}
+	if info.Avatar != nil && (info.Avatar.ID != ghost.AvatarID || !ghost.AvatarSet) {
+		return true
+	}
+	return false
+}
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	store := c.contactStore()
 	if store == nil {
@@ -1620,6 +1646,10 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	rows.Close()
 
 	reconciled := 0
+	// Counts ghosts whose profile is actually expected to change, which is what
+	// the pacing below spaces out. Distinct from reconciled, which counts every
+	// ghost passed to UpdateInfo whether or not it writes anything.
+	paced := 0
 	for _, g := range ghosts {
 		// Skip ghosts with no matching contact (efficiency: avoids loading
 		// the full ghost object for participants who aren't in the address book).
@@ -1671,25 +1701,38 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if err != nil || info == nil {
 			continue
 		}
-		// Pace the writes. Each UpdateInfo that actually changes a name emits an
-		// m.room.member state event into every DM that ghost is in, and Matrix
-		// clients derive a DM's title and avatar from exactly that. Reconciling
-		// a whole address book unpaced fired 22 profile changes inside 9ms on a
-		// first connect, which is a burst no client is expecting; Beeper Desktop
-		// came out of it with a wedged icon cache that only a re-login cleared.
+		// Pace the writes. Each UpdateInfo that actually changes a name or avatar
+		// emits an m.room.member state event into every DM that ghost is in, and
+		// Matrix clients derive a DM's title and avatar from exactly that.
+		// Reconciling a whole address book unpaced fired 22 profile changes
+		// inside 9ms on a first connect, which is a burst no client expects;
+		// Beeper Desktop came out of it with a wedged icon cache that only a
+		// re-login cleared.
 		//
-		// This is the one connect where almost every ghost changes — afterwards
-		// the diff-gate above means near-zero updates — so spreading the first
-		// pass over a couple of seconds costs nothing anyone will notice and
-		// hands clients a rate they can absorb. Skipped after the last one so a
-		// small address book doesn't pay for a delay it doesn't need.
-		if reconciled > 0 {
-			select {
-			case <-c.stopChan:
-				log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
-				return
-			case <-time.After(ghostReconcilePacing):
+		// Paced between WRITES, not between iterations. The loop above
+		// deliberately calls UpdateInfo for every ghost every cycle rather than
+		// diff-gating on the name, because that is what heals identifier and
+		// avatar drift. UpdateInfo self-gates internally, so an unchanged ghost
+		// costs zero Matrix calls — but a sleep placed before it would be paid
+		// anyway, once per ghost, on every 15-minute contact tick. At a few
+		// thousand contacts that is minutes of dead time per tick, and it is
+		// serialized ahead of refreshDMPortalNamesFromContacts and
+		// repairDivergedDMRoomNames in this same goroutine, so it would delay
+		// those by the same amount.
+		//
+		// Predicting the write instead means the first connect still gets the
+		// full spreading effect (nearly every ghost changes there) while a
+		// steady-state tick that changes nothing sleeps not at all.
+		if ghostProfileWouldChange(ghost, info) {
+			if paced > 0 {
+				select {
+				case <-c.stopChan:
+					log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
+					return
+				case <-time.After(ghostReconcilePacing):
+				}
 			}
+			paced++
 		}
 		ghost.UpdateInfo(ctx, info)
 		reconciled++

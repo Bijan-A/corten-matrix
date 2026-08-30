@@ -452,15 +452,24 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 		return
 	}
 	// Drain the cursor completely before resolving anything. An open *sql.Rows
-	// holds one pooled connection for as long as it lives, and the resolve step
+	// holds a pooled connection for as long as it lives, and the resolve step
 	// below queries the same database (resolveSiblingHandleLive →
 	// findPortalByID → GetExistingPortalByKey) and writes to it
-	// (rememberAliasPortal → KV.Set). SQLite runs with max_open_conns=1, so
-	// doing that inside the loop asks the pool for a second connection that can
-	// never be granted: the goroutine blocks forever on a context.Background()
-	// that never times out, while holding both the process's only connection
-	// and — via GetExistingPortalByKey — the bridge-wide cache lock. Everything
-	// else then stops, with the bridge still reporting Connected.
+	// (rememberAliasPortal → KV.Set). Issuing those inside the loop asks the
+	// pool for a second connection while the first is still held.
+	//
+	// How bad that is depends on the pool. With room to spare it merely wastes
+	// a connection for the length of the scan. With a single-connection pool it
+	// deadlocks outright: the second query can never be granted, the context is
+	// context.Background() so nothing times out, and the goroutine sits on the
+	// only connection AND — via GetExistingPortalByKey — the bridge-wide cache
+	// lock. Every later DB operation and portal lookup then blocks while the
+	// bridge still reports Connected.
+	//
+	// Upstream hit the deadlock after clamping SQLite to max_open_conns=1; this
+	// tree has no such clamp, so here it is latent rather than fatal. The
+	// nested query under an open cursor is the bug either way, and it is not
+	// worth leaving armed against a future pool change.
 	ghostIDs := make([]string, 0, 256)
 	for rows.Next() {
 		var ghostID string
