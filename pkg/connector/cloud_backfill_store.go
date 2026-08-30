@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2428,9 +2429,18 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 // gid:<group_id> is a different problem — its canonical target would itself be
 // a gid: key, which is not what moveGroupRooms is being handed here — and is
 // left for the normal participant-key path rather than widened into this one.
-func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string) (map[string]string, error) {
+// Returns the unambiguous mappings, plus the gid: portals deliberately left
+// out because their group_id resolves to more than one canonical key (see
+// resolveOrphanedGroupRooms), so the caller can say so rather than silently
+// reporting fewer.
+func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string) (map[string]string, []string, error) {
+	// Every candidate pair, not one collapsed row per portal. This used to be
+	// GROUP BY p.id with MIN(cc.portal_id), which cannot represent a group_id
+	// whose rows sit at two different canonical keys — it just picked the
+	// lexicographically smaller one. See resolveOrphanedGroupRooms for why
+	// there is no right answer to pick in that case.
 	rows, err := s.db.Query(ctx, `
-		SELECT p.id, MIN(cc.portal_id) AS canonical
+		SELECT p.id, cc.portal_id
 		FROM portal p
 		JOIN cloud_chat cc
 		  ON cc.login_id = $1
@@ -2440,22 +2450,65 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 		WHERE p.bridge_id = $2 AND p.receiver = $1 AND p.mxid <> '' AND p.id LIKE 'gid:%'
 		  AND cc.portal_id <> p.id
 		  AND cc.portal_id NOT LIKE 'gid:%'
-		GROUP BY p.id
 	`, s.loginID, bridgeID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 
-	out := make(map[string]string)
+	candidates := make(map[string]map[string]bool)
 	for rows.Next() {
 		var gidPortal, canonical string
 		if err := rows.Scan(&gidPortal, &canonical); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		out[gidPortal] = canonical
+		if candidates[gidPortal] == nil {
+			candidates[gidPortal] = make(map[string]bool)
+		}
+		candidates[gidPortal][canonical] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	resolved, ambiguous := resolveOrphanedGroupRooms(candidates)
+	return resolved, ambiguous, nil
+}
+
+// resolveOrphanedGroupRooms keeps only the orphaned rooms whose group_id points
+// at exactly one canonical key, and reports the rest as ambiguous rather than
+// guessing between them.
+//
+// The old query collapsed the candidates with MIN(cc.portal_id), which silently
+// picked the lexicographically smallest. That is not a conservative default, it
+// is an arbitrary one — and it looked right most of the time because
+// planGroupConsolidation also breaks ties by lowest canonical, so the two
+// usually agreed by coincidence.
+//
+// There is no correct pick available here. A gid: room whose group_id now spans
+// two participant keys either holds messages from both conversations (they
+// shared the portal until their rosters diverged) or came from one of them with
+// no record of which. Moving it to either key files a room under a roster that
+// does not describe its contents, which is the partitioned-history problem in
+// #10 — and that needs the rebuild path, not a room move. So the room stays
+// orphaned, which is where it already was, and `split-chats` reports it.
+//
+// This matches the rule #10 states for the same class of decision: if identity
+// cannot be positively confirmed, keep portals separate — a duplicate room is
+// acceptable, a wrong merge is not.
+func resolveOrphanedGroupRooms(candidates map[string]map[string]bool) (map[string]string, []string) {
+	resolved := make(map[string]string)
+	var ambiguous []string
+	for gidPortal, canonicals := range candidates {
+		if len(canonicals) != 1 {
+			ambiguous = append(ambiguous, gidPortal)
+			continue
+		}
+		for canonical := range canonicals {
+			resolved[gidPortal] = canonical
+		}
+	}
+	sort.Strings(ambiguous)
+	return resolved, ambiguous
 }
 
 // reKeyChatRowPortalID re-keys ONE chat's rows to a new portal ID, matched by

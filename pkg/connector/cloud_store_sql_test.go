@@ -833,7 +833,16 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	room("gid:gggg")
 	chat("gggg", "hhhh", "gid:hhhh")
 
-	got, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
+	// p_ambiguous: two conversations share this group_id but their rosters
+	// diverged, so the row-scoped re-key sent them to different canonical keys.
+	// No room move is correct here — see resolveOrphanedGroupRooms — so the
+	// room must be reported as ambiguous rather than silently filed under
+	// whichever key sorts lower, which is what MIN() used to do.
+	room("gid:iiii")
+	chat("c-amb-a", "iiii", "tel:+10,tel:+11")
+	chat("c-amb-b", "iiii", "tel:+10,tel:+12")
+
+	got, ambiguous, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
 	if err != nil {
 		t.Fatalf("orphanedGroupRoomPortalIDs: %v", err)
 	}
@@ -843,6 +852,31 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("orphanedGroupRoomPortalIDs() = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(ambiguous, []string{"gid:iiii"}) {
+		t.Fatalf("ambiguous = %#v, want [gid:iiii]", ambiguous)
+	}
+	// The lexicographically smaller key is exactly what MIN() would have
+	// returned, so pin that it is NOT silently chosen.
+	if _, picked := got["gid:iiii"]; picked {
+		t.Error("an ambiguous group_id was resolved anyway — MIN()'s arbitrary pick is back")
+	}
+}
+
+// TestResolveOrphanedGroupRooms is the rule on its own: one candidate resolves,
+// more than one is reported rather than guessed between.
+func TestResolveOrphanedGroupRooms(t *testing.T) {
+	resolved, ambiguous := resolveOrphanedGroupRooms(map[string]map[string]bool{
+		"gid:one":  {"tel:+1,tel:+2": true},
+		"gid:many": {"tel:+1,tel:+2": true, "tel:+1,tel:+3": true},
+		"gid:also": {"tel:+9,tel:+9": true, "tel:+8,tel:+8": true},
+	})
+	if !reflect.DeepEqual(resolved, map[string]string{"gid:one": "tel:+1,tel:+2"}) {
+		t.Errorf("resolved = %#v, want only gid:one", resolved)
+	}
+	// Sorted, so the log line and this assertion are both stable.
+	if !reflect.DeepEqual(ambiguous, []string{"gid:also", "gid:many"}) {
+		t.Errorf("ambiguous = %#v, want [gid:also gid:many]", ambiguous)
 	}
 }
 

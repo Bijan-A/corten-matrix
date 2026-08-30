@@ -4090,12 +4090,22 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 	// Folded into the ROOM groups, not the row re-keys: an orphan's cloud rows
 	// are already on the canonical key by definition, so there is nothing to
 	// re-key — only a room to move.
-	if orphans, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID)); oErr != nil {
+	if orphans, ambiguous, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID)); oErr != nil {
 		log.Warn().Err(oErr).Msg("Failed to look up orphaned gid: group rooms")
-	} else if len(orphans) > 0 {
-		groups = mergeOrphanedGroupRooms(groups, orphans)
-		log.Info().Int("orphaned_rooms", len(orphans)).
-			Msg("Found gid: group rooms orphaned by a prior deferred consolidation")
+	} else {
+		if len(orphans) > 0 {
+			groups = mergeOrphanedGroupRooms(groups, orphans)
+			log.Info().Int("orphaned_rooms", len(orphans)).
+				Msg("Found gid: group rooms orphaned by a prior deferred consolidation")
+		}
+		if len(ambiguous) > 0 {
+			// Left where they are on purpose: their group_id spans two
+			// participant keys, so no move files the room under a roster that
+			// describes its contents. Merging them needs the rebuild path, not
+			// a room move. Logged rather than dropped so they are findable.
+			log.Info().Strs("portal_ids", ambiguous).
+				Msg("Left gid: group rooms orphaned — their group_id resolves to more than one canonical key, so no room move is correct")
+		}
 	}
 
 	if len(plan.rowReKeys) == 0 && len(groups) == 0 {
