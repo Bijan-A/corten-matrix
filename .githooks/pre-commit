@@ -12,4 +12,76 @@ if [ -n "$blocked" ]; then
   echo "Unstage with:  git restore --staged <path>" >&2
   exit 1
 fi
+
+# ── gofmt, mirroring the "gofmt (changed files)" step in ci.yml ─────────────
+#
+# That step runs gofmt over WHOLE files a PR touches, and 14 files inherited
+# from upstream are not gofmt-clean (deliberately — reformatting them wholesale
+# would create conflict surface against future upstream rebases). The
+# consequence is easy to trip over: whether you pass the check depends on WHICH
+# file you edited, not on what you wrote. A two-line change to an inherited file
+# fails CI on pre-existing misformatting elsewhere in the same file, minutes
+# after you pushed. This says so before the commit instead.
+#
+# Bypass, like the guard above: git commit --no-verify
+
+# Staged Go files, excluding deletions — the same --diff-filter CI uses. Read
+# NUL-delimited: -z also stops git from applying core.quotePath, which would
+# otherwise hand us "pkg/foo\303\251.go" for a non-ASCII name and make the
+# `git show :$f` below fail to resolve it.
+staged_go=()
+while IFS= read -r -d '' f; do
+  staged_go+=("$f")
+done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.go')
+[ ${#staged_go[@]} -gt 0 ] || exit 0
+
+if ! command -v gofmt >/dev/null 2>&1; then
+  echo "pre-commit: gofmt is not on PATH; skipping the format check (CI still enforces it)" >&2
+  exit 0
+fi
+
+# Check the STAGED content rather than the working tree: that is what the commit
+# — and therefore CI — will actually see. Checking the tree would pass a commit
+# whose staged version is still unformatted, which is the case most worth
+# catching (`gofmt -w` run after `git add`).
+#
+# The trailing X on both sides is load-bearing. Command substitution strips ALL
+# trailing newlines, so comparing bare captures makes a difference that exists
+# only in trailing bytes invisible — a file with no final newline, or with blank
+# lines after the closing brace, would pass here and then fail `gofmt -l` in CI.
+# The sentinel preserves those bytes; ${blob%X} hands gofmt the original content.
+unformatted=()
+for f in "${staged_go[@]}"; do
+  blob=$(git show ":$f"; printf X)
+  # `st=$?; printf X; exit "$st"` propagates gofmt's status out of the subshell.
+  # Without it the substitution reports printf's status (always 0) and a file
+  # gofmt cannot parse is misreported as merely needing reformatting.
+  if ! fmt=$(printf '%s' "${blob%X}" | gofmt 2>/dev/null; st=$?; printf X; exit "$st"); then
+    echo "pre-commit: gofmt could not parse the staged $f (syntax error?)" >&2
+    exit 1
+  fi
+  [ "$blob" = "$fmt" ] || unformatted+=("$f")
+done
+
+if [ ${#unformatted[@]} -gt 0 ]; then
+  echo "pre-commit: gofmt would reformat staged Go files:" >&2
+  for f in "${unformatted[@]}"; do
+    echo "   $f" >&2
+  done
+  # Shell-quote the paths so the suggested line is copy-pasteable even for a
+  # filename with a space in it.
+  quoted=""
+  for f in "${unformatted[@]}"; do
+    quoted="$quoted $(printf '%q' "$f")"
+  done
+  echo "" >&2
+  echo "CI checks whole files, so pre-existing misformatting in a file you touched" >&2
+  echo "counts against you. Fix and re-stage:" >&2
+  echo "" >&2
+  echo "  gofmt -w$quoted && git add$quoted" >&2
+  echo "" >&2
+  echo "To commit anyway: git commit --no-verify" >&2
+  exit 1
+fi
+
 exit 0

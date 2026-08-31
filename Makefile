@@ -32,7 +32,7 @@ endif
 
 # Plain `make` builds the corten-matrix binary.
 .DEFAULT_GOAL := build
-.PHONY: build clean rust bindings check-deps
+.PHONY: build clean rust bindings check-deps install-hooks
 
 # ===========================================================================
 # Path validation – spaces in the working directory break CGO linker flags
@@ -262,6 +262,13 @@ $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | gre
 	@# rebuilds (the arm64 linker otherwise leaves it as 'a.out', untrackable) —
 	@# needed for the Full Disk Access probe to register it for chat.db backfill.
 	codesign --force --sign - --identifier com.lrhodin.corten-matrix $(BINARY)
+
+# Point git at the tracked .githooks. Not automatic: hooks are per-clone and
+# git will not enable them for you.
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Installed .githooks (pre-commit: blocks private/build paths, checks gofmt)."
+	@echo "Uninstall with: git config --unset core.hooksPath"
 
 clean:
 	rm -f $(APP_NAME) $(RUST_LIB)

@@ -58,6 +58,24 @@ A cold `cargo build --release` takes 20–40 minutes and is memory-hungry; on an
 
 Other targets: `make clean`, `make rust`, `make bindings`.
 
+### Git hooks
+
+```bash
+make install-hooks
+```
+
+Points `core.hooksPath` at the tracked `.githooks`. Git does not enable hooks on
+clone, so this is a one-time step per checkout — and worth taking, because
+`pre-commit` there refuses to commit private or build paths
+(`third_party/rustpush-upstream/`, `dist/`, `librustpushgo.a`, `target/`) even
+when they are staged with `git add -f`.
+
+It also runs `gofmt` over the Go files you have staged. CI checks *whole* files a
+PR touches, and 14 files inherited from upstream are not gofmt-clean — so a
+two-line change to one of those fails CI on misformatting you did not write, and
+`gofmt -l` on your own diff will not warn you. `gofmt -w <file>` is the fix;
+`git commit --no-verify` bypasses the hook entirely.
+
 ## House rules
 
 **Never hand-edit `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h`.** They are
