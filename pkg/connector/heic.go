@@ -8,6 +8,19 @@
 
 package connector
 
+// The `#cgo linux` line in the preamble below is DEAD in this tree. It is kept
+// only to stay mergeable with upstream, which does build for Linux. The Makefile
+// hard-errors on any non-Darwin host — NAC validation data comes from Apple's
+// AAAbsintheContext framework, and the crates that replace it are not public —
+// so nothing in this file is ever compiled for Linux. See "Linux is not
+// supported here" in the README.
+//
+// Reviewers: a defect that would only bite on the Linux path cannot bite here.
+// This note exists because that was not obvious once already.
+//
+// Kept as a normal Go comment ABOVE the preamble on purpose: prose inside the
+// preamble is parsed as C source by cgo (see pkg/rustpushgo/rustpushgo.go).
+
 /*
 #cgo linux LDFLAGS: -ldl
 #include <stdio.h>
