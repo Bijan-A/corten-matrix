@@ -4283,24 +4283,42 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 //     to NULL for every row, so the DELETE silently removes nothing. Dropping
 //     the guard would swap one silent no-op for another.
 //
-//   - The CASE guard is not decoration, and it has to sit in the FROM clause.
-//     A set-returning function there is expanded BEFORE any WHERE filters the
-//     row, so no WHERE predicate can protect the cast or the call. An empty
-//     string cast to jsonb raises "invalid input syntax for type json", and a
-//     valid but non-array value raises "cannot extract elements from a scalar"
-//     (or "... from an object"). Either aborts the whole DELETE. Note that the
-//     string "null" is valid JSON and IS a scalar, so an emptiness check does
-//     not exclude it. Guarding on a leading "[" admits only what the writer can
-//     actually produce, and a CASE with no ELSE yields NULL for everything
-//     else — which jsonb_array_elements, being strict, turns into zero rows.
+//   - The CASE guard belongs in the FROM clause, not the WHERE. What can abort
+//     the statement: an empty string cast to jsonb ("invalid input syntax for
+//     type json"), and any valid-but-non-array value ("cannot extract elements
+//     from a scalar" / "... from an object"). The string "null" is exactly
+//     that — valid JSON, a scalar — so an emptiness check does not exclude it,
+//     and renderableContentClause already lists it as a value this column is
+//     expected to hold.
 //
-//   - SQLite needs none of that, which is why the gap was invisible:
-//     json_each('null') returns one row whose json_extract is NULL, and the
-//     IS NOT NULL guard already drops it. The same input is silently ignored
-//     there and fatal here. The sole writer (sync_controller, guarded by
-//     len(attRows) > 0) has only ever emitted a non-empty array, so this is
-//     insurance rather than a fix — but insurance on a branch that has never
-//     run in production is worth its two lines.
+//     A WHERE predicate would usually work: Postgres pushes quals that
+//     reference only cloud_message into the base scan, ahead of the
+//     implicit-LATERAL expansion, so a malformed row belonging to another
+//     login or already deleted never reaches the cast. That is a planner
+//     decision rather than a guarantee, and it only narrows the blast radius
+//     to one login's live rows. Putting the guard in the FROM does not depend
+//     on it. A CASE with no ELSE yields NULL for anything that fails the test,
+//     and jsonb_array_elements is strict, so NULL produces zero rows.
+//
+//   - The leading-"[" test does not cover everything the writer can emit. Go's
+//     json.Marshal renders a NUL byte in a filename as a backslash-u0000
+//     escape, which ::jsonb rejects outright ("unsupported Unicode escape
+//     sequence"); ::json accepts the cast but the subsequent ->> fails the
+//     same way. Such a row
+//     would abort the prune on Postgres while SQLite handles it, and the only
+//     surface is the log.Warn in runPostSyncHousekeeping. No row like that
+//     exists in the data checked so far, so it is left unguarded rather than
+//     paid for on every pass — but it is the next thing to suspect if this
+//     ever starts failing on a Postgres install.
+//
+//   - The SQLite branch below keeps its guard in the WHERE, which is exactly
+//     the position this comment argues against. It is load-bearing there:
+//     json_each over an unguarded empty string raises "malformed JSON". It
+//     works because SQLite evaluates a WHERE term at the earliest join loop
+//     where its columns are available — reliable in practice, but the same
+//     kind of planner behaviour rather than a promise. Left as it is because
+//     that branch is the one with production mileage; the asymmetry is
+//     deliberate, not an oversight.
 func referencedAttachmentRecordNames(db *dbutil.Database) string {
 	if db.Dialect == dbutil.Postgres {
 		return `
@@ -4329,10 +4347,12 @@ func referencedAttachmentRecordNames(db *dbutil.Database) string {
 // This prevents unbounded growth after portal deletions or message tombstones
 // remove the messages that originally needed those cached attachments.
 //
-// Both dialects still assume attachments_json holds a valid JSON array when it
-// is non-empty, which the writer guarantees (it is either "" or the marshalled
-// []cloudAttachmentRow). A malformed row would abort the statement on either
-// database, exactly as it did before.
+// Both dialects still assume attachments_json parses when it looks like an
+// array, which the writer guarantees for everything it emits (either "" or a
+// marshalled non-empty []cloudAttachmentRow). A malformed row would abort the
+// statement on either database — unchanged behaviour on SQLite, where this has
+// always run, and a new failure mode on Postgres only in the sense that
+// nothing ran there at all before.
 func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_attachment_cache
