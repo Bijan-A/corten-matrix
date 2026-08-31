@@ -379,7 +379,7 @@ Attachments larger than `max_attachment_size_mb` (default `100`) are **skipped e
 
 ### Dependencies
 
-- **`libheif`** is a runtime dependency the bridge links against. `corten-matrix setup` installs it via Homebrew, regardless of whether `heic_conversion` is enabled.
+- **`libheif`** is a runtime dependency the bridge links against. `corten-matrix setup` installs it via Homebrew, regardless of whether `heic_conversion` is enabled. It is loaded with `dlopen` at first use; the bridge tries the standard loader search path first and then the Homebrew and MacPorts prefixes, since a leaf-name `dlopen` on macOS never searches those. For an install in some other prefix, point `CORTEN_LIBHEIF_PATH` at the library itself (e.g. `CORTEN_LIBHEIF_PATH=/nix/store/.../lib/libheif.1.dylib`). When the library can't be loaded, connect logs a warning naming every path tried and HEIC images bridge unconverted.
 - **`ffmpeg`** is required at runtime only when `video_transcoding` is enabled. The setup flow installs it via the same package manager when you turn the toggle on during the interactive prompts.
 
 ## How It Works

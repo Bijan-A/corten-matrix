@@ -10,9 +10,11 @@ package connector
 
 /*
 #cgo linux LDFLAGS: -ldl
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <libheif/heif.h>
 
 // libheif is loaded at RUNTIME via dlopen — it is NOT linked at build time.
@@ -34,15 +36,59 @@ HEIF_DECL(heif_decode_image) HEIF_DECL(heif_image_get_width) HEIF_DECL(heif_imag
 HEIF_DECL(heif_image_get_plane_readonly) HEIF_DECL(heif_image_release)
 #undef HEIF_DECL
 
+// Candidate paths for libheif, tried in order. The leaf names come first
+// because that is all Linux needs — ld.so searches the standard library paths.
+// macOS needs the absolute entries: a leaf-name dlopen there consults only
+// DYLD_*_LIBRARY_PATH (unset for the bridge) and /usr/lib, never Homebrew's
+// lib dir, so `brew install libheif` is invisible to a leaf-name lookup and
+// every HEIC would silently ship unconverted on an otherwise correct install.
+// CORTEN_LIBHEIF_PATH (checked first) covers a custom prefix — Nix, a
+// vendored build, or a distro that installs somewhere unusual.
+static const char* cr_heif_candidates[] = {
+	"libheif.so.1",
+	"libheif.1.dylib",
+	"libheif.dylib",
+	"libheif.so",
+	"/opt/homebrew/lib/libheif.1.dylib", // Homebrew, Apple Silicon
+	"/usr/local/lib/libheif.1.dylib",    // Homebrew, Intel
+	"/opt/local/lib/libheif.1.dylib",    // MacPorts
+	NULL,
+};
+
 static int cr_heif_state = 0; // 0=unloaded, 1=ok, -1=failed
-static int cr_heif_load(void) {
-	if (cr_heif_state != 0) return cr_heif_state > 0;
-	void* h = dlopen("libheif.so.1", RTLD_NOW | RTLD_GLOBAL);
-	if (!h) h = dlopen("libheif.1.dylib", RTLD_NOW | RTLD_GLOBAL);
-	if (!h) h = dlopen("libheif.dylib", RTLD_NOW | RTLD_GLOBAL);
-	if (!h) h = dlopen("libheif.so", RTLD_NOW | RTLD_GLOBAL);
-	if (!h) { cr_heif_state = -1; return 0; }
-#define HEIF_LOAD(n) p_##n = (__typeof__(n)*)dlsym(h, #n); if (!p_##n) { cr_heif_state = -1; return 0; }
+static char cr_heif_err[2048] = {0};
+static pthread_once_t cr_heif_once = PTHREAD_ONCE_INIT;
+
+// cr_heif_record_err appends one load failure to the diagnostic buffer so a
+// failed load can name every path that was tried. Without it the only symptom
+// is "libheif decode failed", which points at the image rather than at the
+// library that never loaded. Each entry is truncated because dyld's "tried:"
+// lists run several hundred bytes and would crowd out later candidates — the
+// useful part (missing file vs. unresolved dependency) comes first.
+static void cr_heif_record_err(const char* what, const char* err) {
+	size_t used = strlen(cr_heif_err);
+	if (used + 8 >= sizeof(cr_heif_err)) return; // full — keep the earlier entries
+	snprintf(cr_heif_err + used, sizeof(cr_heif_err) - used, "%s%.60s: %.160s",
+		used ? " | " : "", what, err ? err : "unknown error");
+}
+
+// cr_heif_load_once runs under pthread_once: the state and function pointers
+// are written exactly once, so concurrent first calls (a startup availability
+// check racing an inbound attachment) can't tear them.
+static void cr_heif_load_once(void) {
+	void* h = NULL;
+	const char* override = getenv("CORTEN_LIBHEIF_PATH");
+	if (override && *override) {
+		h = dlopen(override, RTLD_NOW | RTLD_GLOBAL);
+		if (!h) cr_heif_record_err(override, dlerror());
+	}
+	for (int i = 0; !h && cr_heif_candidates[i]; i++) {
+		h = dlopen(cr_heif_candidates[i], RTLD_NOW | RTLD_GLOBAL);
+		if (!h) cr_heif_record_err(cr_heif_candidates[i], dlerror());
+	}
+	if (!h) { cr_heif_state = -1; return; }
+#define HEIF_LOAD(n) p_##n = (__typeof__(n)*)dlsym(h, #n); \
+	if (!p_##n) { cr_heif_record_err(#n, "symbol missing from libheif"); cr_heif_state = -1; return; }
 	HEIF_LOAD(heif_context_alloc) HEIF_LOAD(heif_context_read_from_memory) HEIF_LOAD(heif_context_free)
 	HEIF_LOAD(heif_context_get_primary_image_handle) HEIF_LOAD(heif_context_get_number_of_top_level_images)
 	HEIF_LOAD(heif_image_handle_get_number_of_metadata_blocks) HEIF_LOAD(heif_image_handle_get_list_of_metadata_block_IDs)
@@ -53,7 +99,17 @@ static int cr_heif_load(void) {
 	HEIF_LOAD(heif_image_get_plane_readonly) HEIF_LOAD(heif_image_release)
 #undef HEIF_LOAD
 	cr_heif_state = 1;
-	return 1;
+}
+
+static int cr_heif_load(void) {
+	pthread_once(&cr_heif_once, cr_heif_load_once);
+	return cr_heif_state > 0;
+}
+
+// cr_heif_load_error returns the accumulated load failures ("" when libheif
+// loaded). Only valid after cr_heif_load has run.
+static const char* cr_heif_load_error(void) {
+	return cr_heif_err;
 }
 
 // Redirect the call sites below to the dlopen'd pointers (no -lheif link).
@@ -284,6 +340,7 @@ import (
 	"image/jpeg"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/rs/zerolog"
@@ -295,6 +352,38 @@ const maxHEICInputSize = 100 * 1024 * 1024
 // isHEIC returns true if the MIME type indicates an HEIC/HEIF image.
 func isHEIC(mimeType string) bool {
 	return mimeType == "image/heic" || mimeType == "image/heif"
+}
+
+// heifAvailable reports whether libheif could be loaded, and when it could
+// not, the loader errors for every path that was tried. libheif is dlopen'd
+// lazily, so a missing or broken install shows up only here — every heif_*
+// call is a NULL pointer otherwise, surfacing as an opaque decode failure.
+func heifAvailable() (bool, string) {
+	if C.cr_heif_load() != 0 {
+		return true, ""
+	}
+	return false, C.GoString(C.cr_heif_load_error())
+}
+
+// heifUnavailableWarnOnce keeps the "libheif didn't load" warning to a single
+// line per run. Availability never changes after the first dlopen attempt, so
+// warning per attachment would flood a backfill of thousands of photos with
+// identical lines.
+var heifUnavailableWarnOnce sync.Once
+
+// warnHEIFUnavailable logs the load failure once at warn level and at debug
+// level thereafter, so the reason is always recoverable from the logs of the
+// specific message that shipped unconverted.
+func warnHEIFUnavailable(log *zerolog.Logger, loadErr string) {
+	logged := false
+	heifUnavailableWarnOnce.Do(func() {
+		log.Warn().Str("dlopen_error", loadErr).
+			Msg("heic_conversion is enabled but libheif could not be loaded; HEIC images will be bridged as-is (install libheif, or set CORTEN_LIBHEIF_PATH to the absolute path of the library)")
+		logged = true
+	})
+	if !logged {
+		log.Debug().Msg("Skipping HEIC conversion: libheif is not loadable")
+	}
 }
 
 // heicMetadata holds all metadata extracted from a HEIC file.
@@ -453,7 +542,7 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 	}
 	if meta.icc != nil {
 		numChunks := (len(meta.icc) + maxICCChunkData - 1) / maxICCChunkData
-		extra += numChunks * (2 + 2 + 14) + len(meta.icc) // markers + headers + data
+		extra += numChunks*(2+2+14) + len(meta.icc) // markers + headers + data
 	}
 
 	var buf bytes.Buffer
@@ -472,12 +561,12 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 			log.Warn().Int("exif_bytes", len(meta.exif)).
 				Msg("EXIF data too large for JPEG APP1 segment, dropping EXIF")
 		} else {
-			buf.Write([]byte{0xFF, 0xE1})                             // APP1 marker
-			lenBytes := make([]byte, 2)                               //nolint:mnd
-			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len))     //nolint:gosec
-			buf.Write(lenBytes)                                       // length
-			buf.Write(exifHeader)                                     // "Exif\0\0"
-			buf.Write(meta.exif)                                      // raw TIFF data
+			buf.Write([]byte{0xFF, 0xE1})                         // APP1 marker
+			lenBytes := make([]byte, 2)                           //nolint:mnd
+			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len)) //nolint:gosec
+			buf.Write(lenBytes)                                   // length
+			buf.Write(exifHeader)                                 // "Exif\0\0"
+			buf.Write(meta.exif)                                  // raw TIFF data
 		}
 	}
 
@@ -491,12 +580,12 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 			log.Warn().Int("xmp_bytes", len(meta.xmp)).
 				Msg("XMP data too large for JPEG APP1 segment, dropping XMP")
 		} else {
-			buf.Write([]byte{0xFF, 0xE1})                             // APP1 marker
-			lenBytes := make([]byte, 2)                               //nolint:mnd
-			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len))     //nolint:gosec
-			buf.Write(lenBytes)                                       // length
-			buf.Write(xmpHeader)                                      // XMP namespace
-			buf.Write(meta.xmp)                                       // XMP payload
+			buf.Write([]byte{0xFF, 0xE1})                         // APP1 marker
+			lenBytes := make([]byte, 2)                           //nolint:mnd
+			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len)) //nolint:gosec
+			buf.Write(lenBytes)                                   // length
+			buf.Write(xmpHeader)                                  // XMP namespace
+			buf.Write(meta.xmp)                                   // XMP payload
 		}
 	}
 
@@ -519,14 +608,14 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 				// Length = 2 (self) + 12 (signature) + 1 (chunk#) + 1 (total) + data
 				segLen := 2 + len(iccSignature) + 2 + len(chunkData)
 
-				buf.Write([]byte{0xFF, 0xE2})                             // APP2 marker
-				lenBytes := make([]byte, 2)                               //nolint:mnd
-				binary.BigEndian.PutUint16(lenBytes, uint16(segLen))       //nolint:gosec
-				buf.Write(lenBytes)                                       // length
-				buf.Write(iccSignature)                                   // "ICC_PROFILE\0"
-				buf.WriteByte(byte(chunk + 1))                            // 1-based chunk number
-				buf.WriteByte(byte(totalChunks))                          // total chunks
-				buf.Write(chunkData)                                      // profile data
+				buf.Write([]byte{0xFF, 0xE2})                        // APP2 marker
+				lenBytes := make([]byte, 2)                          //nolint:mnd
+				binary.BigEndian.PutUint16(lenBytes, uint16(segLen)) //nolint:gosec
+				buf.Write(lenBytes)                                  // length
+				buf.Write(iccSignature)                              // "ICC_PROFILE\0"
+				buf.WriteByte(byte(chunk + 1))                       // 1-based chunk number
+				buf.WriteByte(byte(totalChunks))                     // total chunks
+				buf.Write(chunkData)                                 // profile data
 			}
 		}
 	}
@@ -610,6 +699,16 @@ func maybeConvertHEIC(log *zerolog.Logger, data []byte, mimeType, fileName strin
 	// small host. Acquired only for actual HEIC work (non-HEIC returned above).
 	heicConvertSem <- struct{}{}
 	defer func() { <-heicConvertSem }()
+
+	// Nothing below can work without libheif — both branches call into it — so
+	// report the load failure by name instead of letting it degrade into
+	// "libheif decode failed", which reads like a problem with the photo.
+	if ok, loadErr := heifAvailable(); !ok {
+		if enabled {
+			warnHEIFUnavailable(log, loadErr)
+		}
+		return data, mimeType, fileName, nil
+	}
 
 	if !enabled {
 		// Decode for dimensions/thumbnail only, keep original HEIC data

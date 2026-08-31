@@ -1262,7 +1262,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 
 	if c.Main.Config.HEICConversion {
-		log.Info().Msg("HEIC conversion enabled (libheif)")
+		// Verify libheif actually loads rather than just echoing the config,
+		// mirroring the ffmpeg check above. libheif is dlopen'd, so a missing
+		// or dependency-broken install is invisible until the first HEIC
+		// arrives and then only reports a generic decode failure.
+		if ok, loadErr := heifAvailable(); ok {
+			log.Info().Msg("HEIC conversion enabled (libheif)")
+		} else {
+			log.Warn().Str("dlopen_error", loadErr).
+				Msg("HEIC conversion enabled in config but libheif could not be loaded — HEIC images will be bridged as-is; install libheif or set CORTEN_LIBHEIF_PATH")
+		}
 	}
 
 	// Persist state after connect (APS tokens, IDS keys, device ID)
