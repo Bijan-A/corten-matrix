@@ -132,6 +132,12 @@ func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.
 // rather than bound as one array. Own handles number a handful, so the IN list
 // stays tiny.
 func buildSelfGhostRoomsQuery(bridgeID networkid.BridgeID, loginID networkid.UserLoginID, ghostIDs []networkid.UserID) (string, []any) {
+	if len(ghostIDs) == 0 {
+		// An empty list would emit "IN ()", a syntax error on both dialects.
+		// The caller guards on this already; returning nothing keeps the
+		// function safe to call on its own terms now that it is testable.
+		return "", nil
+	}
 	args := make([]any, 0, len(ghostIDs)+2)
 	args = append(args, bridgeID, loginID)
 	placeholders := make([]string, len(ghostIDs))

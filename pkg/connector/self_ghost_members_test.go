@@ -300,3 +300,13 @@ func TestSelfGhostRoomsQueryRunsOnSQLite(t *testing.T) {
 		t.Errorf("unexpected result set: %#v", got)
 	}
 }
+
+// TestBuildSelfGhostRoomsQueryEmpty: an empty handle list must not emit "IN ()",
+// which is a syntax error on both dialects. Unreachable through selfGhostRooms,
+// which guards first, but the builder is separately callable now.
+func TestBuildSelfGhostRoomsQueryEmpty(t *testing.T) {
+	query, args := buildSelfGhostRoomsQuery("corten", "D:1", nil)
+	if query != "" || args != nil {
+		t.Errorf("buildSelfGhostRoomsQuery(nil) = (%q, %#v), want empty", query, args)
+	}
+}

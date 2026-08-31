@@ -10,10 +10,11 @@ func TestPlanGroupConsolidation(t *testing.T) {
 	commaB := "tel:+15553333333,tel:+15554444444"
 
 	tests := []struct {
-		name     string
-		entries  []groupConsolidationEntry
-		wantRoom []groupConsolidationGroup
-		wantRows []groupRowReKey
+		name          string
+		entries       []groupConsolidationEntry
+		wantRoom      []groupConsolidationGroup
+		wantRows      []groupRowReKey
+		wantAmbiguous []string
 	}{
 		{
 			name: "multiple gid encodings collapse to one canonical group",
@@ -98,16 +99,17 @@ func TestPlanGroupConsolidation(t *testing.T) {
 			wantRows: []groupRowReKey{{cloudChatID: "diverged", from: comma, to: commaB}},
 		},
 		{
-			name: "two conversations under one portal, neither matching: deterministic target",
-			// Both rosters changed, so the room must move — but to the same key
-			// on every run, or the two candidates alternate forever.
+			name: "two conversations under one portal, neither matching: room stays put",
+			// Both rosters changed and no row claims the current key, so there
+			// is no target that describes what the room holds. Picking the
+			// lowest would be stable but still a guess — the shape #23 removed
+			// from orphanedGroupRoomPortalIDs. The rows still move; the room is
+			// reported instead.
 			entries: []groupConsolidationEntry{
 				{cloudChatID: "c1", portalID: "gid:aaaa", canonical: commaB},
 				{cloudChatID: "c2", portalID: "gid:aaaa", canonical: comma},
 			},
-			wantRoom: []groupConsolidationGroup{
-				{canonical: comma, members: []string{"gid:aaaa"}},
-			},
+			wantAmbiguous: []string{"gid:aaaa"},
 			wantRows: []groupRowReKey{
 				{cloudChatID: "c1", from: "gid:aaaa", to: commaB},
 				{cloudChatID: "c2", from: "gid:aaaa", to: comma},
@@ -146,6 +148,9 @@ func TestPlanGroupConsolidation(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got.rowReKeys, tt.wantRows) {
 				t.Errorf("rowReKeys = %#v, want %#v", got.rowReKeys, tt.wantRows)
+			}
+			if !reflect.DeepEqual(got.ambiguousRooms, tt.wantAmbiguous) {
+				t.Errorf("ambiguousRooms = %#v, want %#v", got.ambiguousRooms, tt.wantAmbiguous)
 			}
 		})
 	}
@@ -322,5 +327,44 @@ func TestPlanGroupRoomMoves(t *testing.T) {
 				t.Fatalf("planGroupRoomMoves() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestPlanGroupConsolidationAmbiguousRoomConverges: leaving an ambiguous room in
+// place must still settle. The conversations move to their own keys, so the next
+// plan has nothing to say about that portal at all — otherwise "don't guess"
+// would trade a misfiled room for a pass that reports the same room forever.
+func TestPlanGroupConsolidationAmbiguousRoomConverges(t *testing.T) {
+	const comma = "tel:+15551111111,tel:+15552222222"
+	const commaB = "tel:+15553333333,tel:+15554444444"
+	entries := []groupConsolidationEntry{
+		{cloudChatID: "c1", portalID: "gid:aaaa", canonical: comma},
+		{cloudChatID: "c2", portalID: "gid:aaaa", canonical: commaB},
+	}
+
+	first := planGroupConsolidation(entries)
+	if len(first.ambiguousRooms) != 1 || first.ambiguousRooms[0] != "gid:aaaa" {
+		t.Fatalf("first pass ambiguousRooms = %#v, want the shared portal", first.ambiguousRooms)
+	}
+	if len(first.roomGroups) != 0 {
+		t.Errorf("first pass moved a room: %#v", first.roomGroups)
+	}
+	if len(first.rowReKeys) != 2 {
+		t.Fatalf("first pass rowReKeys = %#v, want both conversations re-keyed", first.rowReKeys)
+	}
+
+	// Apply the re-keys the way reKeyGroupCloudRows does, then re-plan.
+	applied := make([]groupConsolidationEntry, 0, len(entries))
+	for _, e := range entries {
+		for _, rk := range first.rowReKeys {
+			if rk.cloudChatID == e.cloudChatID {
+				e.portalID = rk.to
+			}
+		}
+		applied = append(applied, e)
+	}
+	second := planGroupConsolidation(applied)
+	if len(second.rowReKeys) != 0 || len(second.roomGroups) != 0 || len(second.ambiguousRooms) != 0 {
+		t.Errorf("second pass still has work: %#v", second)
 	}
 }

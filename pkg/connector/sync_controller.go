@@ -3901,9 +3901,12 @@ type groupRowReKey struct {
 
 // groupConsolidationPlan separates the two kinds of work: per-conversation
 // re-keys (pure DB) and Matrix room merges (homeserver round trips, budgeted).
+// ambiguousRooms carries the portals deliberately left alone, so the caller can
+// name them rather than silently doing nothing.
 type groupConsolidationPlan struct {
-	rowReKeys  []groupRowReKey
-	roomGroups []groupConsolidationGroup
+	rowReKeys      []groupRowReKey
+	roomGroups     []groupConsolidationGroup
+	ambiguousRooms []string
 }
 
 // groupConsolidationGroup is the set of group portals that resolve to
@@ -3973,14 +3976,26 @@ func planGroupConsolidation(entries []groupConsolidationEntry) groupConsolidatio
 			// and get their own room.
 			continue
 		}
-		// Nobody claims the current key. With one canonical this is the ordinary
-		// rename (the roster changed); with several, pick the lowest key so the
-		// choice is stable across runs instead of depending on row order.
+		// Nobody claims the current key. With ONE canonical this is the ordinary
+		// rename: the roster changed, and the room follows it.
+		//
+		// With several, there is no correct target. The room holds messages from
+		// more than one conversation (or from one, with no record of which), so
+		// any move files it under a roster that does not describe its contents.
+		// Picking the lowest key would be stable across runs but still a guess —
+		// the same shape of guess that orphanedGroupRoomPortalIDs used to make
+		// with MIN(portal_id) before #23 removed it. Leave the room where it is
+		// and let the caller name it; the rows still move to their own keys
+		// above, so the conversations themselves converge.
 		targets := make([]string, 0, len(canonicals))
 		for c := range canonicals {
 			targets = append(targets, c)
 		}
 		sort.Strings(targets)
+		if len(targets) > 1 {
+			plan.ambiguousRooms = append(plan.ambiguousRooms, portalID)
+			continue
+		}
 		target := targets[0]
 		if roomMembers[target] == nil {
 			roomMembers[target] = make(map[string]bool)
@@ -4079,6 +4094,15 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 
 	plan := planGroupConsolidation(entries)
 	groups := plan.roomGroups
+	if len(plan.ambiguousRooms) > 0 {
+		// Same disposition as the ambiguous orphans below: no room move is
+		// correct, so the room stays put and is logged by name rather than
+		// filed under one of its conversations' rosters. Their cloud rows have
+		// moved to their own keys, so new messages land in the right rooms and
+		// this room keeps the history it already holds.
+		log.Info().Strs("portal_ids", plan.ambiguousRooms).
+			Msg("Left group rooms in place — their conversations moved to more than one canonical key, so no room move is correct")
+	}
 
 	// Rediscover gid: rooms whose move was deferred on a prior startup: their
 	// cloud rows are already canonical (so the participant-key path above no
