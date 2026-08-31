@@ -4318,22 +4318,99 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	return count > 0, nil
 }
 
-// pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
-// record_name is not referenced by any live (non-deleted) cloud_message row.
-// This prevents unbounded growth after portal deletions or message tombstones
-// remove the messages that originally needed those cached attachments.
-func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
-	result, err := s.db.Exec(ctx, `
-		DELETE FROM cloud_attachment_cache
-		WHERE login_id=$1
-		  AND record_name NOT IN (
+// referencedAttachmentRecordNames returns the subquery selecting every
+// record_name still referenced by a live cloud_message row's attachments_json.
+//
+// There is no portable spelling. SQLite's JSON1 exposes json_each() as a table
+// function straight over a TEXT column, with json_extract() paths; Postgres has
+// json_each(json) — so a TEXT column fails to resolve at all ("function
+// json_each(text) does not exist") — and no json_extract() whatsoever, wanting
+// jsonb_array_elements() over an explicit cast and the ->> operator instead.
+// This shipped SQLite-only, so the prune has never run on Postgres and the
+// cache has been growing unchecked there.
+//
+// Two things the obvious Postgres translation gets wrong:
+//
+//   - The IS NOT NULL guard is load-bearing and must survive. The caller uses
+//     NOT IN, and a single NULL anywhere in this result makes NOT IN evaluate
+//     to NULL for every row, so the DELETE silently removes nothing. Dropping
+//     the guard would swap one silent no-op for another.
+//
+//   - The CASE guard belongs in the FROM clause, not the WHERE. What can abort
+//     the statement: an empty string cast to jsonb ("invalid input syntax for
+//     type json"), and any valid-but-non-array value ("cannot extract elements
+//     from a scalar" / "... from an object"). The string "null" is exactly
+//     that — valid JSON, a scalar — so an emptiness check does not exclude it,
+//     and renderableContentClause already lists it as a value this column is
+//     expected to hold.
+//
+//     A WHERE predicate would usually work: Postgres pushes quals that
+//     reference only cloud_message into the base scan, ahead of the
+//     implicit-LATERAL expansion, so a malformed row belonging to another
+//     login or already deleted never reaches the cast. That is a planner
+//     decision rather than a guarantee, and it only narrows the blast radius
+//     to one login's live rows. Putting the guard in the FROM does not depend
+//     on it. A CASE with no ELSE yields NULL for anything that fails the test,
+//     and jsonb_array_elements is strict, so NULL produces zero rows.
+//
+//   - The leading-"[" test does not cover everything the writer can emit. Go's
+//     json.Marshal renders a NUL byte in a filename as a backslash-u0000
+//     escape, which ::jsonb rejects outright ("unsupported Unicode escape
+//     sequence"); ::json accepts the cast but the subsequent ->> fails the
+//     same way. Such a row
+//     would abort the prune on Postgres while SQLite handles it, and the only
+//     surface is the log.Warn in runPostSyncHousekeeping. No row like that
+//     exists in the data checked so far, so it is left unguarded rather than
+//     paid for on every pass — but it is the next thing to suspect if this
+//     ever starts failing on a Postgres install.
+//
+//   - The SQLite branch below keeps its guard in the WHERE, which is exactly
+//     the position this comment argues against. It is load-bearing there:
+//     json_each over an unguarded empty string raises "malformed JSON". It
+//     works because SQLite evaluates a WHERE term at the earliest join loop
+//     where its columns are available — reliable in practice, but the same
+//     kind of planner behaviour rather than a promise. Left as it is because
+//     that branch is the one with production mileage; the asymmetry is
+//     deliberate, not an oversight.
+func referencedAttachmentRecordNames(db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return `
+			SELECT DISTINCT je->>'record_name'
+			FROM cloud_message,
+			     jsonb_array_elements(
+			         CASE WHEN cloud_message.attachments_json LIKE '[%'
+			              THEN cloud_message.attachments_json::jsonb END
+			     ) AS je
+			WHERE cloud_message.login_id=$1
+			  AND cloud_message.deleted=FALSE
+			  AND je->>'record_name' IS NOT NULL`
+	}
+	return `
 			SELECT DISTINCT json_extract(je.value, '$.record_name')
 			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
 			WHERE cloud_message.login_id=$1
 			  AND cloud_message.deleted=FALSE
 			  AND cloud_message.attachments_json IS NOT NULL
 			  AND cloud_message.attachments_json <> ''
-			  AND json_extract(je.value, '$.record_name') IS NOT NULL
+			  AND json_extract(je.value, '$.record_name') IS NOT NULL`
+}
+
+// pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
+// record_name is not referenced by any live (non-deleted) cloud_message row.
+// This prevents unbounded growth after portal deletions or message tombstones
+// remove the messages that originally needed those cached attachments.
+//
+// Both dialects still assume attachments_json parses when it looks like an
+// array, which the writer guarantees for everything it emits (either "" or a
+// marshalled non-empty []cloudAttachmentRow). A malformed row would abort the
+// statement on either database — unchanged behaviour on SQLite, where this has
+// always run, and a new failure mode on Postgres only in the sense that
+// nothing ran there at all before.
+func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
+	result, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_attachment_cache
+		WHERE login_id=$1
+		  AND record_name NOT IN (`+referencedAttachmentRecordNames(s.db)+`
 		  )
 	`, s.loginID)
 	if err != nil {

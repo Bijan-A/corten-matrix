@@ -1340,3 +1340,118 @@ func TestReKeyChatRowCarriesOrphanRowsWhenUnambiguous(t *testing.T) {
 		t.Errorf("orphan row at %q with carryOrphans=true, want %q", got, to)
 	}
 }
+
+// TestPruneOrphanedAttachmentCacheOnSQLite runs the real DELETE against SQLite:
+// an unreferenced cache row goes, a referenced one stays, and a row referenced
+// only by a DELETED message goes (that is the growth this prune exists to stop).
+func TestPruneOrphanedAttachmentCacheOnSQLite(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	const now = int64(1_700_000_000_000)
+
+	msg := func(guid, attachmentsJSON string, deleted int) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_message (login_id, guid, timestamp_ms, is_from_me, deleted, attachments_json, created_ts, updated_ts)
+			 VALUES ($1,$2,$3,0,$4,$5,$3,$3)`,
+			testSQLLoginID, guid, now, deleted, attachmentsJSON); err != nil {
+			t.Fatalf("insert message %s: %v", guid, err)
+		}
+	}
+	cache := func(recordName string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+			 VALUES ($1,$2,$3,$4)`,
+			testSQLLoginID, recordName, "{}", now); err != nil {
+			t.Fatalf("insert cache %s: %v", recordName, err)
+		}
+	}
+
+	msg("m-live", `[{"guid":"a","file_size":1,"record_name":"rec-live"}]`, 0)
+	msg("m-dead", `[{"guid":"b","file_size":1,"record_name":"rec-dead"}]`, 1)
+	// Empty and NULL attachment columns must not break the statement.
+	msg("m-none", "", 0)
+	if _, err := db.Exec(ctx,
+		`INSERT INTO cloud_message (login_id, guid, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
+		 VALUES ($1,$2,$3,0,0,$3,$3)`, testSQLLoginID, "m-null", now); err != nil {
+		t.Fatalf("insert null-attachment message: %v", err)
+	}
+
+	cache("rec-live")   // referenced by a live message — must survive
+	cache("rec-dead")   // referenced only by a deleted message — must go
+	cache("rec-orphan") // referenced by nothing at all — must go
+
+	n, err := store.pruneOrphanedAttachmentCache(ctx)
+	if err != nil {
+		t.Fatalf("pruneOrphanedAttachmentCache: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("pruned %d rows, want 2", n)
+	}
+
+	var survivors []string
+	rows, err := db.Query(ctx, `SELECT record_name FROM cloud_attachment_cache WHERE login_id=$1 ORDER BY record_name`, testSQLLoginID)
+	if err != nil {
+		t.Fatalf("read back cache: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		survivors = append(survivors, name)
+	}
+	if !reflect.DeepEqual(survivors, []string{"rec-live"}) {
+		t.Errorf("survivors = %v, want [rec-live]", survivors)
+	}
+}
+
+// TestReferencedAttachmentRecordNamesSpellsBothDialects pins the two spellings.
+//
+// The Postgres branch cannot be executed here — CI has no Postgres — and it is
+// precisely the branch that was broken for months, so the least this can do is
+// assert it uses the constructs that database actually has and keeps the two
+// guards that make it correct.
+func TestReferencedAttachmentRecordNamesSpellsBothDialects(t *testing.T) {
+	sqlite := referencedAttachmentRecordNames(&dbutil.Database{Dialect: dbutil.SQLite})
+	postgres := referencedAttachmentRecordNames(&dbutil.Database{Dialect: dbutil.Postgres})
+
+	for _, want := range []string{"json_each(cloud_message.attachments_json)", "json_extract(je.value, '$.record_name')"} {
+		if !strings.Contains(sqlite, want) {
+			t.Errorf("SQLite spelling missing %q:\n%s", want, sqlite)
+		}
+	}
+	// json_each over a TEXT column is the exact call that fails on Postgres
+	// with "function json_each(text) does not exist", and json_extract does
+	// not exist there at all.
+	for _, unwanted := range []string{"json_each(", "json_extract("} {
+		if strings.Contains(postgres, unwanted) {
+			t.Errorf("Postgres spelling still uses SQLite-only %q:\n%s", unwanted, postgres)
+		}
+	}
+	for _, want := range []string{
+		"jsonb_array_elements(",
+		"je->>'record_name'",
+		// The array guard must be INSIDE the FROM expression: a set-returning
+		// function is expanded before WHERE filters the row, so no WHERE
+		// predicate can protect the cast. Without it, an empty string, the
+		// scalar "null", or any non-array value aborts the whole DELETE.
+		"LIKE '[%'",
+		"CASE WHEN",
+		// Without this, one NULL makes the caller's NOT IN delete nothing.
+		"IS NOT NULL",
+	} {
+		if !strings.Contains(postgres, want) {
+			t.Errorf("Postgres spelling missing %q:\n%s", want, postgres)
+		}
+	}
+	// The guard is worthless in the WHERE clause, which is where it would
+	// naturally be written. Pin that it is not there.
+	if idx := strings.Index(postgres, "WHERE"); idx >= 0 && strings.Contains(postgres[idx:], "LIKE '[%'") {
+		t.Errorf("array guard is in the WHERE clause, where it cannot protect the cast:\n%s", postgres)
+	}
+}
