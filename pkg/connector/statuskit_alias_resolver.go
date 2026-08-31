@@ -451,8 +451,26 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: pre-warm ghost scan failed")
 		return
 	}
-	defer rows.Close()
-	primed := 0
+	// Drain the cursor completely before resolving anything. An open *sql.Rows
+	// holds a pooled connection for as long as it lives, and the resolve step
+	// below queries the same database (resolveSiblingHandleLive →
+	// findPortalByID → GetExistingPortalByKey) and writes to it
+	// (rememberAliasPortal → KV.Set). Issuing those inside the loop asks the
+	// pool for a second connection while the first is still held.
+	//
+	// How bad that is depends on the pool. With room to spare it merely wastes
+	// a connection for the length of the scan. With a single-connection pool it
+	// deadlocks outright: the second query can never be granted, the context is
+	// context.Background() so nothing times out, and the goroutine sits on the
+	// only connection AND — via GetExistingPortalByKey — the bridge-wide cache
+	// lock. Every later DB operation and portal lookup then blocks while the
+	// bridge still reports Connected.
+	//
+	// Upstream hit the deadlock after clamping SQLite to max_open_conns=1; this
+	// tree has no such clamp, so here it is latent rather than fatal. The
+	// nested query under an open cursor is the bug either way, and it is not
+	// worth leaving armed against a future pool change.
+	ghostIDs := make([]string, 0, 256)
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
@@ -461,6 +479,13 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 		if !strings.HasPrefix(ghostID, "mailto:") && !strings.HasPrefix(ghostID, "tel:") {
 			continue
 		}
+		ghostIDs = append(ghostIDs, ghostID)
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+
+	primed := 0
+	for _, ghostID := range ghostIDs {
 		if _, ok := c.statusKitPortalCache.Load(ghostID); ok {
 			continue
 		}
@@ -469,7 +494,7 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 			primed++
 		}
 	}
-	if err := rows.Err(); err != nil {
+	if err := rowsErr; err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: pre-warm row iteration error")
 	}
 	log.Info().Int("primed", primed).Msg("StatusKit alias-resolver: pre-warm complete")
