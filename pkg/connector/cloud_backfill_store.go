@@ -4283,22 +4283,35 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 //     to NULL for every row, so the DELETE silently removes nothing. Dropping
 //     the guard would swap one silent no-op for another.
 //
-//   - NULLIF is not decoration. A set-returning function in FROM is expanded
-//     before WHERE filters it, so the empty-string guard in the WHERE clause
-//     below cannot protect the cast: casting an empty string to jsonb raises
-//     "invalid input syntax for type json" and aborts the whole statement.
-//     NULLIF turns it into NULL first, and jsonb_array_elements is strict, so
-//     a NULL yields no rows.
+//   - The CASE guard is not decoration, and it has to sit in the FROM clause.
+//     A set-returning function there is expanded BEFORE any WHERE filters the
+//     row, so no WHERE predicate can protect the cast or the call. An empty
+//     string cast to jsonb raises "invalid input syntax for type json", and a
+//     valid but non-array value raises "cannot extract elements from a scalar"
+//     (or "... from an object"). Either aborts the whole DELETE. Note that the
+//     string "null" is valid JSON and IS a scalar, so an emptiness check does
+//     not exclude it. Guarding on a leading "[" admits only what the writer can
+//     actually produce, and a CASE with no ELSE yields NULL for everything
+//     else — which jsonb_array_elements, being strict, turns into zero rows.
+//
+//   - SQLite needs none of that, which is why the gap was invisible:
+//     json_each('null') returns one row whose json_extract is NULL, and the
+//     IS NOT NULL guard already drops it. The same input is silently ignored
+//     there and fatal here. The sole writer (sync_controller, guarded by
+//     len(attRows) > 0) has only ever emitted a non-empty array, so this is
+//     insurance rather than a fix — but insurance on a branch that has never
+//     run in production is worth its two lines.
 func referencedAttachmentRecordNames(db *dbutil.Database) string {
 	if db.Dialect == dbutil.Postgres {
 		return `
 			SELECT DISTINCT je->>'record_name'
 			FROM cloud_message,
-			     jsonb_array_elements(NULLIF(cloud_message.attachments_json, '')::jsonb) AS je
+			     jsonb_array_elements(
+			         CASE WHEN cloud_message.attachments_json LIKE '[%'
+			              THEN cloud_message.attachments_json::jsonb END
+			     ) AS je
 			WHERE cloud_message.login_id=$1
 			  AND cloud_message.deleted=FALSE
-			  AND cloud_message.attachments_json IS NOT NULL
-			  AND cloud_message.attachments_json <> ''
 			  AND je->>'record_name' IS NOT NULL`
 	}
 	return `

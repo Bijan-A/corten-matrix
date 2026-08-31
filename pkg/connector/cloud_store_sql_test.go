@@ -1402,14 +1402,22 @@ func TestReferencedAttachmentRecordNamesSpellsBothDialects(t *testing.T) {
 	for _, want := range []string{
 		"jsonb_array_elements(",
 		"je->>'record_name'",
-		// Without NULLIF, the cast runs before the WHERE guard and an empty
-		// string aborts the statement.
-		"NULLIF(cloud_message.attachments_json, '')",
+		// The array guard must be INSIDE the FROM expression: a set-returning
+		// function is expanded before WHERE filters the row, so no WHERE
+		// predicate can protect the cast. Without it, an empty string, the
+		// scalar "null", or any non-array value aborts the whole DELETE.
+		"LIKE '[%'",
+		"CASE WHEN",
 		// Without this, one NULL makes the caller's NOT IN delete nothing.
 		"IS NOT NULL",
 	} {
 		if !strings.Contains(postgres, want) {
 			t.Errorf("Postgres spelling missing %q:\n%s", want, postgres)
 		}
+	}
+	// The guard is worthless in the WHERE clause, which is where it would
+	// naturally be written. Pin that it is not there.
+	if idx := strings.Index(postgres, "WHERE"); idx >= 0 && strings.Contains(postgres[idx:], "LIKE '[%'") {
+		t.Errorf("array guard is in the WHERE clause, where it cannot protect the cast:\n%s", postgres)
 	}
 }
