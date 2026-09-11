@@ -347,13 +347,20 @@ func (c *IMClient) canonicalizeDMSender(portalKey networkid.PortalKey, sender br
 // The guard reasons about PEOPLE instead of cards. contactPersonIndex derives,
 // once per contact sync, which person owns each handle; a merge is allowed only
 // between two handles the same person owns exclusively. A handle two people
-// claim is evidence about neither and is never traversed — it is also the
-// handle whose card lookup depends on map iteration order, so merging through
-// one would flap between restarts and churn rooms.
+// claim is evidence about neither and is never traversed.
+//
+// Which of the two cards a lookup returns for such a handle is decided by
+// last-write-wins as SyncContacts walks the address book in document order, so
+// it is stable for a given response but arbitrary: nothing about the data says
+// the later card is the right answer, and a server that reorders its response
+// or an edit to either card can swap it. Merging through a handle whose owner
+// is picked that way is a coin flip, and one that can land differently after a
+// re-sync.
 //
 // Refusing a merge is the safe direction: the worst case is two rooms for one
-// contact. Wrongly merging is not recoverable the same way — it needs the
-// retroactive repair in dm_merge_repair.go.
+// contact, which costs nothing but clutter. Wrongly merging is not recoverable
+// the same way — this guard prevents new merges but does not split a room that
+// already holds two people's conversations, which needs a separate repair.
 
 // contactIdentityKey returns a case-folded identity for a named contact card.
 //
@@ -397,7 +404,7 @@ type contactPersonIndex struct {
 	// the handle, or when more than one person does (see ambiguous).
 	owner map[string]string
 	// ambiguous holds handles claimed by two or more people. Never merged
-	// through, and the fingerprint dm_merge_repair.go looks for.
+	// through, and the fingerprint a retroactive repair would look for.
 	ambiguous map[string]struct{}
 	// handles maps a person key to every handle they exclusively own, sorted.
 	// Read instead of a single card's handle list so a person split across
@@ -408,6 +415,27 @@ type contactPersonIndex struct {
 
 // buildContactPersonIndex groups cards into people by compatible name, then
 // records each handle's claimant.
+// buildContactPersonIndex groups cards into people, then records each handle's
+// claimant.
+//
+// Two cards are the same person only when they agree on BOTH the case-folded
+// name and at least one handle. Name alone is not enough: two strangers who
+// share a name would have their handle sets unioned, and then
+// resolveContactPortalID would send one of them's DM into the other's portal —
+// this file's own bug, reached by a different route. Requiring a shared handle
+// is corroboration; a name is a label, a handle is an identity claim.
+//
+// The cost is that one person whose cards carry disjoint handles reads as two
+// people and their handles do not merge, so they may get one room per card.
+// That is the same trade this file makes everywhere: an extra room is
+// non-destructive and reversible, a wrong merge is neither. On the address book
+// this was developed against, 5 names had more than one card — 2 shared a
+// handle (still merged) and 3 did not (no longer merged, previously a silent
+// cross-card union).
+//
+// The person key is therefore NOT the name. Two components can share a name, so
+// keying on it would collapse exactly the case this guards against; the key is
+// the name plus the component's lowest handle, which is unique per component.
 func buildContactPersonIndex(contacts []*imessage.Contact) *contactPersonIndex {
 	idx := &contactPersonIndex{
 		owner:     make(map[string]string),
@@ -415,15 +443,87 @@ func buildContactPersonIndex(contacts []*imessage.Contact) *contactPersonIndex {
 		handles:   make(map[string][]string),
 	}
 
-	claimants := make(map[string]map[string]struct{})
+	type cardInfo struct {
+		name    string
+		handles []string
+	}
+	cards := make([]cardInfo, 0, len(contacts))
 	for _, contact := range contacts {
-		// The person key IS the case-folded name. Unnamed cards carry no
-		// identity and never drive a merge (every caller gates on HasName).
-		person := contactIdentityKey(contact)
-		if person == "" {
+		// Unnamed cards carry no identity to compare and never drive a merge
+		// (every caller gates on HasName).
+		name := contactIdentityKey(contact)
+		if name == "" {
 			continue
 		}
-		for _, handle := range contactPortalIDs(contact) {
+		handles := contactPortalIDs(contact)
+		if len(handles) == 0 {
+			continue
+		}
+		cards = append(cards, cardInfo{name: name, handles: handles})
+	}
+
+	// Union-find over cards. Only cards that already share a name are ever
+	// compared, so this stays near-linear instead of quadratic over the book.
+	parent := make([]int, len(cards))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(x int) int {
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
+		}
+		return x
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra == rb {
+			return
+		}
+		// Lowest index wins, so a component's representative does not depend on
+		// the order the shared handles happened to be discovered in.
+		if ra < rb {
+			parent[rb] = ra
+		} else {
+			parent[ra] = rb
+		}
+	}
+	// Within one name, the first card seen claiming a handle owns it; any later
+	// card claiming the same handle joins that card's component.
+	claimedWithinName := make(map[string]int, len(cards))
+	for i, card := range cards {
+		for _, handle := range card.handles {
+			key := card.name + "\x00" + handle
+			if j, seen := claimedWithinName[key]; seen {
+				union(i, j)
+			} else {
+				claimedWithinName[key] = i
+			}
+		}
+	}
+
+	// Collect each component's handles, then name it.
+	componentHandles := make(map[int][]string)
+	for i, card := range cards {
+		root := find(i)
+		componentHandles[root] = append(componentHandles[root], card.handles...)
+	}
+	personKey := make(map[int]string, len(componentHandles))
+	for root, handles := range componentHandles {
+		low := ""
+		for _, h := range handles {
+			if low == "" || h < low {
+				low = h
+			}
+		}
+		personKey[root] = cards[root].name + "|" + low
+	}
+
+	claimants := make(map[string]map[string]struct{})
+	for i := range cards {
+		person := personKey[find(i)]
+		for _, handle := range cards[i].handles {
 			set := claimants[handle]
 			if set == nil {
 				set = make(map[string]struct{}, 1)
@@ -434,6 +534,8 @@ func buildContactPersonIndex(contacts []*imessage.Contact) *contactPersonIndex {
 	}
 	for handle, people := range claimants {
 		if len(people) > 1 {
+			// Claimed by two components — two different people as far as this
+			// index can tell. Never merged through, in either direction.
 			idx.ambiguous[handle] = struct{}{}
 			continue
 		}
@@ -443,9 +545,24 @@ func buildContactPersonIndex(contacts []*imessage.Contact) *contactPersonIndex {
 		}
 	}
 	for person, hs := range idx.handles {
-		idx.handles[person] = sortContactHandles(hs)
+		idx.handles[person] = sortContactHandles(dedupeHandles(hs))
 	}
 	return idx
+}
+
+// dedupeHandles removes repeats, which arise when several cards in one
+// component list the same handle (the shared handle that joined them).
+func dedupeHandles(handles []string) []string {
+	seen := make(map[string]struct{}, len(handles))
+	out := handles[:0]
+	for _, h := range handles {
+		if _, dup := seen[h]; dup {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	return out
 }
 
 // contactPersonIndex returns the cached index for the installed contact source,

@@ -368,3 +368,92 @@ func TestSortContactHandles(t *testing.T) {
 		t.Errorf("sortContactHandles() = %#v, want %#v", got, want)
 	}
 }
+
+// TestBuildContactPersonIndexKeepsSameNamedStrangersApart is the reviewer's
+// reproduction from PR #31: two different people who happen to share a name,
+// each with their own handle and nothing in common.
+//
+// Keying a person on the name alone unioned their handle sets, so
+// resolveContactPortalID would adopt the stranger's portal, canonicalizeDMSender
+// would relabel the inbound messages to match, and resolveSendTarget would fall
+// back to the stranger's number — this file's own bug via a different route. It
+// was also a regression: before the person index, resolveContactPortalID read a
+// single card, so two one-handle cards hit len(altIDs) <= 1 and never merged.
+func TestBuildContactPersonIndexKeepsSameNamedStrangersApart(t *testing.T) {
+	one := card("Jordan", "Example", []string{"+15551111111"}, nil)
+	two := card("Jordan", "Example", []string{"+15552222222"}, nil)
+
+	idx := buildContactPersonIndex([]*imessage.Contact{one, two})
+
+	a, b := "tel:+15551111111", "tel:+15552222222"
+	if idx.owner[a] == idx.owner[b] {
+		t.Fatalf("owner[%s] == owner[%s] (%q) — an identical name is not proof of one person", a, b, idx.owner[a])
+	}
+	c := bookClient([]*imessage.Contact{one, two})
+	if got := c.mutualContactHandles(a); got != nil {
+		t.Errorf("mutualContactHandles(%s) = %#v, want nil — must not reach the stranger's number", a, got)
+	}
+	if got := c.mutualContactHandles(b); got != nil {
+		t.Errorf("mutualContactHandles(%s) = %#v, want nil", b, got)
+	}
+}
+
+// The other half, which had no coverage at all: one person split across two
+// cards that DO corroborate each other by sharing a handle. Their handles must
+// still union, or the cross-card merge this index exists for is dead.
+func TestBuildContactPersonIndexUnionsCorroboratedCards(t *testing.T) {
+	// Both cards carry the mobile; each adds an address the other lacks.
+	first := card("Riley", "Example", []string{"+15555550110"}, []string{"riley@example.com"})
+	second := card("Riley", "Example", []string{"+15555550110"}, []string{"riley.example@icloud.example"})
+
+	idx := buildContactPersonIndex([]*imessage.Contact{first, second})
+
+	phone := "tel:+15555550110"
+	if _, amb := idx.ambiguous[phone]; amb {
+		t.Fatalf("ambiguous[%s] set — a shared handle is what proves the two cards are one person", phone)
+	}
+	got := idx.handles[idx.owner[phone]]
+	want := []string{phone, "mailto:riley.example@icloud.example", "mailto:riley@example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("handles[person] = %#v, want %#v (deduped, tel: first)", got, want)
+	}
+	c := bookClient([]*imessage.Contact{first, second})
+	if got := c.mutualContactHandles("mailto:riley@example.com"); len(got) != 2 || got[0] != phone {
+		t.Errorf("mutualContactHandles(email) = %#v, want the phone first plus the other email", got)
+	}
+}
+
+// Three cards chained by shared handles are one person even though no single
+// pair carries every handle — the union must be transitive within a name.
+func TestBuildContactPersonIndexUnionsTransitivelyWithinAName(t *testing.T) {
+	a := card("Sam", "Example", []string{"+15555550120"}, nil)
+	b := card("Sam", "Example", []string{"+15555550120", "+15555550121"}, nil)
+	cc := card("Sam", "Example", []string{"+15555550121"}, []string{"sam@example.com"})
+
+	idx := buildContactPersonIndex([]*imessage.Contact{a, b, cc})
+
+	owner := idx.owner["tel:+15555550120"]
+	if owner == "" || idx.owner["mailto:sam@example.com"] != owner {
+		t.Fatalf("the chain a-b-c should be one person: owner[first]=%q owner[last]=%q",
+			owner, idx.owner["mailto:sam@example.com"])
+	}
+	if got := len(idx.handles[owner]); got != 3 {
+		t.Errorf("handles[person] has %d entries, want 3 deduped", got)
+	}
+}
+
+// A same-name stranger must not become ambiguous either — that would refuse the
+// merges within each person's own card, which is not what the collision implies.
+func TestBuildContactPersonIndexSameNamedStrangersStillMergeTheirOwnHandles(t *testing.T) {
+	one := card("Alex", "Example", []string{"+15555550130"}, []string{"alex.one@example.com"})
+	two := card("Alex", "Example", []string{"+15555550131"}, []string{"alex.two@example.com"})
+
+	c := bookClient([]*imessage.Contact{one, two})
+
+	if got := c.mutualContactHandles("tel:+15555550130"); !reflect.DeepEqual(got, []string{"mailto:alex.one@example.com"}) {
+		t.Errorf("mutualContactHandles() = %#v, want only this card's own email", got)
+	}
+	if got := c.mutualContactHandles("tel:+15555550131"); !reflect.DeepEqual(got, []string{"mailto:alex.two@example.com"}) {
+		t.Errorf("mutualContactHandles() = %#v, want only the other card's own email", got)
+	}
+}

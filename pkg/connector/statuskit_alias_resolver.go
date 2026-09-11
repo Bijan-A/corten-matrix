@@ -356,14 +356,12 @@ func (c *IMClient) resolveSiblingHandleLive(ctx context.Context, log zerolog.Log
 
 	// Address book: a sibling listed as a contact resolves through the
 	// contact store's portal IDs.
-	{
-		for _, altID := range c.mutualContactHandles(normalized) {
-			if !strings.HasPrefix(altID, "tel:") && !strings.HasPrefix(altID, "mailto:") {
-				continue
-			}
-			if p := c.findPortalByID(ctx, networkid.PortalID(altID)); p != nil {
-				return p
-			}
+	for _, altID := range c.mutualContactHandles(normalized) {
+		if !strings.HasPrefix(altID, "tel:") && !strings.HasPrefix(altID, "mailto:") {
+			continue
+		}
+		if p := c.findPortalByID(ctx, networkid.PortalID(altID)); p != nil {
+			return p
 		}
 	}
 
