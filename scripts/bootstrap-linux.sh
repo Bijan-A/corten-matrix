@@ -21,7 +21,6 @@ command -v make   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES build-essential
 command -v cc     >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES build-essential"
 command -v g++    >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES build-essential"
 dpkg -s pkg-config   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES pkg-config"
-dpkg -s libolm-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libolm-dev"
 dpkg -s libclang-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libclang-dev"
 dpkg -s libssl-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libssl-dev"
 dpkg -s libheif-dev    >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libheif-dev"
