@@ -50,12 +50,25 @@ ifneq ($(UNAME_S),Darwin)
   $(error This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework. Build and run it on a Mac.)
 endif
 
+# GO_TAGS selects mautrix's pure-Go olm implementation. Without `goolm`,
+# maunium.net/go/mautrix/crypto pulls in crypto/libolm (see its
+# registerlibolm.go, `//go:build !goolm`), which is cgo linking `-lolm`.
+# Homebrew deprecated libolm in August 2024 after matrix.org deprecated olm
+# upstream, and has since removed the formula outright — `brew install libolm`
+# now fails with "No available formula". The tag drops the dependency rather
+# than chasing an EOL C library; goolm reads libolm's pickle format, so an
+# existing encrypted install keeps its sessions.
+#
+# Every `go` invocation that compiles this tree needs it, here and in CI.
+GO_TAGS := goolm
+
 # Homebrew's prefix differs by architecture: /opt/homebrew on Apple Silicon,
 # /usr/local on Intel. Ask brew rather than hardcoding, or an Intel build fails
-# to find olm/olm.h. Note these are `:=` assignments, which take precedence over
-# the environment in GNU make — so exporting CGO_CFLAGS cannot work around a
-# wrong value here, only a command-line override can. Deriving it is what lets
-# `make` and `corten-matrix update source` work unmodified on both arches.
+# to find libheif's headers. Note these are `:=` assignments, which take
+# precedence over the environment in GNU make — so exporting CGO_CFLAGS cannot
+# work around a wrong value here, only a command-line override can. Deriving it
+# is what lets `make` and `corten-matrix update source` work unmodified on both
+# arches.
 BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 ifeq ($(BREW_PREFIX),)
   # brew isn't installed yet (check-deps installs it below); guess by arch.
@@ -89,7 +102,6 @@ check-deps:
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	command -v tmux >/dev/null 2>&1  || missing="$$missing tmux"; \
-	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
 	pkg-config --exists libheif 2>/dev/null || missing="$$missing libheif"; \
 	if [ -n "$$missing" ]; then \
 		echo "Installing dependencies:$$missing"; \
@@ -257,7 +269,7 @@ build: check-deps $(RUST_LIB) $(BINARY)
 
 $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
+		go build -tags '$(GO_TAGS)' -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 	@# Sign with a STABLE identifier so macOS/TCC can track this binary across
 	@# rebuilds (the arm64 linker otherwise leaves it as 'a.out', untrackable) —
 	@# needed for the Full Disk Access probe to register it for chat.db backfill.

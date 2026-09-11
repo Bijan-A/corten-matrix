@@ -676,7 +676,7 @@ Instead of downloading a release you can build the bridge yourself on a Mac. Thi
 - Xcode Command Line Tools (`xcode-select --install`).
 - A checkout path **without spaces** — CGO and the linker can't handle spaces in library paths.
 
-Everything else (Homebrew, Go, Rust, protobuf, libolm, libheif, tmux) is installed for you on the first build.
+Everything else (Homebrew, Go, Rust, protobuf, libheif, tmux) is installed for you on the first build.
 
 **Build**
 
@@ -686,7 +686,7 @@ cd corten-matrix
 make
 ```
 
-**On Intel Macs, override the Homebrew prefix.** The Makefile hardcodes `/opt/homebrew`, which only exists on Apple Silicon. If `brew --prefix` prints `/usr/local`, plain `make` fails to find `olm/olm.h`; pass the CGO flags explicitly:
+**On Intel Macs, override the Homebrew prefix.** The Makefile hardcodes `/opt/homebrew`, which only exists on Apple Silicon. If `brew --prefix` prints `/usr/local`, plain `make` fails to find libheif's headers; pass the CGO flags explicitly:
 
 ```bash
 make CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"

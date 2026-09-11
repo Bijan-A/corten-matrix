@@ -30,7 +30,7 @@ You also need:
 - a checkout path **without spaces** — CGO and the linker cannot handle them
 - roughly 10 GB free, mostly cargo build artifacts
 
-Homebrew, Go, Rust, protobuf, libolm, libheif and tmux are installed for you on
+Homebrew, Go, Rust, protobuf, libheif and tmux are installed for you on
 the first build.
 
 ## Build and test
@@ -39,12 +39,12 @@ the first build.
 git clone https://github.com/Bijan-A/corten-matrix.git
 cd corten-matrix
 make
-go test ./pkg/... ./imessage/...
+go test -tags goolm ./pkg/... ./imessage/...
 ```
 
 **On Intel Macs**, the Makefile hardcodes the Apple Silicon Homebrew prefix
 (`/opt/homebrew`). If `brew --prefix` prints `/usr/local`, plain `make` fails to
-find `olm/olm.h`:
+find libheif's headers:
 
 ```bash
 make CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib -L$PWD"
@@ -146,7 +146,7 @@ indefinitely without starting. So CI builds the slice it can and hands over. A
 job that hangs forever is worse than one that doesn't exist.
 
 Cross-compiling the second slice isn't an option either: this is a CGO project
-linking `libolm` and `libheif` from Homebrew, which is single-arch, so an
+linking `libheif` from Homebrew, which is single-arch, so an
 x86_64 link on an arm64 host fails at the linker.
 
 ### Version scheme

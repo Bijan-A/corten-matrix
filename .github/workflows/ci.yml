@@ -71,7 +71,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install build dependencies
-        run: brew install protobuf libolm libheif tmux
+        run: brew install protobuf libheif tmux
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -132,10 +132,10 @@ jobs:
           # forbids hand-editing it, and its FFI shims trip vet's
           # unsafe.Pointer check by construction. Everything else is vetted,
           # discovered dynamically so a new package is never silently skipped.
-          pkgs="$(go list ./... | grep -v '/pkg/rustpushgo$')"
+          pkgs="$(go list -tags goolm ./... | grep -v '/pkg/rustpushgo$')"
           echo "$pkgs"
           # shellcheck disable=SC2086
-          go vet $pkgs
+          go vet -tags goolm $pkgs
 
       - name: go test
         run: |
@@ -144,4 +144,4 @@ jobs:
           # so its tests need the same CGO flags the build used.
           BREW="$(brew --prefix)"
           CGO_CFLAGS="-I${BREW}/include" CGO_LDFLAGS="-L${BREW}/lib -L${PWD}" \
-            go test ./pkg/... ./imessage/...
+            go test -tags goolm ./pkg/... ./imessage/...
