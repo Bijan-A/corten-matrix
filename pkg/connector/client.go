@@ -394,13 +394,13 @@ type IMClient struct {
 	// Guards the one-shot diverged-DM-name repair; see repairDivergedDMRoomNames.
 	dmNameRepairRan atomic.Bool
 
-	// Caches the set of contact handles more than one person claims, so the
-	// cross-contact merge guard doesn't rebuild it per lookup. Generation is
-	// the contact source's (count, lastSync); see sharedContactHandles.
-	sharedHandlesMu       sync.RWMutex
-	personIndex           *contactPersonIndex
-	sharedHandlesContacts int
-	sharedHandlesSync     time.Time
+	// Caches which person owns each contact handle, so the cross-contact merge
+	// guard doesn't rebuild the index per lookup. Generation is the contact
+	// source's (count, lastSync); see contactPersonIndex.
+	personIndexMu       sync.RWMutex
+	personIndex         *contactPersonIndex
+	personIndexContacts int
+	personIndexSync     time.Time
 
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool

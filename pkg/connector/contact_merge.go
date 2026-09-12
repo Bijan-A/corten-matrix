@@ -413,8 +413,6 @@ type contactPersonIndex struct {
 	handles map[string][]string
 }
 
-// buildContactPersonIndex groups cards into people by compatible name, then
-// records each handle's claimant.
 // buildContactPersonIndex groups cards into people, then records each handle's
 // claimant.
 //
@@ -436,6 +434,13 @@ type contactPersonIndex struct {
 // The person key is therefore NOT the name. Two components can share a name, so
 // keying on it would collapse exactly the case this guards against; the key is
 // the name plus the component's lowest handle, which is unique per component.
+//
+// The limit of the rule: two DIFFERENT people who share both a name and a
+// handle still union, and that handle is not marked ambiguous — the household
+// shape with a name collision on top. Nothing in an address book distinguishes
+// that from one person listed on two cards, which is the same reason a
+// corroborated union is trusted at all. It is strictly better than keying on
+// the name alone, not airtight.
 func buildContactPersonIndex(contacts []*imessage.Contact) *contactPersonIndex {
 	idx := &contactPersonIndex{
 		owner:     make(map[string]string),
@@ -580,21 +585,21 @@ func (c *IMClient) contactPersonIndex() *contactPersonIndex {
 	}
 	count, lastSync := store.CacheStatus()
 
-	c.sharedHandlesMu.RLock()
-	if c.personIndex != nil && c.sharedHandlesContacts == count && c.sharedHandlesSync.Equal(lastSync) {
+	c.personIndexMu.RLock()
+	if c.personIndex != nil && c.personIndexContacts == count && c.personIndexSync.Equal(lastSync) {
 		cached := c.personIndex
-		c.sharedHandlesMu.RUnlock()
+		c.personIndexMu.RUnlock()
 		return cached
 	}
-	c.sharedHandlesMu.RUnlock()
+	c.personIndexMu.RUnlock()
 
 	idx := buildContactPersonIndex(store.GetAllContacts())
 
-	c.sharedHandlesMu.Lock()
+	c.personIndexMu.Lock()
 	c.personIndex = idx
-	c.sharedHandlesContacts = count
-	c.sharedHandlesSync = lastSync
-	c.sharedHandlesMu.Unlock()
+	c.personIndexContacts = count
+	c.personIndexSync = lastSync
+	c.personIndexMu.Unlock()
 	return idx
 }
 

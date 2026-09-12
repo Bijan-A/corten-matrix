@@ -457,3 +457,52 @@ func TestBuildContactPersonIndexSameNamedStrangersStillMergeTheirOwnHandles(t *t
 		t.Errorf("mutualContactHandles() = %#v, want only the other card's own email", got)
 	}
 }
+
+// TestBuildContactPersonIndexUnionsSameNamedPeopleSharingAHandle pins the known
+// limit of the corroboration rule, so a future change to it is a deliberate one.
+//
+// Two DIFFERENT people who share both a name and a handle still union, and the
+// shared handle is NOT marked ambiguous — the household shape with a name
+// collision on top. No address book distinguishes that from one person listed
+// on two cards, which is the same reason a corroborated union is trusted at all.
+// This documents the behaviour rather than endorsing it.
+func TestBuildContactPersonIndexUnionsSameNamedPeopleSharingAHandle(t *testing.T) {
+	// Two people called Ann Example who both list the household landline.
+	annA := card("Ann", "Example", []string{"+15555550140", "+15555550199"}, nil)
+	annB := card("Ann", "Example", []string{"+15555550141", "+15555550199"}, nil)
+
+	idx := buildContactPersonIndex([]*imessage.Contact{annA, annB})
+
+	if _, amb := idx.ambiguous[sharedLine]; amb {
+		t.Fatalf("ambiguous[%s] set — known limit: a same-name pair corroborates through it", sharedLine)
+	}
+	if got := len(idx.handles[idx.owner[sharedLine]]); got != 3 {
+		t.Errorf("handles[person] = %d, want all 3 unioned (the documented limit)", got)
+	}
+}
+
+// ...but a third, differently-named person claiming the same handle still makes
+// it ambiguous, and that must not cost the same-named pair their own merge.
+// This is the case the reviewer most expected to break.
+func TestBuildContactPersonIndexAmbiguityBeatsCorroboration(t *testing.T) {
+	annA := card("Ann", "Example", []string{"+15555550140", "+15555550199"}, nil)
+	annB := card("Ann", "Example", []string{"+15555550141", "+15555550199"}, nil)
+	other := card("Blake", "Example", []string{"+15555550142", "+15555550199"}, nil)
+
+	c := bookClient([]*imessage.Contact{annA, annB, other})
+	idx := c.contactPersonIndex()
+
+	if _, amb := idx.ambiguous[sharedLine]; !amb {
+		t.Fatalf("ambiguous[%s] missing — two named people claim it, so it is evidence about neither", sharedLine)
+	}
+	// The Anns keep their own handles despite the refused shared line.
+	if got := c.mutualContactHandles("tel:+15555550140"); !reflect.DeepEqual(got, []string{"tel:+15555550141"}) {
+		t.Errorf("mutualContactHandles(annA) = %#v, want the other Ann handle — refusing the shared line must not cost this", got)
+	}
+	if got := c.mutualContactHandles("tel:+15555550142"); got != nil {
+		t.Errorf("mutualContactHandles(other) = %#v, want nil — the shared line was their only alternate", got)
+	}
+	if got := c.mutualContactHandles(sharedLine); got != nil {
+		t.Errorf("mutualContactHandles(shared) = %#v, want nil", got)
+	}
+}
