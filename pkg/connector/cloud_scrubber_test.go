@@ -333,3 +333,72 @@ func TestCountUndeliveredScrubbedMessages(t *testing.T) {
 		t.Errorf("countUndeliveredScrubbedMessages(p-other) = %d, want 1 — another login's delivery is not ours", got)
 	}
 }
+
+// TestCachedBridgedGUIDSetReusesOneLoad pins the memoisation that keeps the
+// per-portal delivery check from re-reading the whole message table.
+//
+// loadBridgedGUIDSet reads every delivered id for the login, so calling it once
+// per portal reintroduces the cost the scrubber restructure removed. Group
+// consolidation resets fwd_backfill_done for every group, sending a wave of
+// delivered-and-scrubbed portals down the zero-message path at once, so this is
+// not a rare path.
+func TestCachedBridgedGUIDSetReusesOneLoad(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"G-ONE", "test-bridge", string(testSQLLoginID)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	first, err := store.cachedBridgedGUIDSet(ctx, "test-bridge")
+	if err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if _, ok := first["g-one"]; !ok {
+		t.Fatalf("first load missing g-one: %v", first)
+	}
+
+	// A row added after the load must NOT appear while the entry is warm —
+	// that is the observable signature of reuse rather than a re-read.
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"G-TWO", "test-bridge", string(testSQLLoginID)); err != nil {
+		t.Fatalf("insert second: %v", err)
+	}
+	second, err := store.cachedBridgedGUIDSet(ctx, "test-bridge")
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if _, ok := second["g-two"]; ok {
+		t.Error("cachedBridgedGUIDSet re-read the table; the wave would pay a full scan per portal")
+	}
+
+	// Staleness must only ever over-report undelivered, never under-report:
+	// a row missing from the cached set is treated as not delivered, which is
+	// the conservative answer. G-TWO is scrubbed but absent from the warm set.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_message
+		  (login_id, guid, portal_id, timestamp_ms, is_from_me, record_name,
+		   body_scrubbed, deleted, created_ts, updated_ts)
+		VALUES ($1, 'G-TWO', 'p-stale', 1000, FALSE, 'r', TRUE, FALSE, 1000, 1000)`,
+		testSQLLoginID); err != nil {
+		t.Fatalf("insert cloud_message: %v", err)
+	}
+	got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", "p-stale")
+	if err != nil {
+		t.Fatalf("countUndeliveredScrubbedMessages: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("countUndeliveredScrubbedMessages = %d, want 1 — a stale set must err toward reporting loss", got)
+	}
+
+	// A different bridge id must not be served from the cache.
+	other, err := store.cachedBridgedGUIDSet(ctx, "other-bridge")
+	if err != nil {
+		t.Fatalf("other bridge: %v", err)
+	}
+	if len(other) != 0 {
+		t.Errorf("cachedBridgedGUIDSet(other-bridge) = %v, want empty — the cache is per bridge id", other)
+	}
+}

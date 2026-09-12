@@ -8490,15 +8490,28 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// run, with a "VISIBLE data loss" error for history that was
 				// fully present in Matrix.
 				undelivered, undelErr := c.cloudStore.countUndeliveredScrubbedMessages(ctx, string(c.Main.Bridge.ID), portalID)
-				if undelErr != nil {
+				// deliveryCheckFailed keeps the logging honest about what the
+				// count below actually measures. In the degraded branch it is
+				// the TOTAL scrubbed rows, not the undelivered ones, and
+				// reporting that as "undelivered" would overstate the loss
+				// under a label claiming precision — the same false-alarm
+				// shape this guard exists to remove.
+				deliveryCheckFailed := undelErr != nil
+				if deliveryCheckFailed {
 					// Can't prove the portal is safe, so fall back to the old
 					// conservative behaviour rather than skipping a real loss.
 					log.Warn().Err(undelErr).Str("portal_id", portalID).
 						Msg("Forward backfill: could not check delivery of scrubbed rows — assuming recovery is needed")
 					undelivered, _ = c.cloudStore.countScrubbedBackfillableMessages(ctx, portalID)
 				}
+				scrubbedCount := func(e *zerolog.Event) *zerolog.Event {
+					if deliveryCheckFailed {
+						return e.Int("scrubbed_total", undelivered).Bool("delivery_check_failed", true)
+					}
+					return e.Int("undelivered", undelivered)
+				}
 				if undelivered > 0 {
-					log.Warn().Str("portal_id", portalID).Int("undelivered", undelivered).
+					scrubbedCount(log.Warn().Str("portal_id", portalID)).
 						Msg("Forward backfill: 0 messages but portal has body-scrubbed rows that never reached Matrix — rehydrating from CloudKit before marking done")
 					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
 						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
@@ -8519,7 +8532,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// genuinely unrecoverable. Surface the loss loudly (it was
 						// silent before) and mark done so the backward-backfill queue
 						// doesn't loop forever on an anchor that will never appear.
-						log.Error().Str("portal_id", portalID).Int("undelivered", undelivered).
+						scrubbedCount(log.Error().Str("portal_id", portalID)).
 							Msg("Forward backfill: body-scrubbed rows could not be rehydrated from CloudKit — history unrecoverable, marking done (VISIBLE data loss)")
 					}
 				}

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,7 +20,29 @@ import (
 type cloudBackfillStore struct {
 	db      *dbutil.Database
 	loginID networkid.UserLoginID
+
+	// Memoised delivered-ID set, for the per-portal delivery check in
+	// countUndeliveredScrubbedMessages. See cachedBridgedGUIDSet.
+	bridgedMu       sync.Mutex
+	bridgedSet      map[string]struct{}
+	bridgedSetFor   string
+	bridgedSetAtNow time.Time
 }
+
+// bridgedSetCacheTTL bounds how stale the memoised delivered-ID set may be.
+//
+// Staleness is only ever safe in one direction here, which is what makes the
+// cache sound rather than a shortcut. A row is scrubbed only after it was
+// delivered AND aged past the scrub grace window, so any set loaded after a
+// row's delivery contains it. A set loaded BEFORE that delivery is a subset of
+// the truth, so it can only over-report a row as undelivered — the conservative
+// answer, which triggers the same recovery the pre-fix code always took. It can
+// never under-report and let a genuine loss go unreported.
+//
+// Two minutes comfortably spans one forward-backfill wave (the case this cache
+// exists for) while keeping the window well inside the five-minute grace
+// period that guarantees the direction above.
+const bridgedSetCacheTTL = 2 * time.Minute
 
 type cloudMessageRow struct {
 	GUID        string
@@ -2960,7 +2983,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
-// hasScrubbedBackfillableMessages reports whether a portal has non-deleted,
+// countScrubbedBackfillableMessages reports how many non-deleted,
 // deliverable rows whose bodies were cleared by the privacy scrubber
 // (body_scrubbed=TRUE, not a reaction). cloudRowToBackfillMessages skips EVERY
 // such row (see its `row.BodyScrubbed && !isCloudReactionRow` guard) regardless
@@ -2992,8 +3015,8 @@ func (s *cloudBackfillStore) countScrubbedBackfillableMessages(ctx context.Conte
 // backfillable rows have NO corresponding bridgev2 message row — that is, how
 // many were scrubbed without ever reaching Matrix.
 //
-// hasScrubbedBackfillableMessages answers a strictly weaker question: whether
-// the portal has any scrubbed row at all. For a portal whose history was
+// countScrubbedBackfillableMessages answers a strictly weaker question: how
+// many scrubbed rows the portal has, delivered or not. For a portal whose history was
 // delivered and then legitimately scrubbed, that is true forever, which made
 // every later forward-backfill run of a healthy portal look like the
 // scrubbed-before-delivery data-loss case. The caller then un-scrubbed the
@@ -3033,7 +3056,7 @@ func (s *cloudBackfillStore) countUndeliveredScrubbedMessages(ctx context.Contex
 		return 0, nil
 	}
 
-	bridged, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	bridged, err := s.cachedBridgedGUIDSet(ctx, bridgeID)
 	if err != nil {
 		return 0, err
 	}
@@ -4674,6 +4697,37 @@ func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID st
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate bridged guid set: %w", err)
 	}
+	return set, nil
+}
+
+// cachedBridgedGUIDSet returns the delivered-ID set, reusing a recent load.
+//
+// loadBridgedGUIDSet reads every delivered id for the login — on the install
+// this was measured against, 330,765 ids and ~380ms — so calling it once per
+// portal reintroduces exactly the cost the scrubber restructure removed: a
+// whole-table read repeated per unit of work. Group consolidation resets
+// fwd_backfill_done for every group, which sends a wave of
+// delivered-and-scrubbed portals down the zero-message forward-backfill path
+// at once, so the per-portal call is not a rare case; that install has 2,734
+// portals carrying a scrubbed row.
+//
+// The scrubber deliberately does NOT use this: it loads the set fresh once per
+// pass, which is already proportional to its work, and its decision about what
+// to scrub should not run on a cached view.
+func (s *cloudBackfillStore) cachedBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
+	s.bridgedMu.Lock()
+	defer s.bridgedMu.Unlock()
+	if s.bridgedSet != nil && s.bridgedSetFor == bridgeID &&
+		time.Since(s.bridgedSetAtNow) < bridgedSetCacheTTL {
+		return s.bridgedSet, nil
+	}
+	set, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		return nil, err
+	}
+	s.bridgedSet = set
+	s.bridgedSetFor = bridgeID
+	s.bridgedSetAtNow = time.Now()
 	return set, nil
 }
 

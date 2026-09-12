@@ -81,8 +81,9 @@ func TestForwardBackfillDoneLifecycle(t *testing.T) {
 	}
 }
 
-// hasScrubbedBackfillableMessages is the trigger for forward backfill's
-// rehydrate-before-marking-done guard. It must fire only for deliverable rows
+// countScrubbedBackfillableMessages is the FALLBACK trigger for forward
+// backfill's rehydrate-before-marking-done guard, used only when the delivery
+// check in countUndeliveredScrubbedMessages cannot run. It must fire only for deliverable rows
 // whose bodies were cleared by the privacy scrubber (body_scrubbed=TRUE,
 // has_body=TRUE, non-reaction) — not for genuinely-empty portals, non-scrubbed
 // rows, deleted rows, or scrubbed reactions.
