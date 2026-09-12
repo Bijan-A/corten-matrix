@@ -257,3 +257,79 @@ func TestScrubBridgedBodiesCrossesChunkBoundary(t *testing.T) {
 		t.Errorf("%d rows left unscrubbed after a multi-chunk pass", leftover)
 	}
 }
+
+// TestCountUndeliveredScrubbedMessages is the regression test for a false
+// "VISIBLE data loss" alarm.
+//
+// Forward backfill converts zero messages for a portal whose history was
+// delivered and then scrubbed — correctly, since nothing is left to deliver.
+// The old guard asked only "does this portal have scrubbed rows", which is
+// true forever afterwards, so every later backfill run of a healthy portal
+// looked like the scrubbed-before-delivery case. On a live bridge that
+// un-scrubbed 7,059 delivered rows and re-fetched them from CloudKit to
+// recover history that was fully present in Matrix.
+//
+// Only rows that were scrubbed WITHOUT reaching Matrix may count.
+func TestCountUndeliveredScrubbedMessages(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+
+	insert := func(guid, portal string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_message
+			  (login_id, guid, portal_id, timestamp_ms, is_from_me, record_name,
+			   body_scrubbed, deleted, created_ts, updated_ts)
+			VALUES ($1, $2, $3, 1000, FALSE, 'r', TRUE, FALSE, 1000, 1000)`,
+			testSQLLoginID, guid, portal); err != nil {
+			t.Fatalf("insert %s: %v", guid, err)
+		}
+	}
+	// A healthy portal: every scrubbed row reached Matrix.
+	insert("G-DELIVERED-1", "p-healthy")
+	insert("G-DELIVERED-2", "p-healthy")
+	// A damaged portal: scrubbed, never delivered.
+	insert("G-LOST", "p-damaged")
+	// Mixed: one delivered, one not.
+	insert("G-MIXED-OK", "p-mixed")
+	insert("G-MIXED-LOST", "p-mixed")
+
+	for _, id := range []string{"g-delivered-1", "G-DELIVERED-2", "G-MIXED-OK"} {
+		// Deliberately mixed case: delivery matching is case-insensitive.
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			id, "test-bridge", string(testSQLLoginID)); err != nil {
+			t.Fatalf("insert message %s: %v", id, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		portal string
+		want   int
+	}{
+		{"p-healthy", 0}, // the false-alarm case
+		{"p-damaged", 1}, // the real loss this guard exists for
+		{"p-mixed", 1},
+		{"p-empty", 0},
+	} {
+		got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", tc.portal)
+		if err != nil {
+			t.Fatalf("countUndeliveredScrubbedMessages(%s): %v", tc.portal, err)
+		}
+		if got != tc.want {
+			t.Errorf("countUndeliveredScrubbedMessages(%s) = %d, want %d", tc.portal, got, tc.want)
+		}
+	}
+
+	// Another login's delivery must not make our scrubbed row look delivered.
+	insert("G-OTHER-LOGIN", "p-other")
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"g-other-login", "test-bridge", "someone-else"); err != nil {
+		t.Fatalf("insert foreign message: %v", err)
+	}
+	if got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", "p-other"); err != nil {
+		t.Fatalf("countUndeliveredScrubbedMessages(p-other): %v", err)
+	} else if got != 1 {
+		t.Errorf("countUndeliveredScrubbedMessages(p-other) = %d, want 1 — another login's delivery is not ours", got)
+	}
+}

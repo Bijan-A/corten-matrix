@@ -2973,7 +2973,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 // NOT require has_body=TRUE: an attachment-only (photo/video) portal has
 // scrubbed rows with has_body=FALSE, and gating on has_body would let that
 // portal reach the empty path unguarded — the precise silent loss this catches.
-func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context, portalID string) (bool, error) {
+func (s *cloudBackfillStore) countScrubbedBackfillableMessages(ctx context.Context, portalID string) (int, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -2983,9 +2983,67 @@ func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context
 		  AND (tapback_type IS NULL OR tapback_type < 2000)
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	return count > 0, nil
+	return count, nil
+}
+
+// countUndeliveredScrubbedMessages returns how many of a portal's scrubbed,
+// backfillable rows have NO corresponding bridgev2 message row — that is, how
+// many were scrubbed without ever reaching Matrix.
+//
+// hasScrubbedBackfillableMessages answers a strictly weaker question: whether
+// the portal has any scrubbed row at all. For a portal whose history was
+// delivered and then legitimately scrubbed, that is true forever, which made
+// every later forward-backfill run of a healthy portal look like the
+// scrubbed-before-delivery data-loss case. The caller then un-scrubbed the
+// whole portal and re-fetched it from CloudKit to recover content that was
+// never missing.
+//
+// Delivery is decided by the same loadBridgedGUIDSet the scrubber uses to pick
+// what it may scrub. That sharing is deliberate: if the scrubber's notion of
+// "delivered" and this guard's ever diverged, the guard would either raise
+// false alarms about rows the scrubber correctly cleared, or miss the real
+// loss it exists to catch.
+func (s *cloudBackfillStore) countUndeliveredScrubbedMessages(ctx context.Context, bridgeID, portalID string) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT guid
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+		  AND body_scrubbed=TRUE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)`,
+		s.loginID, portalID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list scrubbed rows for %s: %w", portalID, err)
+	}
+	var guids []string
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan scrubbed guid: %w", err)
+		}
+		guids = append(guids, guid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate scrubbed rows: %w", err)
+	}
+	if len(guids) == 0 {
+		return 0, nil
+	}
+
+	bridged, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		return 0, err
+	}
+	undelivered := 0
+	for _, guid := range guids {
+		if _, ok := bridged[strings.ToLower(guid)]; !ok {
+			undelivered++
+		}
+	}
+	return undelivered, nil
 }
 
 // countBackfillableMessages returns the number of rows FetchMessages can read

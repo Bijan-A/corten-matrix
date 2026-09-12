@@ -107,10 +107,10 @@ func TestHasScrubbedBackfillableMessages(t *testing.T) {
 	if _, err := db.Exec(ctx, `UPDATE cloud_message SET record_name='r' WHERE login_id=$1`, testSQLLoginID); err != nil {
 		t.Fatalf("set record_name: %v", err)
 	}
-	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-live"); err != nil {
-		t.Fatalf("hasScrubbedBackfillableMessages(p-live): %v", err)
-	} else if got {
-		t.Errorf("hasScrubbedBackfillableMessages(p-live) = true for a live contentful row, want false")
+	if got, err := store.countScrubbedBackfillableMessages(ctx, "p-live"); err != nil {
+		t.Fatalf("countScrubbedBackfillableMessages(p-live): %v", err)
+	} else if got != 0 {
+		t.Errorf("countScrubbedBackfillableMessages(p-live) = %d for a live contentful row, want 0", got)
 	}
 
 	// A scrubbed, has_body, non-reaction row on p-scrub MUST trigger.
@@ -126,17 +126,17 @@ func TestHasScrubbedBackfillableMessages(t *testing.T) {
 	); err != nil {
 		t.Fatalf("scrub G-SCRUB: %v", err)
 	}
-	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-scrub"); err != nil {
-		t.Fatalf("hasScrubbedBackfillableMessages(p-scrub): %v", err)
-	} else if !got {
-		t.Errorf("hasScrubbedBackfillableMessages(p-scrub) = false for a scrubbed deliverable row, want true")
+	if got, err := store.countScrubbedBackfillableMessages(ctx, "p-scrub"); err != nil {
+		t.Fatalf("countScrubbedBackfillableMessages(p-scrub): %v", err)
+	} else if got == 0 {
+		t.Error("countScrubbedBackfillableMessages(p-scrub) = 0 for a scrubbed deliverable row, want non-zero")
 	}
 
 	// A portal with no rows at all must NOT trigger.
-	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-empty"); err != nil {
-		t.Fatalf("hasScrubbedBackfillableMessages(p-empty): %v", err)
-	} else if got {
-		t.Errorf("hasScrubbedBackfillableMessages(p-empty) = true for an empty portal, want false")
+	if got, err := store.countScrubbedBackfillableMessages(ctx, "p-empty"); err != nil {
+		t.Fatalf("countScrubbedBackfillableMessages(p-empty): %v", err)
+	} else if got != 0 {
+		t.Errorf("countScrubbedBackfillableMessages(p-empty) = %d for an empty portal, want 0", got)
 	}
 
 	// A scrubbed ATTACHMENT-ONLY row (has_body=FALSE) MUST trigger: conversion
@@ -156,10 +156,10 @@ func TestHasScrubbedBackfillableMessages(t *testing.T) {
 	); err != nil {
 		t.Fatalf("scrub G-PHOTO: %v", err)
 	}
-	if got, err := store.hasScrubbedBackfillableMessages(ctx, "p-photo"); err != nil {
-		t.Fatalf("hasScrubbedBackfillableMessages(p-photo): %v", err)
-	} else if !got {
-		t.Errorf("hasScrubbedBackfillableMessages(p-photo) = false for a scrubbed attachment-only row, want true")
+	if got, err := store.countScrubbedBackfillableMessages(ctx, "p-photo"); err != nil {
+		t.Fatalf("countScrubbedBackfillableMessages(p-photo): %v", err)
+	} else if got == 0 {
+		t.Error("countScrubbedBackfillableMessages(p-photo) = 0 for a scrubbed attachment-only row, want non-zero")
 	}
 }
 

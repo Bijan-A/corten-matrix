@@ -8480,9 +8480,26 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// marking done would strand real history permanently. Detect that case
 			// and rehydrate from CloudKit, then retry conversion once.
 			if c.cloudStore != nil {
-				if scrubbed, _ := c.cloudStore.hasScrubbedBackfillableMessages(ctx, portalID); scrubbed {
-					log.Warn().Str("portal_id", portalID).
-						Msg("Forward backfill: 0 messages but portal has body-scrubbed deliverable rows — rehydrating from CloudKit before marking done")
+				// Only rows that were scrubbed WITHOUT reaching Matrix are a
+				// loss. A portal whose history was delivered and then
+				// legitimately scrubbed also converts to zero messages here —
+				// correctly, since there is nothing left to deliver — and
+				// treating that as loss un-scrubbed the whole portal and
+				// re-fetched it from CloudKit for nothing. Observed on a live
+				// bridge: 7,059 delivered rows cleared and re-fetched in one
+				// run, with a "VISIBLE data loss" error for history that was
+				// fully present in Matrix.
+				undelivered, undelErr := c.cloudStore.countUndeliveredScrubbedMessages(ctx, string(c.Main.Bridge.ID), portalID)
+				if undelErr != nil {
+					// Can't prove the portal is safe, so fall back to the old
+					// conservative behaviour rather than skipping a real loss.
+					log.Warn().Err(undelErr).Str("portal_id", portalID).
+						Msg("Forward backfill: could not check delivery of scrubbed rows — assuming recovery is needed")
+					undelivered, _ = c.cloudStore.countScrubbedBackfillableMessages(ctx, portalID)
+				}
+				if undelivered > 0 {
+					log.Warn().Str("portal_id", portalID).Int("undelivered", undelivered).
+						Msg("Forward backfill: 0 messages but portal has body-scrubbed rows that never reached Matrix — rehydrating from CloudKit before marking done")
 					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
 						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 						if queryErr != nil {
@@ -8502,7 +8519,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// genuinely unrecoverable. Surface the loss loudly (it was
 						// silent before) and mark done so the backward-backfill queue
 						// doesn't loop forever on an anchor that will never appear.
-						log.Error().Str("portal_id", portalID).
+						log.Error().Str("portal_id", portalID).Int("undelivered", undelivered).
 							Msg("Forward backfill: body-scrubbed rows could not be rehydrated from CloudKit — history unrecoverable, marking done (VISIBLE data loss)")
 					}
 				}
