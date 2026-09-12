@@ -6,6 +6,7 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -200,5 +201,59 @@ func TestScrubBatchIfEligibleRechecksAtWriteTime(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("scrubbed %d rows, want 0 — the write must re-check the grace window", n)
+	}
+}
+
+// TestScrubBridgedBodiesCrossesChunkBoundary drives more candidates than one
+// chunk so the multi-chunk path and the size of the generated IN list are both
+// exercised on SQLite.
+//
+// scrubBatchIfEligible names every guid in the chunk as a bound parameter, so a
+// full chunk is chunkSize+2 parameters. SQLite's SQLITE_MAX_VARIABLE_NUMBER was
+// 999 before 3.32 and 32766 after; go-sqlite3 bundles a modern SQLite, but a
+// build linked against an old system library (-tags libsqlite3) would fail here
+// rather than silently scrubbing nothing. Postgres' own limit is 65535.
+func TestScrubBridgedBodiesCrossesChunkBoundary(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+
+	// 2,500 rows: two full chunks plus a remainder.
+	const total = 2500
+	if err := db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for i := 0; i < total; i++ {
+			guid := fmt.Sprintf("GUID-%05d", i)
+			if _, err := db.Exec(ctx, `
+				INSERT INTO cloud_message
+				  (login_id, guid, portal_id, timestamp_ms, is_from_me, text, created_ts, updated_ts)
+				VALUES ($1, $2, 'tel:+15555550100', $3, FALSE, 'body', $3, $3)`,
+				testSQLLoginID, guid, old); err != nil {
+				return err
+			}
+			if _, err := db.Exec(ctx,
+				`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+				guid, "test-bridge", string(testSQLLoginID)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+
+	n, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil, false)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies across chunks: %v", err)
+	}
+	if n != total {
+		t.Errorf("scrubbed %d rows, want %d — every chunk must apply", n, total)
+	}
+	var leftover int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND body_scrubbed=FALSE`,
+		testSQLLoginID).Scan(&leftover); err != nil {
+		t.Fatalf("count leftover: %v", err)
+	}
+	if leftover != 0 {
+		t.Errorf("%d rows left unscrubbed after a multi-chunk pass", leftover)
 	}
 }
