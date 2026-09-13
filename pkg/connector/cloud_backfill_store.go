@@ -2018,41 +2018,141 @@ func (s *cloudBackfillStore) normalizeGroupChatPortalIDs(ctx context.Context) (i
 	return res.RowsAffected()
 }
 
-// normalizeGroupMessagePortalIDs fixes cloud_message rows where the portal_id
+// normalizeGroupMessagePortalIDs fixes cloud_message rows whose gid: portal_id
 // uses a UUID that differs from the canonical group_id → portal_id mapping in
-// cloud_chat. This happens when resolveConversationID used the CloudKit chat_id
-// UUID (before the getChatPortalID-first fix) instead of the group_id UUID.
-// Returns the number of rows updated.
+// cloud_chat. resolveConversationID historically used the CloudKit chat_id UUID
+// (before the getChatPortalID-first fix, 2eace9a), producing gid:<chat_id> rows
+// that differ from the canonical gid:<group_id>. Left alone they cause
+// duplicate portal creation on startup and restore. Returns rows updated.
+//
+// This runs on every startup from runCloudSyncController, so its cost when
+// there is nothing to fix is the cost that matters — and on a normalized
+// install that is the normal case.
+//
+// It used to be one UPDATE with a correlated subquery joining
+// LOWER(SUBSTR(cloud_message.portal_id, 5)) against LOWER(cc.group_id) /
+// LOWER(cc.cloud_chat_id). Neither side of that is indexable, so it degraded to
+// a nested loop over cloud_message × cloud_chat, evaluating two LOWER() and a
+// SUBSTR() per pair. Measured on a live Postgres install: 36,009 gid: message
+// rows against 6,383 chats — about 230 million comparisons — running over 336
+// seconds, on every startup, to update ZERO rows. Nothing bounded it either,
+// unlike the scrubber statements in this file.
+//
+// The join is now done in Go against the small side. cloud_chat is thousands of
+// rows, and the distinct gid: portal_ids in cloud_message are hundreds (309 on
+// that install, read in 75ms via cloud_message_portal_ts_idx), so the whole
+// decision is made from two small reads. Each rewrite that is actually needed
+// is then a portal-keyed UPDATE, which that same index serves.
 func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context) (int64, error) {
-	// Find cloud_message rows with gid: portal_ids where the UUID matches
-	// a cloud_chat row's group_id but the portal_id doesn't match.
-	// Update them to use the canonical portal_id from cloud_chat.
-	res, err := s.db.Exec(ctx, `
-		UPDATE cloud_message
-		SET portal_id = (
-			SELECT cc.portal_id FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-			LIMIT 1
-		)
-		WHERE login_id = $1
-		  AND portal_id LIKE 'gid:%'
-		  AND EXISTS (
-			SELECT 1 FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-		  )
-	`, s.loginID)
+	// The canonical mapping, keyed by both UUIDs a gid: portal_id may carry.
+	// A chat contributes its group_id and its cloud_chat_id because the legacy
+	// rows could have been keyed by either.
+	type chatKey struct{ groupID, chatID, portalID string }
+	rows, err := s.db.Query(ctx, `
+		SELECT LOWER(group_id), LOWER(cloud_chat_id), portal_id
+		FROM cloud_chat
+		WHERE login_id=$1 AND portal_id <> ''`, s.loginID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read canonical group portal mapping: %w", err)
 	}
-	return res.RowsAffected()
+	// Several chats can claim one UUID; collect them all so ambiguity is
+	// visible rather than decided by whichever row the database returned first.
+	canonical := make(map[string]map[string]struct{})
+	add := func(uuid, portalID string) {
+		if uuid == "" {
+			return
+		}
+		set := canonical[uuid]
+		if set == nil {
+			set = make(map[string]struct{}, 1)
+			canonical[uuid] = set
+		}
+		set[portalID] = struct{}{}
+	}
+	for rows.Next() {
+		var c chatKey
+		if err := rows.Scan(&c.groupID, &c.chatID, &c.portalID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan canonical mapping: %w", err)
+		}
+		add(c.groupID, c.portalID)
+		add(c.chatID, c.portalID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate canonical mapping: %w", err)
+	}
+	if len(canonical) == 0 {
+		return 0, nil
+	}
+
+	// The gid: portal_ids actually present in cloud_message. Hundreds, not the
+	// tens of thousands of rows carrying them.
+	portalRows, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id FROM cloud_message
+		WHERE login_id=$1 AND portal_id LIKE 'gid:%'`, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list gid message portals: %w", err)
+	}
+	var present []string
+	for portalRows.Next() {
+		var portalID string
+		if err := portalRows.Scan(&portalID); err != nil {
+			portalRows.Close()
+			return 0, fmt.Errorf("scan gid message portal: %w", err)
+		}
+		present = append(present, portalID)
+	}
+	portalRows.Close()
+	if err := portalRows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate gid message portals: %w", err)
+	}
+
+	var total int64
+	for _, portalID := range present {
+		target, ok := canonicalPortalForGid(canonical, portalID)
+		if !ok || target == portalID {
+			continue
+		}
+		res, err := s.db.Exec(ctx,
+			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, portalID, target)
+		if err != nil {
+			return total, fmt.Errorf("failed to normalize %s to %s: %w", portalID, target, err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
+// canonicalPortalForGid resolves a gid:<uuid> portal_id to the canonical
+// portal_id cloud_chat records for that UUID.
+//
+// Returns ok=false when the UUID is unknown, or when two or more chats claim it
+// with DIFFERENT portal_ids. The old SQL took whichever row the database
+// returned first via a bare LIMIT 1, so an ambiguous UUID was resolved
+// arbitrarily and could resolve differently on the next run — the same
+// guess-a-canonical pattern this tree removed from group consolidation twice
+// (see "don't guess a canonical when a group_id spans two portals"). Declining
+// leaves the rows where they are, which is what the pre-2eace9a data already
+// looks like, rather than moving them somewhere that may be wrong.
+func canonicalPortalForGid(canonical map[string]map[string]struct{}, portalID string) (string, bool) {
+	if !strings.HasPrefix(portalID, "gid:") {
+		return "", false
+	}
+	uuid := strings.ToLower(strings.TrimPrefix(portalID, "gid:"))
+	targets := canonical[uuid]
+	if len(targets) != 1 {
+		return "", false
+	}
+	for target := range targets {
+		if target == "" {
+			return "", false
+		}
+		return target, true
+	}
+	return "", false
 }
 
 // getMessageRecordNamesByGroupID returns all non-empty message record_names
