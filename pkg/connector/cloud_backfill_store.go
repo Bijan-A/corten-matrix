@@ -27,21 +27,36 @@ type cloudBackfillStore struct {
 	bridgedSet      map[string]struct{}
 	bridgedSetFor   string
 	bridgedSetAtNow time.Time
+
+	// now is the clock, injectable so tests can drive the cache's expiry
+	// without sleeping. nil means time.Now.
+	now func() time.Time
 }
 
 // bridgedSetCacheTTL bounds how stale the memoised delivered-ID set may be.
 //
-// Staleness is only ever safe in one direction here, which is what makes the
-// cache sound rather than a shortcut. A row is scrubbed only after it was
-// delivered AND aged past the scrub grace window, so any set loaded after a
-// row's delivery contains it. A set loaded BEFORE that delivery is a subset of
-// the truth, so it can only over-report a row as undelivered — the conservative
-// answer, which triggers the same recovery the pre-fix code always took. It can
-// never under-report and let a genuine loss go unreported.
+// What makes the cache sound is that delivery only ever ADDS rows to bridgev2's
+// message table. A cached set is therefore always a subset of the true
+// delivered set: it may be missing a row that has since been delivered, but it
+// can never contain a row that was not. So staleness can only over-report rows
+// as undelivered, which takes the conservative recovery path, and can never
+// under-report and hide a real loss.
 //
-// Two minutes comfortably spans one forward-backfill wave (the case this cache
-// exists for) while keeping the window well inside the five-minute grace
-// period that guarantees the direction above.
+// A false alarm inside the TTL is therefore possible, not excluded: a portal
+// whose rows were delivered after the cached load and scrubbed before its check
+// will take the recovery path. That is safe, and no worse for that portal than
+// the behaviour before this guard existed.
+//
+// Note in particular that the scrub grace window does NOT prevent this. That
+// window is keyed on cloud_message.updated_ts, and delivery writes bridgev2's
+// message table without touching it — the only writers of updated_ts are
+// ingest, delete, re-key, heal, undelete and un-scrub. A row ingested long ago
+// and delivered now keeps its old updated_ts, so the next scrub pass can clear
+// it immediately.
+//
+// The TTL is purely a trade between how often that false alarm can happen and
+// how often the full delivered set is reloaded. Raising it keeps the same
+// safety property; it is not bounded by the grace window or anything else.
 const bridgedSetCacheTTL = 2 * time.Minute
 
 type cloudMessageRow struct {
@@ -4718,7 +4733,7 @@ func (s *cloudBackfillStore) cachedBridgedGUIDSet(ctx context.Context, bridgeID 
 	s.bridgedMu.Lock()
 	defer s.bridgedMu.Unlock()
 	if s.bridgedSet != nil && s.bridgedSetFor == bridgeID &&
-		time.Since(s.bridgedSetAtNow) < bridgedSetCacheTTL {
+		s.clock().Sub(s.bridgedSetAtNow) < bridgedSetCacheTTL {
 		return s.bridgedSet, nil
 	}
 	set, err := s.loadBridgedGUIDSet(ctx, bridgeID)
@@ -4727,8 +4742,38 @@ func (s *cloudBackfillStore) cachedBridgedGUIDSet(ctx context.Context, bridgeID 
 	}
 	s.bridgedSet = set
 	s.bridgedSetFor = bridgeID
-	s.bridgedSetAtNow = time.Now()
+	s.bridgedSetAtNow = s.clock()
 	return set, nil
+}
+
+// clock returns the store's time source, defaulting to time.Now.
+func (s *cloudBackfillStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// releaseExpiredBridgedGUIDSet drops the memoised delivered-ID set once it is
+// past its TTL.
+//
+// Expiry is otherwise only noticed on the next read, so a set built during one
+// forward-backfill wave stays referenced until another portal happens to reach
+// the same path — which on a quiet bridge may be never. Measured at one
+// install's size that is about 30MB held for the life of the process: not
+// growth, but not worth keeping either, on top of the transient copy the
+// scrubber builds every pass. Called from the periodic scrub loop, which
+// already ticks often enough to bound the retention.
+func (s *cloudBackfillStore) releaseExpiredBridgedGUIDSet() {
+	s.bridgedMu.Lock()
+	defer s.bridgedMu.Unlock()
+	if s.bridgedSet == nil {
+		return
+	}
+	if s.clock().Sub(s.bridgedSetAtNow) >= bridgedSetCacheTTL {
+		s.bridgedSet = nil
+		s.bridgedSetFor = ""
+	}
 }
 
 // scrubCandidates lists the rows this pass may scrub, without consulting the

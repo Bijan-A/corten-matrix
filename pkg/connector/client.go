@@ -8511,8 +8511,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					return e.Int("undelivered", undelivered)
 				}
 				if undelivered > 0 {
+					// Wording differs by branch on purpose: in the degraded
+					// branch the count is every scrubbed row, delivered or not,
+					// so claiming they never reached Matrix would overstate it
+					// exactly as the mislabelled field did.
+					reason := "rows that never reached Matrix"
+					if deliveryCheckFailed {
+						reason = "rows whose delivery could not be checked"
+					}
 					scrubbedCount(log.Warn().Str("portal_id", portalID)).
-						Msg("Forward backfill: 0 messages but portal has body-scrubbed rows that never reached Matrix — rehydrating from CloudKit before marking done")
+						Msgf("Forward backfill: 0 messages but portal has body-scrubbed %s — rehydrating from CloudKit before marking done", reason)
 					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
 						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 						if queryErr != nil {

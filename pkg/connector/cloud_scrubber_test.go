@@ -402,3 +402,59 @@ func TestCachedBridgedGUIDSetReusesOneLoad(t *testing.T) {
 		t.Errorf("cachedBridgedGUIDSet(other-bridge) = %v, want empty — the cache is per bridge id", other)
 	}
 }
+
+// TestCachedBridgedGUIDSetExpiresAndReleases drives the TTL through the
+// store's injected clock, so both expiry and the release are covered without
+// sleeping for the real two minutes.
+func TestCachedBridgedGUIDSetExpiresAndReleases(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+	clock := time.Now()
+	store.now = func() time.Time { return clock }
+
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"G-ONE", "test-bridge", string(testSQLLoginID)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := store.cachedBridgedGUIDSet(ctx, "test-bridge"); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+
+	// A row delivered after the load is invisible while the entry is warm.
+	if _, err := db.Exec(ctx,
+		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+		"G-TWO", "test-bridge", string(testSQLLoginID)); err != nil {
+		t.Fatalf("insert second: %v", err)
+	}
+	warm, err := store.cachedBridgedGUIDSet(ctx, "test-bridge")
+	if err != nil {
+		t.Fatalf("warm read: %v", err)
+	}
+	if _, ok := warm["g-two"]; ok {
+		t.Fatal("warm read saw a later delivery; the cache is not being reused")
+	}
+
+	// Past the TTL, the next read must reload and pick it up.
+	clock = clock.Add(bridgedSetCacheTTL + time.Second)
+	fresh, err := store.cachedBridgedGUIDSet(ctx, "test-bridge")
+	if err != nil {
+		t.Fatalf("read after expiry: %v", err)
+	}
+	if _, ok := fresh["g-two"]; !ok {
+		t.Error("read after expiry did not reload; the set would stay stale forever")
+	}
+
+	// releaseExpiredBridgedGUIDSet must keep a warm entry and drop an expired
+	// one, so a quiet bridge doesn't retain the set for the whole process.
+	store.releaseExpiredBridgedGUIDSet()
+	if store.bridgedSet == nil {
+		t.Error("release dropped a warm entry; the next wave would reload for nothing")
+	}
+	clock = clock.Add(bridgedSetCacheTTL + time.Second)
+	store.releaseExpiredBridgedGUIDSet()
+	if store.bridgedSet != nil {
+		t.Error("release left an expired entry referenced; ~30MB would be held for the life of the process")
+	}
+	// Releasing with nothing cached must be a no-op rather than a panic.
+	store.releaseExpiredBridgedGUIDSet()
+}
