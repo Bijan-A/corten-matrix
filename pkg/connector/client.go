@@ -8489,37 +8489,60 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// bridge: 7,059 delivered rows cleared and re-fetched in one
 				// run, with a "VISIBLE data loss" error for history that was
 				// fully present in Matrix.
+				// needsRecovery is the decision; scrubbedCount is only what the
+				// log may claim it measured. Keeping them separate matters
+				// because in the degraded branches the count is not an
+				// undelivered count at all.
 				undelivered, undelErr := c.cloudStore.countUndeliveredScrubbedMessages(ctx, string(c.Main.Bridge.ID), portalID)
-				// deliveryCheckFailed keeps the logging honest about what the
-				// count below actually measures. In the degraded branch it is
-				// the TOTAL scrubbed rows, not the undelivered ones, and
-				// reporting that as "undelivered" would overstate the loss
-				// under a label claiming precision — the same false-alarm
-				// shape this guard exists to remove.
-				deliveryCheckFailed := undelErr != nil
-				if deliveryCheckFailed {
-					// Can't prove the portal is safe, so fall back to the old
-					// conservative behaviour rather than skipping a real loss.
+				needsRecovery := undelivered > 0
+				scrubbedCount, deliveryCheckFailed := undelivered, false
+				if undelErr != nil {
+					// Can't prove the portal is safe, so fall back to the
+					// weaker count rather than skipping a possible loss.
+					deliveryCheckFailed = true
 					log.Warn().Err(undelErr).Str("portal_id", portalID).
-						Msg("Forward backfill: could not check delivery of scrubbed rows — assuming recovery is needed")
-					undelivered, _ = c.cloudStore.countScrubbedBackfillableMessages(ctx, portalID)
-				}
-				scrubbedCount := func(e *zerolog.Event) *zerolog.Event {
-					if deliveryCheckFailed {
-						return e.Int("scrubbed_total", undelivered).Bool("delivery_check_failed", true)
+						Msg("Forward backfill: could not check delivery of scrubbed rows — falling back to the total scrubbed count")
+					total, totalErr := c.cloudStore.countScrubbedBackfillableMessages(ctx, portalID)
+					if totalErr != nil {
+						// Both queries failed, which is one condition and not
+						// two: the pool exhaustion or expired deadline that
+						// broke the first breaks the second, and that is
+						// exactly the post-consolidation wave this guard is
+						// for. Dropping this error left undelivered at 0, so
+						// the portal was marked forward-backfill-done with no
+						// rehydrate and nothing logged — silent loss of the
+						// kind this guard exists to prevent. Fail toward
+						// recovering instead.
+						log.Err(totalErr).Str("portal_id", portalID).
+							Msg("Forward backfill: scrubbed-row count also failed — assuming recovery is needed rather than marking done")
+						needsRecovery = true
+						scrubbedCount = -1
+					} else {
+						scrubbedCount = total
+						needsRecovery = total > 0
 					}
-					return e.Int("undelivered", undelivered)
 				}
-				if undelivered > 0 {
+				logCount := func(e *zerolog.Event) *zerolog.Event {
+					if !deliveryCheckFailed {
+						return e.Int("undelivered", scrubbedCount)
+					}
+					e = e.Bool("delivery_check_failed", true)
+					if scrubbedCount < 0 {
+						// Neither query answered; no count may be claimed.
+						return e.Bool("scrubbed_count_unknown", true)
+					}
+					return e.Int("scrubbed_total", scrubbedCount)
+				}
+				if needsRecovery {
 					// Wording differs by branch on purpose: in the degraded
-					// branch the count is every scrubbed row, delivered or not,
-					// so claiming they never reached Matrix would overstate it
-					// exactly as the mislabelled field did.
+					// branches the count is every scrubbed row, delivered or
+					// not, so claiming they never reached Matrix would
+					// overstate it exactly as the mislabelled field did.
 					reason := "rows that never reached Matrix"
 					if deliveryCheckFailed {
 						reason = "rows whose delivery could not be checked"
 					}
-					scrubbedCount(log.Warn().Str("portal_id", portalID)).
+					logCount(log.Warn().Str("portal_id", portalID)).
 						Msgf("Forward backfill: 0 messages but portal has body-scrubbed %s — rehydrating from CloudKit before marking done", reason)
 					if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
 						rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
@@ -8540,7 +8563,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						// genuinely unrecoverable. Surface the loss loudly (it was
 						// silent before) and mark done so the backward-backfill queue
 						// doesn't loop forever on an anchor that will never appear.
-						scrubbedCount(log.Error().Str("portal_id", portalID)).
+						logCount(log.Error().Str("portal_id", portalID)).
 							Msg("Forward backfill: body-scrubbed rows could not be rehydrated from CloudKit — history unrecoverable, marking done (VISIBLE data loss)")
 					}
 				}

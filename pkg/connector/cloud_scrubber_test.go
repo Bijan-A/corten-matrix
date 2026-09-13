@@ -458,3 +458,63 @@ func TestCachedBridgedGUIDSetExpiresAndReleases(t *testing.T) {
 	// Releasing with nothing cached must be a no-op rather than a panic.
 	store.releaseExpiredBridgedGUIDSet()
 }
+
+// TestScrubBridgedBodiesPagesPastUndeliveredPrefix is the regression test for
+// the keyset cursor.
+//
+// A plain LIMIT would re-read the same prefix on every pass: rows a pass
+// declines to scrub (not yet delivered) stay in the candidate set and keep
+// filling that prefix, so anything behind them never gets reached. Here the
+// oldest 1,200 rows — more than one page — are undelivered, and the delivered
+// rows sit behind them. All of the delivered ones must still be scrubbed in a
+// single pass.
+func TestScrubBridgedBodiesPagesPastUndeliveredPrefix(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+	base := time.Now().Add(-time.Hour).UnixMilli()
+
+	const undeliveredCount = 1200
+	const deliveredCount = 300
+	if err := db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for i := 0; i < undeliveredCount+deliveredCount; i++ {
+			guid := fmt.Sprintf("GUID-%05d", i)
+			// updated_ts ascending, so the undelivered rows are the oldest and
+			// form the prefix the cursor has to step past.
+			if _, err := db.Exec(ctx, `
+				INSERT INTO cloud_message
+				  (login_id, guid, portal_id, timestamp_ms, is_from_me, text, created_ts, updated_ts)
+				VALUES ($1, $2, 'tel:+15555550100', $3, FALSE, 'body', $3, $3)`,
+				testSQLLoginID, guid, base+int64(i)); err != nil {
+				return err
+			}
+			if i >= undeliveredCount {
+				if _, err := db.Exec(ctx,
+					`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+					guid, "test-bridge", string(testSQLLoginID)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	n, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil, false)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies: %v", err)
+	}
+	if n != deliveredCount {
+		t.Errorf("scrubbed %d rows, want %d — the cursor must step past the undelivered prefix", n, deliveredCount)
+	}
+
+	// And the undelivered prefix must be untouched.
+	var leftover int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND body_scrubbed=FALSE`,
+		testSQLLoginID).Scan(&leftover); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if leftover != undeliveredCount {
+		t.Errorf("%d rows left unscrubbed, want %d (the undelivered prefix only)", leftover, undeliveredCount)
+	}
+}
