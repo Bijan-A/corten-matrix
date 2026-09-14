@@ -394,6 +394,14 @@ type IMClient struct {
 	// Guards the one-shot diverged-DM-name repair; see repairDivergedDMRoomNames.
 	dmNameRepairRan atomic.Bool
 
+	// Caches which person owns each contact handle, so the cross-contact merge
+	// guard doesn't rebuild the index per lookup. Generation is the contact
+	// source's (count, lastSync); see contactPersonIndex.
+	personIndexMu       sync.RWMutex
+	personIndex         *contactPersonIndex
+	personIndexContacts int
+	personIndexSync     time.Time
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -2092,18 +2100,17 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		}
 
 		if portal == nil && strings.HasPrefix(normalizedUser, "mailto:") {
-			// (1) Address-book.
-			contact := c.lookupContact(user)
-			if contact != nil {
-				for _, altID := range contactPortalIDs(contact) {
-					if !strings.HasPrefix(altID, "tel:") {
-						continue
-					}
-					if p := findPortal(networkid.PortalID(altID)); p != nil {
-						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
-						portal = p
-						break
-					}
+			// (1) Address-book. Guarded handles only: routing presence through
+			// a handle two people share would publish one person's status into
+			// the other's room.
+			for _, altID := range c.mutualContactHandles(normalizedUser) {
+				if !strings.HasPrefix(altID, "tel:") {
+					continue
+				}
+				if p := findPortal(networkid.PortalID(altID)); p != nil {
+					log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
+					portal = p
+					break
 				}
 			}
 
@@ -2144,19 +2151,13 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			portal = findPortal(portalID)
 
 			if portal == nil {
-				contact := c.lookupContact(user)
-				if contact != nil {
-					for _, altID := range contactPortalIDs(contact) {
-						if altID == normalizedUser {
-							continue
-						}
-						altPortalID := c.resolveContactPortalID(altID)
-						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
-						if p := findPortal(altPortalID); p != nil {
-							log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
-							portal = p
-							break
-						}
+				for _, altID := range c.mutualContactHandles(normalizedUser) {
+					altPortalID := c.resolveContactPortalID(altID)
+					altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+					if p := findPortal(altPortalID); p != nil {
+						log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
+						portal = p
+						break
 					}
 				}
 			}
@@ -2825,16 +2826,14 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 	}
 
 	if strings.HasPrefix(normalizedUser, "mailto:") {
-		if contact := c.lookupContact(sender); contact != nil {
-			for _, altID := range contactPortalIDs(contact) {
-				if !strings.HasPrefix(altID, "tel:") {
-					continue
-				}
-				if p := findPortal(networkid.PortalID(altID)); p != nil {
-					c.rememberAliasPortal(ctx, sender, p.ID)
-					log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
-					return
-				}
+		for _, altID := range c.mutualContactHandles(normalizedUser) {
+			if !strings.HasPrefix(altID, "tel:") {
+				continue
+			}
+			if p := findPortal(networkid.PortalID(altID)); p != nil {
+				c.rememberAliasPortal(ctx, sender, p.ID)
+				log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
+				return
 			}
 		}
 		if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, sender); altPortal != nil {
@@ -5611,11 +5610,10 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 	if !strings.Contains(portalID, ",") && !strings.HasPrefix(portalID, "gid:") {
 		contactResolved := string(c.resolveContactPortalID(portalID))
 		acceptableIDs[contactResolved] = true
-		contact := c.lookupContact(portalID)
-		if contact != nil {
-			for _, altID := range contactPortalIDs(contact) {
-				acceptableIDs[altID] = true
-			}
+		// Guarded alternates only: an over-broad set here would accept a
+		// DIFFERENT person's CloudKit messages as belonging to this portal.
+		for _, altID := range c.mutualContactHandles(portalID) {
+			acceptableIDs[altID] = true
 		}
 	}
 
@@ -10963,24 +10961,18 @@ func (c *IMClient) resolveExistingDMPortalID(identifier string) networkid.Portal
 	// For mailto: identifiers, try the contact's other handles (phone numbers)
 	// since the DM portal may have been created under a tel: handle.
 	if strings.HasPrefix(identifier, "mailto:") {
-		contact := c.lookupContact(identifier)
-		if contact != nil {
-			ctx := context.Background()
-			for _, altID := range contactPortalIDs(contact) {
-				if altID == identifier {
-					continue
-				}
-				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-					ID:       networkid.PortalID(altID),
-					Receiver: c.UserLogin.ID,
-				})
-				if err == nil && portal != nil && portal.MXID != "" {
-					c.UserLogin.Log.Debug().
-						Str("original", identifier).
-						Str("resolved", altID).
-						Msg("Resolved mailto: DM portal to existing contact portal")
-					return networkid.PortalID(altID)
-				}
+		ctx := context.Background()
+		for _, altID := range c.mutualContactHandles(identifier) {
+			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       networkid.PortalID(altID),
+				Receiver: c.UserLogin.ID,
+			})
+			if err == nil && portal != nil && portal.MXID != "" {
+				c.UserLogin.Log.Debug().
+					Str("original", identifier).
+					Str("resolved", altID).
+					Msg("Resolved mailto: DM portal to existing contact portal")
+				return networkid.PortalID(altID)
 			}
 		}
 		return defaultID
