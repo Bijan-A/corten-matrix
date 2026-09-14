@@ -584,3 +584,59 @@ func TestOrientImageLeavesUprightImagesAlone(t *testing.T) {
 		}
 	}
 }
+
+// scaleAndEncodeThumb indexes the source through its Bounds().Min, which every
+// fixture here leaves at the origin because that is what the decoders return. A
+// sub-image is the one shape that tells a correct offset from an absent one.
+func TestScaleAndEncodeThumbHonoursSourceBoundsMin(t *testing.T) {
+	for o := 1; o <= 8; o++ {
+		want, wantW, wantH := scaleAndEncodeThumb(markerImage(), o)
+		got, gotW, gotH := scaleAndEncodeThumb(markerSubImage(), o)
+		if gotW != wantW || gotH != wantH {
+			t.Errorf("orientation %d: sub-image thumb is %dx%d, want %dx%d", o, gotW, gotH, wantW, wantH)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("orientation %d: sub-image thumb differs from the origin-anchored one; "+
+				"Bounds().Min is being ignored", o)
+		}
+	}
+}
+
+// Rotating first and then scaling upright must give the same thumbnail as
+// scaling with the orientation applied inline. If it does not, one of the two
+// mappings is wrong, or a TIFF — which goes through orientImage for its
+// full-size image and the inline path for its thumbnail — ends up rotated
+// twice.
+func TestScaleAndEncodeThumbAgreesWithOrientImage(t *testing.T) {
+	for o := 1; o <= 8; o++ {
+		inline, iw, ih := scaleAndEncodeThumb(markerImage(), o)
+		pre, pw, ph := scaleAndEncodeThumb(orientImage(markerImage(), o), orientationNormal)
+		if iw != pw || ih != ph {
+			t.Errorf("orientation %d: inline thumb %dx%d, pre-rotated %dx%d", o, iw, ih, pw, ph)
+			continue
+		}
+		if !bytes.Equal(inline, pre) {
+			t.Errorf("orientation %d: scaleAndEncodeThumb(img, o) differs from "+
+				"scaleAndEncodeThumb(orientImage(img, o), 1)", o)
+		}
+	}
+}
+
+// A truncated IFD must not be walked off the end. The entry count is a
+// 16-bit field read from the file, so a corrupt or clipped block can claim
+// far more entries than the bytes hold; the bound is what stops the read.
+func TestExifOrientationRejectsTruncatedIFD(t *testing.T) {
+	tiff := buildTIFFEntries(6, false, 3, exifDecoysBefore, nil)
+	// Keep the header and the entry count, drop the entries. The count still
+	// says five, so an unguarded walk reads past the end.
+	truncated := tiff[:12]
+	if got := exifOrientation(truncated); got != orientationNormal {
+		t.Errorf("truncated IFD returned %d, want %d", got, orientationNormal)
+	}
+	// And the same block one entry short of what it promises.
+	short := tiff[:len(tiff)-13]
+	if got := exifOrientation(short); got != orientationNormal {
+		t.Errorf("IFD one entry short returned %d, want %d", got, orientationNormal)
+	}
+}
