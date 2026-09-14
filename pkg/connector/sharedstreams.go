@@ -719,9 +719,16 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 	var thumbW, thumbH int
 	if heicImg != nil {
 		b := heicImg.Bounds()
+		// Explicitly upright: libheif applies the ISOBMFF transforms while
+		// decoding, so heicImg's pixels are already oriented, and
+		// convertHEICToJPEG calls resetEXIFOrientation to set the tag to 1 so
+		// viewers do not rotate a second time. Reading the tag back here would
+		// therefore return 1 today and this would work by coincidence — pass
+		// the constant so that changing how EXIF is embedded cannot silently
+		// start rotating already-upright photos again.
 		imgWidth, imgHeight = b.Dx(), b.Dy()
 		if imgWidth > 800 || imgHeight > 800 {
-			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, orientationNormal)
 		}
 	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
@@ -729,18 +736,26 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
 		} else if img, fmtName, _ := decodeImageData(data); img != nil {
+			// Parsed here rather than before the HEIC branch: only this path
+			// uses it, and keeping it out of that scope means the constant the
+			// HEIC branch passes cannot be quietly replaced with this.
+			orientation := exifOrientation(data)
 			b := img.Bounds()
-			imgWidth, imgHeight = b.Dx(), b.Dy()
+			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			if fmtName == "tiff" {
+				// Rotate before re-encoding. jpeg.Encode writes no EXIF, so a
+				// rotated TIFF would otherwise upload as sideways pixels while
+				// its reported dimensions and thumbnail — both now oriented —
+				// said the opposite. Rotating here keeps all three agreeing.
 				var buf bytes.Buffer
-				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+				if err := jpeg.Encode(&buf, orientImage(img, orientation), &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
-				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, orientation)
 			}
 		}
 	}
