@@ -9701,9 +9701,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	// Read from the source bytes. A non-JPEG (PNG, GIF) yields 1 and everything
-	// below is a no-op. The HEIC branch does not use this — see below.
-	orientation := exifOrientation(data)
 	if heicImg != nil {
 		// Use the already-decoded image from HEIC conversion
 		b := heicImg.Bounds()
@@ -9724,12 +9721,20 @@ func (c *IMClient) downloadAndUploadAttachment(
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
 		} else if img, fmtName, _ := decodeImageData(data); img != nil {
+			// Parsed here rather than before the HEIC branch: only this path
+			// uses it, and keeping it out of that scope means the constant the
+			// HEIC branch passes cannot be quietly replaced with this.
+			orientation := exifOrientation(data)
 			b := img.Bounds()
 			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
 			if fmtName == "tiff" {
+				// Rotate before re-encoding. jpeg.Encode writes no EXIF, so a
+				// rotated TIFF would otherwise upload as sideways pixels while
+				// its reported dimensions and thumbnail — both now oriented —
+				// said the opposite. Rotating here keeps all three agreeing.
 				var buf bytes.Buffer
-				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+				if err := jpeg.Encode(&buf, orientImage(img, orientation), &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
@@ -12848,9 +12853,6 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	// Read from the source bytes. A non-JPEG (PNG, GIF) yields 1 and everything
-	// below is a no-op. The HEIC branch does not use this — see below.
-	orientation := exifOrientation(inlineData)
 	if heicImg != nil {
 		// Use the already-decoded image from HEIC conversion
 		b := heicImg.Bounds()
@@ -12874,6 +12876,10 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
 		} else if img, fmtName, _ := decodeImageData(inlineData); img != nil {
+			// Parsed here rather than before the HEIC branch: only this path
+			// uses it, and keeping it out of that scope means the constant the
+			// HEIC branch passes cannot be quietly replaced with this.
+			orientation := exifOrientation(inlineData)
 			b := img.Bounds()
 			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			log.Debug().Str("decoded_format", fmtName).
@@ -12883,8 +12889,12 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 				Msg("Image decoded successfully")
 			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
 			if fmtName == "tiff" {
+				// Rotate before re-encoding. jpeg.Encode writes no EXIF, so a
+				// rotated TIFF would otherwise upload as sideways pixels while
+				// its reported dimensions and thumbnail — both now oriented —
+				// said the opposite. Rotating here keeps all three agreeing.
 				var buf bytes.Buffer
-				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+				if err := jpeg.Encode(&buf, orientImage(img, orientation), &jpeg.Options{Quality: 95}); err == nil {
 					inlineData = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"

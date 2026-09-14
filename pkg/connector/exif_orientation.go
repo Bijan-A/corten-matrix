@@ -4,7 +4,10 @@
 
 package connector
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"image"
+)
 
 // EXIF orientation values (TIFF tag 0x0112). 1 is upright; 2/4/5/7 include a
 // mirror, 3/6/8 are pure rotations.
@@ -178,4 +181,29 @@ func orientedSourcePixel(x, y, dstW, dstH, orientation int) (int, int) {
 	default: // 1, and anything unrecognised
 		return x, y
 	}
+}
+
+// orientImage returns img transformed so it is upright, or img unchanged when
+// the orientation is already normal.
+//
+// Used for the FULL-SIZE image, not the thumbnail — the thumbnail applies the
+// same mapping inline while downsampling, so it needs no separate copy. This is
+// for formats that are re-encoded on the way out and lose their metadata in the
+// process: a TIFF becomes a JPEG written by jpeg.Encode, which carries no EXIF,
+// so unless the pixels are rotated here the uploaded image stays sideways while
+// its reported dimensions and thumbnail say otherwise.
+func orientImage(img image.Image, orientation int) image.Image {
+	if orientation <= orientationNormal || orientation > orientationMax {
+		return img
+	}
+	src := img.Bounds()
+	dstW, dstH := displayDims(src.Dx(), src.Dy(), orientation)
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	for y := range dstH {
+		for x := range dstW {
+			sx, sy := orientedSourcePixel(x, y, dstW, dstH, orientation)
+			dst.Set(x, y, img.At(src.Min.X+sx, src.Min.Y+sy))
+		}
+	}
+	return dst
 }

@@ -13,35 +13,48 @@ import (
 	"testing"
 )
 
-// buildEXIFJPEG produces a minimal JPEG carrying an APP1/Exif segment whose
-// IFD0 holds the given orientation, in the requested byte order.
-func buildEXIFJPEG(t *testing.T, orientation uint16, bigEndian bool) []byte {
-	t.Helper()
+// buildTIFF produces a raw TIFF/EXIF block whose IFD0 holds one Orientation
+// entry. One builder for every case: three near-copies drifted apart before,
+// and that is how the APP1 offset bug in the failure tests survived.
+func buildTIFF(orientation uint32, bigEndian bool, typ uint16) []byte {
 	var bo binary.ByteOrder = binary.LittleEndian
 	order := []byte("II")
 	if bigEndian {
 		bo, order = binary.BigEndian, []byte("MM")
 	}
-	var tiff bytes.Buffer
-	tiff.Write(order)
-	_ = binary.Write(&tiff, bo, uint16(42))
-	_ = binary.Write(&tiff, bo, uint32(8)) // IFD0 at offset 8
-	_ = binary.Write(&tiff, bo, uint16(1)) // one entry
-	_ = binary.Write(&tiff, bo, uint16(0x0112))
-	_ = binary.Write(&tiff, bo, uint16(3)) // SHORT
-	_ = binary.Write(&tiff, bo, uint32(1))
-	_ = binary.Write(&tiff, bo, orientation)
-	_ = binary.Write(&tiff, bo, uint16(0)) // pad the 4-byte value field
-	_ = binary.Write(&tiff, bo, uint32(0)) // next IFD
+	var b bytes.Buffer
+	b.Write(order)
+	_ = binary.Write(&b, bo, uint16(42))
+	_ = binary.Write(&b, bo, uint32(8)) // IFD0 at offset 8
+	_ = binary.Write(&b, bo, uint16(1)) // one entry
+	_ = binary.Write(&b, bo, uint16(0x0112))
+	_ = binary.Write(&b, bo, typ)
+	_ = binary.Write(&b, bo, uint32(1))
+	if typ == 4 { // LONG fills the whole value field
+		_ = binary.Write(&b, bo, orientation)
+	} else { // SHORT sits in the first half
+		_ = binary.Write(&b, bo, uint16(orientation))
+		_ = binary.Write(&b, bo, uint16(0))
+	}
+	_ = binary.Write(&b, bo, uint32(0)) // no next IFD
+	return b.Bytes()
+}
 
-	payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
+// wrapJPEG wraps TIFF blocks as APP1/Exif segments, in order, ahead of a real
+// image body. Extra segments model the APP0 JFIF or XMP that most re-saved
+// JPEGs carry before the Exif one.
+func wrapJPEG(t *testing.T, pre [][]byte, tiff []byte) []byte {
+	t.Helper()
 	var out bytes.Buffer
 	out.Write([]byte{0xFF, 0xD8}) // SOI
+	for _, seg := range pre {
+		out.Write(seg)
+	}
+	payload := append([]byte("Exif\x00\x00"), tiff...)
 	out.Write([]byte{0xFF, 0xE1})
 	_ = binary.Write(&out, binary.BigEndian, uint16(len(payload)+2))
 	out.Write(payload)
 
-	// A real, decodable image body so the same bytes can drive the encoder.
 	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
 	var body bytes.Buffer
 	if err := jpeg.Encode(&body, img, nil); err != nil {
@@ -49,6 +62,11 @@ func buildEXIFJPEG(t *testing.T, orientation uint16, bigEndian bool) []byte {
 	}
 	out.Write(body.Bytes()[2:]) // skip the body's own SOI
 	return out.Bytes()
+}
+
+func buildEXIFJPEG(t *testing.T, orientation uint16, bigEndian bool) []byte {
+	t.Helper()
+	return wrapJPEG(t, nil, buildTIFF(uint32(orientation), bigEndian, 3))
 }
 
 func TestExifOrientationReadsAllValues(t *testing.T) {
@@ -282,75 +300,67 @@ func TestExifOrientationSkipsEarlierSegments(t *testing.T) {
 // SHORT yields the high half, which is zero for every real orientation — so
 // ignoring the type silently degrades to 1 rather than failing loudly.
 func TestExifOrientationHonoursEntryType(t *testing.T) {
-	buildLong := func(bigEndian bool) []byte {
-		var bo binary.ByteOrder = binary.LittleEndian
-		order := []byte("II")
-		if bigEndian {
-			bo, order = binary.BigEndian, []byte("MM")
-		}
-		var tiff bytes.Buffer
-		tiff.Write(order)
-		_ = binary.Write(&tiff, bo, uint16(42))
-		_ = binary.Write(&tiff, bo, uint32(8))
-		_ = binary.Write(&tiff, bo, uint16(1))
-		_ = binary.Write(&tiff, bo, uint16(0x0112))
-		_ = binary.Write(&tiff, bo, uint16(4)) // LONG
-		_ = binary.Write(&tiff, bo, uint32(1))
-		_ = binary.Write(&tiff, bo, uint32(6))
-		_ = binary.Write(&tiff, bo, uint32(0))
-		payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
-		var out bytes.Buffer
-		out.Write([]byte{0xFF, 0xD8, 0xFF, 0xE1})
-		_ = binary.Write(&out, binary.BigEndian, uint16(len(payload)+2))
-		out.Write(payload)
-		img := image.NewRGBA(image.Rect(0, 0, 2, 2))
-		var body bytes.Buffer
-		_ = jpeg.Encode(&body, img, nil)
-		out.Write(body.Bytes()[2:])
-		return out.Bytes()
-	}
 	for _, be := range []bool{false, true} {
-		if got := exifOrientation(buildLong(be)); got != 6 {
-			label := "little-endian"
-			if be {
-				label = "big-endian"
-			}
-			t.Errorf("exifOrientation(%s LONG) = %d, want 6", label, got)
+		if got := exifOrientation(wrapJPEG(t, nil, buildTIFF(6, be, 4))); got != 6 {
+			t.Errorf("exifOrientation(bigEndian=%v, LONG) = %d, want 6", be, got)
 		}
+	}
+	// An unknown type must not be guessed at.
+	if got := exifOrientation(wrapJPEG(t, nil, buildTIFF(6, false, 9))); got != orientationNormal {
+		t.Errorf("exifOrientation(unknown type) = %d, want 1", got)
 	}
 }
 
 // A TIFF file's header is the same block the EXIF path parses, so its
-// orientation is readable directly. Callers re-encode TIFF to JPEG without
-// EXIF but build the thumbnail from the decoded image, so this is what makes
-// those thumbnails upright too.
+// orientation is readable directly. Callers re-encode TIFF to JPEG without EXIF
+// but rotate the pixels first, so the uploaded image, its dimensions and its
+// thumbnail all agree.
 func TestExifOrientationReadsBareTIFF(t *testing.T) {
-	build := func(bigEndian bool, orientation uint16) []byte {
-		var bo binary.ByteOrder = binary.LittleEndian
-		order := []byte("II")
-		if bigEndian {
-			bo, order = binary.BigEndian, []byte("MM")
-		}
-		var b bytes.Buffer
-		b.Write(order)
-		_ = binary.Write(&b, bo, uint16(42))
-		_ = binary.Write(&b, bo, uint32(8))
-		_ = binary.Write(&b, bo, uint16(1))
-		_ = binary.Write(&b, bo, uint16(0x0112))
-		_ = binary.Write(&b, bo, uint16(3))
-		_ = binary.Write(&b, bo, uint32(1))
-		_ = binary.Write(&b, bo, orientation)
-		_ = binary.Write(&b, bo, uint16(0))
-		_ = binary.Write(&b, bo, uint32(0))
-		return b.Bytes()
-	}
 	for _, be := range []bool{false, true} {
-		if got := exifOrientation(build(be, 8)); got != 8 {
+		if got := exifOrientation(buildTIFF(8, be, 3)); got != 8 {
 			t.Errorf("exifOrientation(bare TIFF, bigEndian=%v) = %d, want 8", be, got)
 		}
 	}
 	// A JPEG must still take the APP1 path rather than being read as TIFF.
 	if got := exifOrientation(buildEXIFJPEG(t, 3, false)); got != 3 {
 		t.Errorf("exifOrientation(JPEG) = %d, want 3", got)
+	}
+}
+
+// A non-Exif APP1 (XMP is the common one) must be skipped rather than ending
+// the search, and the walk must stop at SOS instead of reading scan data as
+// segment headers.
+func TestExifOrientationSkipsNonExifAPP1(t *testing.T) {
+	// Segment length counts itself: 8 payload bytes + 2 = 0x000A.
+	xmp := []byte{0xFF, 0xE1, 0x00, 0x0A, 'h', 't', 't', 'p', ':', 0, 0, 0}
+	if got := exifOrientation(wrapJPEG(t, [][]byte{xmp}, buildTIFF(6, false, 3))); got != 6 {
+		t.Errorf("exifOrientation() = %d with an XMP APP1 before the Exif one, want 6", got)
+	}
+	// Exif after SOS is not metadata; the walk must not go looking.
+	sos := []byte{0xFF, 0xDA, 0x00, 0x08, 1, 1, 0, 0, 0, 0}
+	if got := exifOrientation(wrapJPEG(t, [][]byte{sos}, buildTIFF(6, false, 3))); got != orientationNormal {
+		t.Errorf("exifOrientation() = %d for Exif after SOS, want 1", got)
+	}
+}
+
+// An IFD0 offset pointing inside the 8-byte TIFF header is malformed, and the
+// guard against it is load-bearing rather than decorative.
+//
+// With the offset at 0, the walk reads the "II" magic as an entry count and
+// then finds an entry inside the block's own bytes. This particular layout —
+// found by brute-forcing every offset below 8 against the parser with and
+// without the guard — resolves to a bogus orientation of 3. A first attempt at
+// this test used offset 4, which happens to resolve to 1 anyway, so removing
+// the guard still passed.
+func TestExifOrientationRejectsIFDInsideHeader(t *testing.T) {
+	tiff := []byte{'I', 'I', 42, 0, 0, 0, 0, 0} // magic 42, IFD0 offset 0
+	for range 4 {
+		tiff = append(tiff, 0x12, 0x01, 0x03, 0x00, 0x00, 0x00)
+	}
+	if got := exifOrientation(tiff); got != orientationNormal {
+		t.Errorf("exifOrientation(IFD inside the header) = %d, want 1", got)
+	}
+	if got := exifOrientation(wrapJPEG(t, nil, tiff)); got != orientationNormal {
+		t.Errorf("exifOrientation(same, wrapped in APP1) = %d, want 1", got)
 	}
 }

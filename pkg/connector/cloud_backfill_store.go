@@ -482,8 +482,9 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to add thumb_version to cloud_attachment_cache: %w", err)
 		}
 	}
-	// Stale entries are skipped at load rather than deleted here; see
-	// loadAttachmentCacheJSON for why.
+	// Nothing is deleted or rewritten here: loadAttachmentCacheJSON strips the
+	// thumbnail out of any entry still stamped below the current generation,
+	// which keeps the full-size attachment usable. See there for why.
 
 	// Migration: add cloud_attachment_dead table if missing. Persists
 	// record_names that CloudKit no longer serves (Apple aged out the MMCS
@@ -4090,37 +4091,35 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 	`, s.loginID, chatID, portalID, groupID, dnPtr, photoPtr, participantsJSON, nowMS)
 }
 
-// loadAttachmentCacheJSON returns every persisted record_name → content_json
-// pair for this login. The caller deserialises the JSON into
-// *event.MessageEventContent and populates the in-memory attachmentContentCache
-// so pre-upload skips already-uploaded attachments without touching CloudKit.
+// loadAttachmentCacheJSON returns the persisted record_name → content_json
+// entries, with the thumbnail stripped from any entry older than the current
+// thumbnail generation, and populates the in-memory attachmentContentCache so
+// pre-upload skips already-uploaded attachments without touching CloudKit.
+//
+// Stale entries are stripped rather than withheld. Withholding one looks
+// harmless — it would simply be regenerated on next use — but it discards a
+// valid mxc URI for a full-size attachment that is already uploaded, and forces
+// a fresh CloudKit download to get it back. If Apple has aged the blob out, and
+// the attachment-dead subsystem exists precisely because that happens, the
+// download fails with ATTACHMENT_UNRECOVERABLE, markAttachmentDead records it,
+// and the photo is dropped from the room for good. Before any of this work that
+// case was a cache hit: a sideways thumbnail, but the photo was there. Losing
+// the photo to fix its thumbnail is not a trade worth making, and a transient
+// CloudKit error would do the same for one backfill.
+//
+// Removing just the thumbnail keeps the full-size image and its mxc URI, so
+// nothing is re-downloaded and nothing can be lost; the entry simply arrives
+// without a preview. It also means the first start after an upgrade does not
+// re-download every stale attachment through preUploadCloudAttachments, which
+// treats an absent entry as uncached.
+//
+// The residue is that a stale entry keeps its old Info.Width/Height, which for
+// a quarter-turn image are transposed. A missing thumbnail and imperfect
+// dimensions beat a sideways thumbnail, and beat a missing photo by a long way.
 func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[string][]byte, error) {
-	// Skip entries whose thumbnail predates the current generation, so they are
-	// regenerated on next use instead of being replayed. Entries WITHOUT a
-	// thumbnail are unaffected by a thumbnail change and are always loaded:
-	// they still hold the mxc URI of an already-uploaded attachment, and
-	// dropping them would force a pointless re-download and re-upload.
-	//
-	// Skipped rather than deleted, which is the difference between paying for
-	// every stale entry at once and paying only for the ones actually used
-	// again. On the install this was written against, half the cache (12,231 of
-	// 24,186) carries a thumbnail, and most of those attachments will never be
-	// re-sent; a mass delete would re-fetch all of them from CloudKit up front.
-	// A skipped row is overwritten by saveAttachmentCacheEntry, stamped current,
-	// the first time its attachment is used again.
-	//
-	// The thumbnail test is dialect-specific because content_json is BYTEA on
-	// Postgres, where CAST(... AS TEXT) yields the hex escape form (\x7b22...)
-	// and a LIKE for readable text silently matches nothing — the first version
-	// of this did exactly that and invalidated nothing at all.
-	hasThumb := `CAST(content_json AS TEXT) LIKE '%thumbnail%'`
-	if s.db.Dialect == dbutil.Postgres {
-		hasThumb = `position('\x7468756d626e61696c'::bytea in content_json) > 0` // "thumbnail"
-	}
 	rows, err := s.db.Query(ctx,
-		`SELECT record_name, content_json FROM cloud_attachment_cache
-		 WHERE login_id=$1 AND (thumb_version >= $2 OR NOT (`+hasThumb+`))`,
-		s.loginID, thumbCacheVersion,
+		`SELECT record_name, content_json, thumb_version FROM cloud_attachment_cache WHERE login_id=$1`,
+		s.loginID,
 	)
 	if err != nil {
 		return nil, err
@@ -4130,12 +4129,49 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 	for rows.Next() {
 		var recordName string
 		var contentJSON []byte
-		if err := rows.Scan(&recordName, &contentJSON); err != nil {
+		var version int
+		if err := rows.Scan(&recordName, &contentJSON, &version); err != nil {
 			return nil, err
+		}
+		if version < thumbCacheVersion {
+			contentJSON = stripCachedThumbnail(contentJSON)
 		}
 		cache[recordName] = contentJSON
 	}
 	return cache, rows.Err()
+}
+
+// stripCachedThumbnail removes the thumbnail fields from a cached
+// MessageEventContent, leaving everything else — crucially the full-size url
+// and file — untouched. Returns the input unchanged if it cannot be parsed,
+// since an unreadable entry is better served stale than dropped.
+//
+// Done on the parsed JSON rather than by string surgery so it matches the
+// actual keys and cannot be fooled by a filename containing "thumbnail".
+func stripCachedThumbnail(contentJSON []byte) []byte {
+	var content map[string]any
+	if err := json.Unmarshal(contentJSON, &content); err != nil {
+		return contentJSON
+	}
+	info, ok := content["info"].(map[string]any)
+	if !ok {
+		return contentJSON
+	}
+	found := false
+	for _, key := range []string{"thumbnail_url", "thumbnail_file", "thumbnail_info"} {
+		if _, present := info[key]; present {
+			delete(info, key)
+			found = true
+		}
+	}
+	if !found {
+		return contentJSON
+	}
+	stripped, err := json.Marshal(content)
+	if err != nil {
+		return contentJSON
+	}
+	return stripped
 }
 
 // portalsFullyBackfilledNoNewContent returns the set of portal_ids whose
@@ -4276,18 +4312,22 @@ func (s *cloudBackfillStore) saveDeadAttachment(ctx context.Context, recordName,
 	`, s.loginID, recordName, reason, time.Now().UnixMilli())
 }
 
-// saveAttachmentCacheEntry persists a record_name → MessageEventContent JSON
-// pair. Idempotent (upsert). Errors are silently ignored — the persistent cache
-// is a best-effort optimisation; missing entries fall back to re-download.
 // thumbCacheVersion is the generation of thumbnail rendering that produced a
 // cached attachment entry. Bump it whenever a change alters the bytes or the
-// reported dimensions of a generated thumbnail, so entries made by the previous
-// generation are discarded instead of being replayed forever.
+// reported dimensions of a generated thumbnail, so entries made by an earlier
+// generation are not replayed unchanged.
+//
+// Entries below the current version are not discarded — loadAttachmentCacheJSON
+// strips their thumbnail and keeps the rest, so the full-size attachment stays
+// usable and nothing has to be re-downloaded.
 //
 //	1: thumbnails honour the source's EXIF orientation, and Info.Width/Height
 //	   report display rather than decoded dimensions.
 const thumbCacheVersion = 1
 
+// saveAttachmentCacheEntry persists a record_name → MessageEventContent JSON
+// pair. Idempotent (upsert). Errors are silently ignored — the persistent cache
+// is a best-effort optimisation; missing entries fall back to re-download.
 func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recordName string, contentJSON []byte) {
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts, thumb_version)

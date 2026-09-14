@@ -717,9 +717,6 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	// Read from the source bytes. A non-JPEG (PNG, GIF) yields 1 and everything
-	// below is a no-op. The HEIC branch does not use this — see below.
-	orientation := exifOrientation(data)
 	if heicImg != nil {
 		b := heicImg.Bounds()
 		// Explicitly upright: libheif applies the ISOBMFF transforms while
@@ -739,11 +736,19 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
 		} else if img, fmtName, _ := decodeImageData(data); img != nil {
+			// Parsed here rather than before the HEIC branch: only this path
+			// uses it, and keeping it out of that scope means the constant the
+			// HEIC branch passes cannot be quietly replaced with this.
+			orientation := exifOrientation(data)
 			b := img.Bounds()
 			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			if fmtName == "tiff" {
+				// Rotate before re-encoding. jpeg.Encode writes no EXIF, so a
+				// rotated TIFF would otherwise upload as sideways pixels while
+				// its reported dimensions and thumbnail — both now oriented —
+				// said the opposite. Rotating here keeps all three agreeing.
 				var buf bytes.Buffer
-				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+				if err := jpeg.Encode(&buf, orientImage(img, orientation), &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
