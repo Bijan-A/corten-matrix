@@ -7345,13 +7345,15 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 
 const (
 	// plLockLevel is the power level required for destructive or bridge-owned
-	// room actions. It sits just below the bridge bot's 9001 so the bot can
-	// still perform them, but no human-reachable level (Matrix tops out at 100
-	// in practice) can. The homeserver enforces this, so a user's attempt to
-	// tombstone the room, toggle encryption, set server ACLs, invite/kick/ban,
-	// or redact someone else's message is rejected outright. Power-level edits
-	// themselves are intentionally NOT locked here — they're allowed through and
-	// then rubberbanded by HandleMatrixPowerLevels.
+	// room actions: tombstoning the room, toggling encryption, setting server
+	// ACLs, inviting/kicking/banning, and redacting someone else's message. It
+	// sits just below the bridge bot's 9001 so the bot can always perform them.
+	// The homeserver enforces it, so a user at the room default (0) who tries
+	// any of these is rejected outright.
+	//
+	// This is a threshold, not a cap on users. A bridge admin can raise a user
+	// to this level or past it with `set-pl`, and the bridge leaves that level
+	// alone.
 	plLockLevel = 9000
 
 	// botPowerLevel mirrors the level bridgev2 assigns the bridge bot in every
@@ -7362,55 +7364,42 @@ const (
 
 // hardenedPowerLevels returns the power-level overrides applied to every portal
 // — DMs and group chats, on both the CloudKit (GetChatInfo) and chat.db
-// (chatDBInfoToBridgev2) paths — so Matrix users can't clobber bridge-managed
-// room state. See docs/postmortem-style notes: a user raising their power level
-// can otherwise tombstone the room, silently kill incoming messages by raising
-// events_default, pull unbridged users into a group, or redact other people's
-// messages.
+// (chatDBInfoToBridgev2) paths. They set the thresholds for bridge-managed
+// actions. With the room defaults, a user who gains power could tombstone the
+// room, silently stop incoming messages by raising events_default, pull
+// unbridged users into a group, or redact other people's messages.
 //
-// Two layers of defense:
+// The homeserver enforces the thresholds. The destructive/bridge-owned actions
+// are pinned to plLockLevel. Everyday messaging is deliberately left alone:
+// events_default stays 0 so both ghosts and the user can always send, and a
+// user can still redact (unsend) their OWN messages because self-redaction is
+// gated by events_default, not the redact level.
 //
-//  1. Homeserver-enforced lock. The destructive/bridge-owned actions are pinned
-//     to plLockLevel, so the homeserver itself rejects any human user trying
-//     them. Everyday messaging is deliberately left alone: events_default stays
-//     0 so both ghosts and the user can always send, and a user can still
-//     redact (unsend) their OWN messages because self-redaction is gated by
-//     events_default, not the redact level.
+// Individual users' levels are deliberately NOT managed here. Bridge admins set
+// them with bridgev2's built-in `set-pl`, and the level the admin chose sticks,
+// including one at or above plLockLevel for a user who needs a locked action.
+// The bridge previously reset every non-bot user to users_default on each apply,
+// and shadowed set-pl to snap the change back instantly, so no one could be
+// granted a level at all.
 //
-//  2. Reset on apply (+ notice). The Custom hook (resetEscalatedUsers) runs on
-//     every power-level apply — room creation, every member resync, and the
-//     HandleMatrixPowerLevels rubberband. If a non-bot user sits above the room
-//     baseline (users_default) it resets them and posts a single rate-limited
-//     m.notice. Running on resync (not just on user-sent edits) is what catches
-//     the escalation vectors that don't arrive as a user event — `set-pl` and
-//     the homeserver admin API both write power levels as the bot, which the
-//     framework filters out before HandleMatrixPowerLevels would ever see them.
-//     This is safe against notice spam because the bridge never grants normal
-//     users an explicit entry above users_default, so the reset only fires on a
-//     genuine escalation, not on every resync.
-//
-// ctx/portal may be nil (the chat.db path has neither in scope); the reset still
-// happens, only the m.notice is skipped.
-func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Portal) *bridgev2.PowerLevelOverrides {
+// The overrides are re-applied on every member resync and by
+// HandleMatrixPowerLevels, so a threshold that someone lowers is restored.
+func hardenedPowerLevels() *bridgev2.PowerLevelOverrides {
 	return &bridgev2.PowerLevelOverrides{
 		EventsDefault: ptr.Ptr(0), // ghosts + users can always send messages
 		Events: map[event.Type]int{
-			// NOTE: m.room.power_levels is deliberately NOT locked. On homeservers
-			// where a user can edit it, we let the change land (so it's visible in
-			// the room), then snap it back. On platforms where the user can't (e.g.
-			// Beeper users sit at 0 and power_levels needs 100), the escalation can
-			// only come via set-pl/admin-API, which the resync reset below catches.
-			event.StateTombstone:  plLockLevel, // no user may upgrade/replace the room
+			// NOTE: m.room.power_levels is deliberately NOT locked, so a user
+			// with a high enough level can edit levels from their client. Changes
+			// to user levels stand; if they lower one of the thresholds below,
+			// HandleMatrixPowerLevels snaps it back.
+			event.StateTombstone:  plLockLevel, // upgrading/replacing the room
 			event.StateEncryption: plLockLevel, // encryption is bridge-managed
 			event.StateServerACL:  plLockLevel,
 		},
 		Invite: ptr.Ptr(plLockLevel), // membership is bridge-managed
 		Kick:   ptr.Ptr(plLockLevel),
 		Ban:    ptr.Ptr(plLockLevel),
-		Redact: ptr.Ptr(plLockLevel), // can't redact others; self-unsend still works
-		Custom: func(pl *event.PowerLevelsEventContent) bool {
-			return c.resetEscalatedUsers(ctx, portal, pl)
-		},
+		Redact: ptr.Ptr(plLockLevel), // redacting others; self-unsend still works
 	}
 }
 
@@ -7421,9 +7410,9 @@ func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Por
 // CreateRoom request's PowerLevelOverride, and on Beeper (auto_join_invites) the
 // server adds the initial roster via that same create — silently — only if the
 // create's power levels don't get in the way. Baking the full hardened lockdown
-// (Invite/Kick/Ban/Redact = plLockLevel, EventsDefault, the destructive-event
-// locks and the Custom reset hook) into the CREATE request breaks that silent
-// initial-member add, so the whole roster re-surfaces as "<name> joined the
+// (Invite/Kick/Ban/Redact = plLockLevel, EventsDefault and the destructive-event
+// locks) into the CREATE request breaks that silent initial-member add, so the
+// whole roster re-surfaces as "<name> joined the
 // chat" on a fresh-DB backfill. Pre-d78e666 we created groups with only a light
 // Invite=95 and DMs with no override, and creation was silent.
 //
@@ -7432,7 +7421,7 @@ func (c *IMClient) hardenedPowerLevels(ctx context.Context, portal *bridgev2.Por
 // up — and stays — locked, because the immediate post-creation ChatResync runs
 // this with portal.MXID set. Steady-state protection is unchanged; only the
 // one create event is permissive.
-func (c *IMClient) powerLevelsForMemberSync(ctx context.Context, portal *bridgev2.Portal, isGroup bool) *bridgev2.PowerLevelOverrides {
+func powerLevelsForMemberSync(portal *bridgev2.Portal, isGroup bool) *bridgev2.PowerLevelOverrides {
 	if portal == nil || portal.MXID == "" {
 		if isGroup {
 			// Bridge still owns membership for groups, just at a human-reachable
@@ -7441,113 +7430,21 @@ func (c *IMClient) powerLevelsForMemberSync(ctx context.Context, portal *bridgev
 		}
 		return nil
 	}
-	return c.hardenedPowerLevels(ctx, portal)
-}
-
-// resetEscalatedUsers is the Custom power-level hook from hardenedPowerLevels.
-// It demotes any non-bot user whose level was raised above the room baseline
-// (users_default) back down to that baseline, and — when a room is known and the
-// per-room+user rate limit allows — posts one m.notice. The baseline is also
-// exactly the level the user had before they escalated, since the bridge never
-// grants normal users an explicit power-level entry. Returns true if it modified
-// the power-level content, so the framework re-sends the event.
-func (c *IMClient) resetEscalatedUsers(ctx context.Context, portal *bridgev2.Portal, pl *event.PowerLevelsEventContent) bool {
-	if pl == nil {
-		return false
-	}
-	botMXID := c.Main.Bridge.Bot.GetMXID()
-	baseline := pl.UsersDefault
-
-	// Snapshot the user IDs so we don't mutate the map mid-range.
-	var userIDs []id.UserID
-	for userID := range pl.Users {
-		userIDs = append(userIDs, userID)
-	}
-
-	var demoted []id.UserID
-	for _, userID := range userIDs {
-		if userID == botMXID {
-			continue
-		}
-		if pl.GetUserLevel(userID) <= baseline {
-			continue
-		}
-		// The bot sits at 9001, so this reset always succeeds against a user.
-		if pl.EnsureUserLevelAs(botMXID, userID, baseline) {
-			demoted = append(demoted, userID)
-		}
-	}
-	if len(demoted) == 0 {
-		return false
-	}
-
-	if portal != nil && portal.MXID != "" {
-		roomID := portal.MXID
-		notifyCtx := context.Background()
-		if ctx != nil {
-			notifyCtx = context.WithoutCancel(ctx)
-		}
-		body := fmt.Sprintf("⚠️ Power-level changes are disabled in bridge chats. Your power level remains at %d.", baseline)
-		for _, userID := range demoted {
-			c.UserLogin.Log.Info().
-				Stringer("user_id", userID).
-				Stringer("room_id", roomID).
-				Int("baseline", baseline).
-				Msg("Reset escalated Matrix power level back to room default")
-			go func() {
-				if _, err := c.Main.Bridge.Bot.SendMessage(notifyCtx, roomID, event.EventMessage, &event.Content{
-					Parsed: &event.MessageEventContent{MsgType: event.MsgNotice, Body: body},
-				}, nil); err != nil {
-					c.UserLogin.Log.Warn().Err(err).Stringer("room_id", roomID).Msg("Failed to post power-level reset notice")
-				}
-			}()
-		}
-	}
-	return true
-}
-
-// rubberbandSetPowerLevel is the instant path for the `set-pl` command. The
-// framework sends set-pl's change as the bot and filters bot-sent events before
-// HandleMatrixPowerLevels would see them, so the connector's own set-pl command
-// (cmdSetPowerLevel) calls this directly: apply the requested level just long
-// enough to be visible, then snap the room back to the hardened policy —
-// resetting the just-granted level and posting the m.notice via the Custom hook.
-func (c *IMClient) rubberbandSetPowerLevel(ctx context.Context, portal *bridgev2.Portal, target id.UserID, level int) error {
-	if portal == nil || portal.MXID == "" {
-		return fmt.Errorf("no portal room")
-	}
-	pl, err := c.Main.Bridge.Matrix.GetPowerLevels(ctx, portal.MXID)
-	if err != nil {
-		return fmt.Errorf("failed to get power levels: %w", err)
-	}
-	botMXID := c.Main.Bridge.Bot.GetMXID()
-	pl.EnsureUserLevel(botMXID, botPowerLevel)
-
-	// Apply the requested level first so the change is briefly visible.
-	if pl.EnsureUserLevelAs(botMXID, target, level) {
-		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
-			return fmt.Errorf("failed to set power level: %w", err)
-		}
-	}
-	// Snap back to the hardened policy (Custom hook resets + posts the notice).
-	if c.hardenedPowerLevels(ctx, portal).Apply(botMXID, pl) {
-		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
-			return fmt.Errorf("failed to re-assert hardened power levels: %w", err)
-		}
-	}
-	return nil
+	return hardenedPowerLevels()
 }
 
 // HandleMatrixPowerLevels implements bridgev2.PowerLevelHandlingNetworkAPI.
 // iMessage has no power-level concept, so the change is never bridged to the
-// network. Instead this callback is the immediate "rubberband" for homeservers
-// where a user CAN edit power levels: the instant they do, re-apply the hardened
-// overrides — reset any escalation back to the room default, re-assert
-// events_default=0 and the destructive-action locks — and, if that changed
-// anything, re-send the corrected power-levels event as the bot. The user's edit
-// lands first (so it's visible in the timeline), then snaps back. The m.notice
-// is posted by resetEscalatedUsers (the Custom hook inside Apply), which also
-// covers the set-pl/admin-API vectors that never reach this callback.
+// network. Instead, on homeservers where a user CAN edit power levels, this
+// callback keeps the thresholds in force the instant they do. It re-applies the
+// hardened overrides (events_default=0 and the destructive-action locks) and, if
+// that changed anything, re-sends the corrected power-levels event as the bot.
+// The user's edit lands first, so it's visible in the timeline, and only a
+// lowered threshold snaps back. Changes to individual users' levels stand.
+//
+// Bot-sent changes (`set-pl`, the homeserver admin API) never reach this
+// callback. Those only set user levels, which the bridge doesn't manage, and the
+// next member resync re-applies the thresholds regardless.
 func (c *IMClient) HandleMatrixPowerLevels(ctx context.Context, msg *bridgev2.MatrixPowerLevelChange) (bool, error) {
 	portal := msg.Portal
 	pl := msg.Content
@@ -7560,10 +7457,9 @@ func (c *IMClient) HandleMatrixPowerLevels(ctx context.Context, msg *bridgev2.Ma
 	botMXID := c.Main.Bridge.Bot.GetMXID()
 	pl.EnsureUserLevel(botMXID, botPowerLevel)
 
-	// Apply runs the Custom hook (resetEscalatedUsers), which resets escalations
-	// and posts the notice. If it changed nothing, the edit was already within
-	// policy — leave it alone.
-	if !c.hardenedPowerLevels(ctx, portal).Apply(botMXID, pl) {
+	// Apply only touches the thresholds. If it changed nothing, the edit was
+	// already within policy — leave it alone.
+	if !hardenedPowerLevels().Apply(botMXID, pl) {
 		return false, nil
 	}
 	// Re-send the corrected power levels as the bot (the snap-back).
@@ -7660,7 +7556,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			MemberMap: memberMap,
 			// Permissive at creation (silent initial-member add), full lockdown
 			// on resync. See powerLevelsForMemberSync.
-			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, true),
+			PowerLevels: powerLevelsForMemberSync(portal, true),
 		}
 
 		// Only set the group name for NEW portals (no Matrix room yet).
@@ -7782,7 +7678,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			MemberMap:   memberMap,
 			// Permissive at creation (silent initial-member add), full lockdown
 			// on resync. See powerLevelsForMemberSync.
-			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, false),
+			PowerLevels: powerLevelsForMemberSync(portal, false),
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
@@ -13718,7 +13614,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatPortalID ne
 		members := &bridgev2.ChatMemberList{
 			IsFull:      true,
 			MemberMap:   make(map[networkid.UserID]bridgev2.ChatMember),
-			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
+			PowerLevels: hardenedPowerLevels(),
 		}
 		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
@@ -13771,7 +13667,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatPortalID ne
 			IsFull:      true,
 			OtherUserID: otherUser,
 			MemberMap:   memberMap,
-			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
+			PowerLevels: hardenedPowerLevels(),
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
