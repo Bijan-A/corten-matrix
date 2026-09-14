@@ -4126,15 +4126,33 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 // inside the backfill path is a larger change than this fix; it is left as
 // follow-up work rather than smuggled in here.
 //
-// Second, the strip cannot be narrowed to the formats that were actually wrong
-// (JPEG and TIFF; HEIC came back upright from libheif and PNG/GIF carry no
-// orientation). The obvious filter is the stored mime_type or uti_type, and
-// neither is trustworthy: in this deployment 538 attachment rows carry a
-// mime_type and uti_type that name different formats, in both directions —
-// image/heic tagged public.jpeg and image/jpeg tagged public.heic. The runtime
-// path agrees they are unreliable and sniffs the bytes instead, which are not
-// available here. Filtering on either field would both keep wrong thumbnails
-// and drop right ones, so every stale entry is treated as suspect.
+// Second, the strip is broader than it needs to be. Only JPEG and TIFF sources
+// were ever wrong: HEIC comes back upright from libheif, and PNG/GIF carry no
+// orientation. Narrowing it is possible — it is just not done here.
+//
+// The filter to use is att.MimeType, which is what actually selects the branch:
+// maybeConvertHEIC gates on isHEIC(mimeType), a string comparison, and uti_type
+// is consulted only when mime_type is empty. So the ~500 rows in this
+// deployment whose mime_type and uti_type name different formats do not make a
+// narrowing unsound; the disagreement never reaches the decision. On a failed
+// conversion maybeConvertHEIC returns the original mime type and no image,
+// which makes the pair decisive: att.MimeType of image/heic or image/heif with
+// a cached Info.MimeType of image/jpeg can only mean libheif converted it, so
+// that thumbnail was built from upright pixels and is identical under either
+// version. JPEG bytes mislabelled as HEIC fail conversion, keep their heic mime
+// type, and are still stripped. The one case it gets wrong is TIFF bytes
+// labelled HEIC.
+//
+// Doing that here would need att.MimeType, which this query has no access to —
+// it lives in cloud_message.attachments_json — so it belongs at the cache-hit
+// site along with the regeneration above, and is left to the same follow-up.
+// Until then every stale entry is treated as suspect.
+//
+// Fewer entries are affected than the row count suggests. Live Photo stills
+// skip the cache hit entirely and are re-saved at the current version, so their
+// thumbnails come back on their own, and that is the default iPhone capture
+// mode. Installs with a capped max_initial_messages return from
+// preUploadCloudAttachments before this function is called at all.
 //
 // The remaining residue is that a stale entry keeps its old Info.Width/Height,
 // which for a quarter-turn image are transposed. A missing thumbnail and

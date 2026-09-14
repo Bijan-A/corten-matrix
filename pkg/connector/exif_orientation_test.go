@@ -21,8 +21,10 @@ func buildTIFF(orientation uint32, bigEndian bool, typ uint16) []byte {
 	return buildTIFFEntries(orientation, bigEndian, typ, nil, nil)
 }
 
-// exifDecoy is a non-Orientation IFD0 entry whose value fits the inline 4-byte
-// field, used to pad IFD0 the way a real camera file does.
+// exifDecoy is a non-Orientation IFD0 entry used to pad IFD0 the way a real
+// camera file does. Only the 12-byte entry header matters here, since the walk
+// skips these without reading their values — XResolution is a RATIONAL, which
+// a real file stores at an offset rather than inline.
 type exifDecoy struct {
 	tag   uint16
 	typ   uint16
@@ -151,6 +153,13 @@ func TestExifOrientationDegradesToNormal(t *testing.T) {
 			return b.Bytes()
 		}()},
 		{"truncated mid-segment", valid[:12]},
+		// A segment length counts its own two bytes, so 0 and 1 are impossible.
+		// They are also the values that make data[i+4 : i+2+segLen] slice
+		// backwards — with segLen 1 that is [6:5], which panics rather than
+		// returning a wrong answer. The i+2+segLen bound does not catch it,
+		// because a too-SMALL length is still inside the buffer.
+		{"APP1 claiming length 0", []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+		{"APP1 claiming length 1", []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}},
 		{"segment length overruns the buffer", func() []byte {
 			d := append([]byte(nil), valid...)
 			binary.BigEndian.PutUint16(d[4:6], 0xFFFF)
@@ -477,6 +486,15 @@ func markerSubImage() image.Image {
 // Pix fast path and must fall back to At/Set.
 type genericImage struct{ image.Image }
 
+// Built once. These are 1200x800 and the tests below loop over eight
+// orientations and several source shapes; rebuilding them each time dominated
+// the runtime. Nothing here mutates a source image.
+var (
+	sharedMarker      = markerImage()
+	sharedMarkerNRGBA = asNRGBA(markerImage())
+	sharedMarkerSub   = markerSubImage()
+)
+
 // cornersOf reads img's four corner quadrants clockwise from the top-left.
 func cornersOf(img image.Image) string {
 	b := img.Bounds()
@@ -496,11 +514,11 @@ func TestOrientImageOrientsPixels(t *testing.T) {
 			name string
 			img  image.Image
 		}{
-			{"RGBA", markerImage()},
-			{"NRGBA", asNRGBA(markerImage())},
-			{"generic", genericImage{markerImage()}},
-			{"sub-image", markerSubImage()},
-			{"generic sub-image", genericImage{markerSubImage()}},
+			{"RGBA", sharedMarker},
+			{"NRGBA", sharedMarkerNRGBA},
+			{"generic", genericImage{sharedMarker}},
+			{"sub-image", sharedMarkerSub},
+			{"generic sub-image", genericImage{sharedMarkerSub}},
 		} {
 			got := orientImage(src.img, o)
 			wantW, wantH := displayDims(1200, 800, o)
@@ -539,9 +557,11 @@ func TestOrientImageFastPathMatchesGenericPath(t *testing.T) {
 			name string
 			img  image.Image
 		}{
-			{"RGBA", markerImage()},
-			{"NRGBA", asNRGBA(markerImage())},
-			{"sub-image", markerSubImage()},
+			{"RGBA", sharedMarker},
+			{"NRGBA", sharedMarkerNRGBA},
+			{"sub-image", sharedMarkerSub},
+			{"translucent NRGBA", translucentNRGBA()},
+			{"translucent NRGBA sub-image", translucentNRGBASub()},
 		} {
 			fast := orientImage(src.img, o)
 			slow := orientImage(genericImage{src.img}, o)
@@ -638,5 +658,86 @@ func TestExifOrientationRejectsTruncatedIFD(t *testing.T) {
 	short := tiff[:len(tiff)-13]
 	if got := exifOrientation(short); got != orientationNormal {
 		t.Errorf("IFD one entry short returned %d, want %d", got, orientationNormal)
+	}
+}
+
+// translucentPattern fills an NRGBA image with four distinct corner colours,
+// each at a different alpha. Translucency is the point: markerImage is fully
+// opaque, and for an opaque pixel the premultiplied and non-premultiplied
+// encodings are byte-identical, so an opaque fixture cannot tell the two apart.
+func translucentPattern(dst *image.NRGBA, x0, y0 int) {
+	corners := []struct {
+		dx, dy int
+		c      color.NRGBA
+	}{
+		{0, 0, color.NRGBA{R: 255, A: 128}},
+		{3, 0, color.NRGBA{G: 255, A: 64}},
+		{0, 1, color.NRGBA{B: 255, A: 192}},
+		{3, 1, color.NRGBA{R: 255, G: 255, B: 255, A: 32}},
+	}
+	for y := range 2 {
+		for x := range 4 {
+			dst.SetNRGBA(x0+x, y0+y, color.NRGBA{A: 255})
+		}
+	}
+	for _, c := range corners {
+		dst.SetNRGBA(x0+c.dx, y0+c.dy, c.c)
+	}
+}
+
+func translucentNRGBA() *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 2))
+	translucentPattern(img, 0, 0)
+	return img
+}
+
+// translucentNRGBASub returns the same 4x2 content as a sub-image of a wider
+// canvas, so its Stride (4*9) is larger than 4*Dx (4*4). Substituting
+// 4*Rect.Dx() for Stride in the fast path is invisible on an origin-anchored
+// image and wrong here.
+func translucentNRGBASub() *image.NRGBA {
+	canvas := image.NewNRGBA(image.Rect(0, 0, 9, 5))
+	for y := range 5 {
+		for x := range 9 {
+			canvas.SetNRGBA(x, y, color.NRGBA{G: 128, B: 200, A: 90})
+		}
+	}
+	translucentPattern(canvas, 2, 1)
+	return canvas.SubImage(image.Rect(2, 1, 6, 3)).(*image.NRGBA)
+}
+
+// The fast path copies raw bytes, so the destination has to be the same image
+// type as the source. Writing non-premultiplied NRGBA bytes into an RGBA buffer
+// reinterprets them as premultiplied: {255,0,0,128} becomes a pixel whose red
+// exceeds its alpha, which is not a colour at all.
+func TestOrientImageKeepsNRGBAEncoding(t *testing.T) {
+	for _, src := range []struct {
+		name string
+		img  *image.NRGBA
+	}{
+		{"origin", translucentNRGBA()},
+		{"sub-image", translucentNRGBASub()},
+	} {
+		// Rotate 180, whose mapping is stated by the EXIF definition rather
+		// than taken from orientedSourcePixel: the pixel at (x,y) must end up
+		// at (w-1-x, h-1-y), with its channel values untouched.
+		got := orientImage(src.img, 3)
+		out, ok := got.(*image.NRGBA)
+		if !ok {
+			t.Errorf("%s: orientImage returned %T, want *image.NRGBA — the bytes "+
+				"are non-premultiplied and would be misread", src.name, got)
+			continue
+		}
+		b := src.img.Bounds()
+		w, h := b.Dx(), b.Dy()
+		for y := range h {
+			for x := range w {
+				want := src.img.NRGBAAt(b.Min.X+x, b.Min.Y+y)
+				if have := out.NRGBAAt(w-1-x, h-1-y); have != want {
+					t.Errorf("%s: pixel (%d,%d) -> (%d,%d) = %v, want %v",
+						src.name, x, y, w-1-x, h-1-y, have, want)
+				}
+			}
+		}
 	}
 }
