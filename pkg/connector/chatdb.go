@@ -415,19 +415,21 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	// Read once from the final bytes: for HEIC that is the converted JPEG, into
-	// which writeJPEGWithMetadata re-embedded the source's EXIF, and otherwise
-	// the original. A non-JPEG (PNG, TIFF, GIF) yields 1 and everything below
-	// is a no-op.
+	// Read from the source bytes. A non-JPEG (PNG, GIF) yields 1 and everything
+	// below is a no-op. The HEIC branch does not use this — see below.
 	orientation := exifOrientation(data)
 	if heicImg != nil {
 		b := heicImg.Bounds()
-		// Report the dimensions the image is displayed at, not the decoded
-		// ones: for the common portrait-phone orientation they are transposed,
-		// and clients size the placeholder from these.
-		imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
+		// Explicitly upright: libheif applies the ISOBMFF transforms while
+		// decoding, so heicImg's pixels are already oriented, and
+		// convertHEICToJPEG calls resetEXIFOrientation to set the tag to 1 so
+		// viewers do not rotate a second time. Reading the tag back here would
+		// therefore return 1 today and this would work by coincidence — pass
+		// the constant so that changing how EXIF is embedded cannot silently
+		// start rotating already-upright photos again.
+		imgWidth, imgHeight = b.Dx(), b.Dy()
 		if imgWidth > 800 || imgHeight > 800 {
-			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, b.Dx(), b.Dy(), orientation)
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, orientationNormal)
 		}
 	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
@@ -447,7 +449,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
-				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, b.Dx(), b.Dy(), orientation)
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, orientation)
 			}
 		}
 	}

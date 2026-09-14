@@ -90,14 +90,24 @@ func TestExifOrientationDegradesToNormal(t *testing.T) {
 			binary.BigEndian.PutUint16(d[4:6], 0xFFFF)
 			return d
 		}()},
+		// APP1 layout: FFD8 | FFE1 | len(2) | "Exif\0\0"(6) | byte order(2) |
+		// magic(2) | IFD0 offset(4). So byte order is at 12-13 and magic at
+		// 14-15; an earlier version of these two cases overwrote 10-11 and
+		// 12-13, which corrupted the Exif header and the byte order instead —
+		// deleting the magic check still passed.
 		{"bad TIFF byte order", func() []byte {
 			d := append([]byte(nil), valid...)
-			copy(d[10:12], []byte("XX"))
+			copy(d[12:14], []byte("XX"))
 			return d
 		}()},
 		{"bad TIFF magic", func() []byte {
 			d := append([]byte(nil), valid...)
-			d[12], d[13] = 0xFF, 0xFF
+			d[14], d[15] = 0xFF, 0xFF
+			return d
+		}()},
+		{"corrupt Exif header", func() []byte {
+			d := append([]byte(nil), valid...)
+			copy(d[6:12], []byte("XXXXXX"))
 			return d
 		}()},
 		{"orientation out of range", buildEXIFJPEG(t, 99, false)},
@@ -123,97 +133,224 @@ func TestDisplayDimsSwapsOnlyQuarterTurns(t *testing.T) {
 	}
 }
 
-// markedImage is 2x1: left pixel red, right pixel blue. Each orientation moves
-// that pair somewhere predictable, which is what the transform must reproduce.
-func markedImage() image.Image {
-	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
-	img.Set(0, 0, color.RGBA{R: 255, A: 255})
-	img.Set(1, 0, color.RGBA{B: 255, A: 255})
+// markerImage is a 1200x800 image of four solid quadrants:
+//
+//	R | G      R=red   G=green
+//	--+--      B=blue  W=white
+//	B | W
+//
+// Large and solid on purpose. A tiny source is UPSCALED to the 800px cap, and
+// nearest-neighbour plus JPEG then smears single-pixel markers into nothing;
+// quadrants survive both. Asymmetric in each axis with four distinct corners,
+// so all eight orientations are distinguishable — a 2x1 source cannot separate
+// a mirror from a rotation, since orientations 1/4, 2/3, 5/6 and 7/8 produce
+// identical output on it.
+func markerImage() image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, 1200, 800))
+	quad := func(x0, y0, x1, y1 int, c color.RGBA) {
+		for y := y0; y < y1; y++ {
+			for x := x0; x < x1; x++ {
+				img.Set(x, y, c)
+			}
+		}
+	}
+	quad(0, 0, 600, 400, color.RGBA{R: 255, A: 255})
+	quad(600, 0, 1200, 400, color.RGBA{G: 255, A: 255})
+	quad(0, 400, 600, 800, color.RGBA{B: 255, A: 255})
+	quad(600, 400, 1200, 800, color.RGBA{R: 255, G: 255, B: 255, A: 255})
 	return img
 }
 
-func TestOrientImageMovesPixelsCorrectly(t *testing.T) {
-	// Source is 2x1: red at (0,0), blue at (1,0). Each orientation moves that
-	// pair somewhere determined, and both are asserted so a transform that
-	// confuses two orientations (6 and 8 are easy to swap) cannot pass.
-	cases := map[int]struct {
-		w, h                     int
-		redX, redY, blueX, blueY int
+// nearestMarker names the marker colour a (lossy JPEG) pixel is closest to.
+// Channels are converted to signed before subtracting: doing the arithmetic on
+// the uint32 from RGBA() underflows, and squaring that overflows to a negative
+// distance, which silently makes one marker always win.
+func nearestMarker(c color.Color) string {
+	r32, g32, b32, _ := c.RGBA()
+	r, g, b := int(r32>>8), int(g32>>8), int(b32>>8)
+	markers := []struct {
+		name    string
+		r, g, b int
 	}{
-		1: {2, 1, 0, 0, 1, 0}, // unchanged
-		2: {2, 1, 1, 0, 0, 0}, // mirror horizontal
-		3: {2, 1, 1, 0, 0, 0}, // rotate 180
-		4: {2, 1, 0, 0, 1, 0}, // mirror vertical; a single row is unchanged
-		5: {1, 2, 0, 0, 0, 1}, // transpose
-		6: {1, 2, 0, 0, 0, 1}, // rotate 90 CW: left end goes to the top
-		7: {1, 2, 0, 1, 0, 0}, // anti-transpose
-		8: {1, 2, 0, 1, 0, 0}, // rotate 270 CW: left end goes to the bottom
+		{"R", 255, 0, 0}, {"G", 0, 255, 0}, {"B", 0, 0, 255}, {"W", 255, 255, 255},
 	}
-	isRed := func(c color.Color) bool {
-		r, g, b, _ := c.RGBA()
-		return r>>8 == 255 && g>>8 == 0 && b>>8 == 0
+	best, bestD := ".", 1<<30
+	for _, m := range markers {
+		d := (r-m.r)*(r-m.r) + (g-m.g)*(g-m.g) + (b-m.b)*(b-m.b)
+		if d < bestD {
+			best, bestD = m.name, d
+		}
 	}
-	isBlue := func(c color.Color) bool {
-		r, g, b, _ := c.RGBA()
-		return r>>8 == 0 && g>>8 == 0 && b>>8 == 255
+	return best
+}
+
+// TestScaleAndEncodeThumbOrientsPixels drives the PRODUCTION thumbnail path
+// rather than a helper only tests call, and checks where pixels land rather
+// than only the output size.
+//
+// Expected values are the EXIF definitions applied to the source's corners,
+// derived independently of the implementation: 2 flips horizontally, 3 rotates
+// 180, 4 flips vertically, 5 transposes about the main diagonal, 6 rotates 90
+// clockwise, 7 transposes about the anti-diagonal, 8 rotates 270 clockwise.
+func TestScaleAndEncodeThumbOrientsPixels(t *testing.T) {
+	// Display corners read clockwise from top-left, for source R/G/W/B.
+	want := map[int]string{
+		1: "RGWB", // identity
+		2: "GRBW", // flip horizontal
+		3: "WBRG", // rotate 180
+		4: "BWGR", // flip vertical
+		5: "RBWG", // transpose
+		6: "BRGW", // rotate 90 CW
+		7: "WGRB", // anti-transpose
+		8: "GWBR", // rotate 270 CW
 	}
-	for o, want := range cases {
-		got := orientImage(markedImage(), o)
-		b := got.Bounds()
-		if b.Dx() != want.w || b.Dy() != want.h {
-			t.Errorf("orientImage(%d) size = %dx%d, want %dx%d", o, b.Dx(), b.Dy(), want.w, want.h)
+	for o := 1; o <= 8; o++ {
+		data, w, h := scaleAndEncodeThumb(markerImage(), o)
+		if data == nil {
+			t.Errorf("orientation %d: no thumbnail", o)
 			continue
 		}
-		if !isRed(got.At(want.redX, want.redY)) {
-			t.Errorf("orientImage(%d): (%d,%d) is not red", o, want.redX, want.redY)
+		img, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			t.Errorf("orientation %d: does not decode: %v", o, err)
+			continue
 		}
-		if !isBlue(got.At(want.blueX, want.blueY)) {
-			t.Errorf("orientImage(%d): (%d,%d) is not blue", o, want.blueX, want.blueY)
+		if img.Bounds().Dx() != w || img.Bounds().Dy() != h {
+			t.Errorf("orientation %d: encoded %dx%d but reported %dx%d",
+				o, img.Bounds().Dx(), img.Bounds().Dy(), w, h)
+		}
+		// Sample inside each quadrant, away from the seams and the JPEG
+		// ringing at block edges.
+		at := func(fx, fy float64) string {
+			return nearestMarker(img.At(int(float64(w)*fx), int(float64(h)*fy)))
+		}
+		got := at(0.25, 0.25) + at(0.75, 0.25) + at(0.75, 0.75) + at(0.25, 0.75)
+		if got != want[o] {
+			t.Errorf("orientation %d: corners clockwise from top-left = %q, want %q (thumb %dx%d)",
+				o, got, want[o], w, h)
 		}
 	}
 }
 
-// The thumbnail must come out in display orientation, so a portrait photo
-// stored as landscape pixels (orientation 6, the most common non-upright value)
-// produces a portrait thumbnail.
+// The thumbnail must be sized in display orientation, so a landscape-decoded
+// portrait photo produces a portrait thumbnail.
 func TestScaleAndEncodeThumbUsesDisplayOrientation(t *testing.T) {
-	// 1000x500 decoded; orientation 6 means it is displayed 500x1000.
 	src := image.NewRGBA(image.Rect(0, 0, 1000, 500))
-	data, w, h := scaleAndEncodeThumb(src, 1000, 500, 6)
-	if data == nil {
-		t.Fatal("scaleAndEncodeThumb returned no data")
+	if _, w, h := scaleAndEncodeThumb(src, 6); w >= h {
+		t.Errorf("orientation 6 thumb is %dx%d, want portrait", w, h)
 	}
-	if w >= h {
-		t.Errorf("thumb is %dx%d, want portrait for orientation 6", w, h)
-	}
-	decoded, err := jpeg.Decode(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("thumbnail does not decode: %v", err)
-	}
-	if b := decoded.Bounds(); b.Dx() != w || b.Dy() != h {
-		t.Errorf("encoded thumb is %dx%d but reported %dx%d", b.Dx(), b.Dy(), w, h)
-	}
-
-	// Orientation 1 on the same source stays landscape, so the swap is driven
-	// by the tag and not by the scaling.
-	_, w1, h1 := scaleAndEncodeThumb(src, 1000, 500, 1)
-	if w1 <= h1 {
-		t.Errorf("thumb is %dx%d, want landscape for orientation 1", w1, h1)
+	if _, w, h := scaleAndEncodeThumb(src, 1); w <= h {
+		t.Errorf("orientation 1 thumb is %dx%d, want landscape", w, h)
 	}
 }
 
-// Every orientation must produce a decodable thumbnail with no out-of-range
-// source indexing, including sizes that do not divide evenly.
-func TestScaleAndEncodeThumbAllOrientations(t *testing.T) {
+// Sizes that do not divide evenly must still produce a decodable thumbnail for
+// every orientation.
+func TestScaleAndEncodeThumbOddSizes(t *testing.T) {
 	src := image.NewRGBA(image.Rect(0, 0, 1001, 337))
 	for o := 1; o <= 8; o++ {
-		data, w, h := scaleAndEncodeThumb(src, 1001, 337, o)
+		data, w, h := scaleAndEncodeThumb(src, o)
 		if data == nil || w < 1 || h < 1 {
-			t.Errorf("orientation %d: got %dx%d and %d bytes", o, w, h, len(data))
+			t.Errorf("orientation %d: got %dx%d, %d bytes", o, w, h, len(data))
 			continue
 		}
 		if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
-			t.Errorf("orientation %d: thumbnail does not decode: %v", o, err)
+			t.Errorf("orientation %d: does not decode: %v", o, err)
 		}
+	}
+}
+
+// Most re-saved JPEGs begin with an APP0 JFIF segment, so APP1 is not the first
+// thing after SOI and the segment-skip has to work. Nothing covered that.
+func TestExifOrientationSkipsEarlierSegments(t *testing.T) {
+	valid := buildEXIFJPEG(t, 6, false)
+	app0 := []byte{0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0,
+		1, 1, 0, 0, 1, 0, 1, 0, 0}
+	withAPP0 := append(append(append([]byte{}, valid[:2]...), app0...), valid[2:]...)
+	if got := exifOrientation(withAPP0); got != 6 {
+		t.Errorf("exifOrientation() = %d with an APP0 before APP1, want 6", got)
+	}
+
+	// And with 0xFF fill bytes before the APP1 marker, which the spec allows.
+	withFill := append(append(append([]byte{}, valid[:2]...), 0xFF, 0xFF), valid[2:]...)
+	if got := exifOrientation(withFill); got != 6 {
+		t.Errorf("exifOrientation() = %d with 0xFF fill before the marker, want 6", got)
+	}
+}
+
+// The IFD entry's type field must be honoured. A big-endian LONG read as a
+// SHORT yields the high half, which is zero for every real orientation — so
+// ignoring the type silently degrades to 1 rather than failing loudly.
+func TestExifOrientationHonoursEntryType(t *testing.T) {
+	buildLong := func(bigEndian bool) []byte {
+		var bo binary.ByteOrder = binary.LittleEndian
+		order := []byte("II")
+		if bigEndian {
+			bo, order = binary.BigEndian, []byte("MM")
+		}
+		var tiff bytes.Buffer
+		tiff.Write(order)
+		_ = binary.Write(&tiff, bo, uint16(42))
+		_ = binary.Write(&tiff, bo, uint32(8))
+		_ = binary.Write(&tiff, bo, uint16(1))
+		_ = binary.Write(&tiff, bo, uint16(0x0112))
+		_ = binary.Write(&tiff, bo, uint16(4)) // LONG
+		_ = binary.Write(&tiff, bo, uint32(1))
+		_ = binary.Write(&tiff, bo, uint32(6))
+		_ = binary.Write(&tiff, bo, uint32(0))
+		payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
+		var out bytes.Buffer
+		out.Write([]byte{0xFF, 0xD8, 0xFF, 0xE1})
+		_ = binary.Write(&out, binary.BigEndian, uint16(len(payload)+2))
+		out.Write(payload)
+		img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+		var body bytes.Buffer
+		_ = jpeg.Encode(&body, img, nil)
+		out.Write(body.Bytes()[2:])
+		return out.Bytes()
+	}
+	for _, be := range []bool{false, true} {
+		if got := exifOrientation(buildLong(be)); got != 6 {
+			label := "little-endian"
+			if be {
+				label = "big-endian"
+			}
+			t.Errorf("exifOrientation(%s LONG) = %d, want 6", label, got)
+		}
+	}
+}
+
+// A TIFF file's header is the same block the EXIF path parses, so its
+// orientation is readable directly. Callers re-encode TIFF to JPEG without
+// EXIF but build the thumbnail from the decoded image, so this is what makes
+// those thumbnails upright too.
+func TestExifOrientationReadsBareTIFF(t *testing.T) {
+	build := func(bigEndian bool, orientation uint16) []byte {
+		var bo binary.ByteOrder = binary.LittleEndian
+		order := []byte("II")
+		if bigEndian {
+			bo, order = binary.BigEndian, []byte("MM")
+		}
+		var b bytes.Buffer
+		b.Write(order)
+		_ = binary.Write(&b, bo, uint16(42))
+		_ = binary.Write(&b, bo, uint32(8))
+		_ = binary.Write(&b, bo, uint16(1))
+		_ = binary.Write(&b, bo, uint16(0x0112))
+		_ = binary.Write(&b, bo, uint16(3))
+		_ = binary.Write(&b, bo, uint32(1))
+		_ = binary.Write(&b, bo, orientation)
+		_ = binary.Write(&b, bo, uint16(0))
+		_ = binary.Write(&b, bo, uint32(0))
+		return b.Bytes()
+	}
+	for _, be := range []bool{false, true} {
+		if got := exifOrientation(build(be, 8)); got != 8 {
+			t.Errorf("exifOrientation(bare TIFF, bigEndian=%v) = %d, want 8", be, got)
+		}
+	}
+	// A JPEG must still take the APP1 path rather than being read as TIFF.
+	if got := exifOrientation(buildEXIFJPEG(t, 3, false)); got != 3 {
+		t.Errorf("exifOrientation(JPEG) = %d, want 3", got)
 	}
 }

@@ -4,10 +4,7 @@
 
 package connector
 
-import (
-	"encoding/binary"
-	"image"
-)
+import "encoding/binary"
 
 // EXIF orientation values (TIFF tag 0x0112). 1 is upright; 2/4/5/7 include a
 // mirror, 3/6/8 are pure rotations.
@@ -21,20 +18,37 @@ const (
 //
 // Go's image/jpeg decoder ignores EXIF entirely and jpeg.Encode writes none, so
 // a re-encoded thumbnail loses the tag that told the client how to rotate the
-// original. The full-size image keeps it — the bytes are passed through, and the
-// HEIC path deliberately re-embeds the tag when converting (see
-// writeJPEGWithMetadata) — which is why only thumbnails come out sideways.
+// original, while the full-size image keeps it because its bytes are passed
+// through — which is why only thumbnails come out sideways.
+//
+// Not used for HEIC: libheif orients the pixels while decoding and
+// convertHEICToJPEG resets the tag to 1, so that path passes orientationNormal
+// explicitly rather than reading it back.
 //
 // Anything unparseable returns 1 rather than an error: a thumbnail that is not
 // rotated is the current behaviour, so failing to read the tag can only leave
 // things as they are, never make them worse.
 func exifOrientation(data []byte) int {
-	if len(data) < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-		return orientationNormal // not a JPEG
+	if len(data) < 4 {
+		return orientationNormal
+	}
+	// A TIFF file begins with the very block tiffOrientation parses, so it
+	// needs no APP1 hunting. Callers re-encode TIFF to JPEG (dropping EXIF) but
+	// generate the thumbnail from the decoded image, so reading it here is what
+	// makes those come out upright too.
+	if (data[0] == 'I' && data[1] == 'I') || (data[0] == 'M' && data[1] == 'M') {
+		return tiffOrientation(data)
+	}
+	if data[0] != 0xFF || data[1] != 0xD8 {
+		return orientationNormal // not a JPEG either
 	}
 	// Walk the segment chain looking for APP1/Exif.
 	for i := 2; i+4 <= len(data); {
-		if data[i] != 0xFF {
+		// The spec allows any number of 0xFF fill bytes before a marker.
+		for i < len(data) && data[i] == 0xFF && i+1 < len(data) && data[i+1] == 0xFF {
+			i++
+		}
+		if i+4 > len(data) || data[i] != 0xFF {
 			return orientationNormal
 		}
 		marker := data[i+1]
@@ -90,8 +104,19 @@ func tiffOrientation(tiff []byte) int {
 		if bo.Uint16(tiff[off:off+2]) != 0x0112 {
 			continue
 		}
-		// SHORT value, stored inline in the entry's value field.
-		v := int(bo.Uint16(tiff[off+8 : off+10]))
+		// The value is stored inline in the entry's 4-byte value field. Honour
+		// the type: a SHORT sits in the first two bytes, so reading a
+		// big-endian LONG as a SHORT yields the high half — zero for every
+		// real orientation. Type 3 is SHORT, 4 is LONG.
+		var v int
+		switch bo.Uint16(tiff[off+2 : off+4]) {
+		case 3:
+			v = int(bo.Uint16(tiff[off+8 : off+10]))
+		case 4:
+			v = int(bo.Uint32(tiff[off+8 : off+12]))
+		default:
+			return orientationNormal
+		}
 		if v < orientationNormal || v > orientationMax {
 			return orientationNormal
 		}
@@ -153,22 +178,4 @@ func orientedSourcePixel(x, y, dstW, dstH, orientation int) (int, int) {
 	default: // 1, and anything unrecognised
 		return x, y
 	}
-}
-
-// orientImage returns img transformed so it is upright, or img unchanged when
-// the orientation is normal.
-func orientImage(img image.Image, orientation int) image.Image {
-	if orientation <= orientationNormal || orientation > orientationMax {
-		return img
-	}
-	src := img.Bounds()
-	dstW, dstH := displayDims(src.Dx(), src.Dy(), orientation)
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	for y := range dstH {
-		for x := range dstW {
-			sx, sy := orientedSourcePixel(x, y, dstW, dstH, orientation)
-			dst.Set(x, y, img.At(src.Min.X+sx, src.Min.Y+sy))
-		}
-	}
-	return dst
 }

@@ -469,6 +469,37 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create cloud_attachment_cache table: %w", err)
 	}
 
+	// thumb_version marks which thumbnail generation produced a cached entry.
+	// Cached entries hold the rendered thumbnail and Info.Width/Height, and
+	// FetchMessages returns them verbatim, so a fix to how thumbnails are
+	// generated does not reach anything already cached: a re-backfill or a
+	// recreated portal would re-send the old thumbnail forever.
+	if exists, err := columnExists(ctx, s.db, "cloud_attachment_cache", "thumb_version"); err != nil {
+		return fmt.Errorf("failed to check for the thumb_version column: %w", err)
+	} else if !exists {
+		if _, err := s.db.Exec(ctx,
+			`ALTER TABLE cloud_attachment_cache ADD COLUMN thumb_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add thumb_version to cloud_attachment_cache: %w", err)
+		}
+	}
+	// Drop entries produced before the current generation that actually carry a
+	// thumbnail. Scoped to those deliberately: an entry without one cannot be
+	// affected, and discarding it would force a needless re-download and
+	// re-upload of the attachment it already has an mxc URI for.
+	if _, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_attachment_cache
+		WHERE login_id=$1 AND thumb_version < $2
+		  AND CAST(content_json AS TEXT) LIKE '%thumbnail%'`,
+		s.loginID, thumbCacheVersion); err != nil {
+		return fmt.Errorf("failed to invalidate stale thumbnail cache entries: %w", err)
+	}
+	// Everything surviving is current, so this whole step is a no-op next run.
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_attachment_cache SET thumb_version=$2 WHERE login_id=$1 AND thumb_version < $2`,
+		s.loginID, thumbCacheVersion); err != nil {
+		return fmt.Errorf("failed to stamp thumbnail cache version: %w", err)
+	}
+
 	// Migration: add cloud_attachment_dead table if missing. Persists
 	// record_names that CloudKit no longer serves (Apple aged out the MMCS
 	// blob) so the bridge stops re-downloading-and-re-failing the same dead
@@ -4240,12 +4271,23 @@ func (s *cloudBackfillStore) saveDeadAttachment(ctx context.Context, recordName,
 // saveAttachmentCacheEntry persists a record_name → MessageEventContent JSON
 // pair. Idempotent (upsert). Errors are silently ignored — the persistent cache
 // is a best-effort optimisation; missing entries fall back to re-download.
+// thumbCacheVersion is the generation of thumbnail rendering that produced a
+// cached attachment entry. Bump it whenever a change alters the bytes or the
+// reported dimensions of a generated thumbnail, so entries made by the previous
+// generation are discarded instead of being replayed forever.
+//
+//	1: thumbnails honour the source's EXIF orientation, and Info.Width/Height
+//	   report display rather than decoded dimensions.
+const thumbCacheVersion = 1
+
 func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recordName string, contentJSON []byte) {
 	_, _ = s.db.Exec(ctx, `
-		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (login_id, record_name) DO UPDATE SET content_json=excluded.content_json
-	`, s.loginID, recordName, contentJSON, time.Now().UnixMilli())
+		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts, thumb_version)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (login_id, record_name) DO UPDATE SET
+			content_json=excluded.content_json,
+			thumb_version=excluded.thumb_version
+	`, s.loginID, recordName, contentJSON, time.Now().UnixMilli(), thumbCacheVersion)
 }
 
 // markForwardBackfillDone marks all cloud_chat rows for portalID as having
