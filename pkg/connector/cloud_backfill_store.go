@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,7 +20,52 @@ import (
 type cloudBackfillStore struct {
 	db      *dbutil.Database
 	loginID networkid.UserLoginID
+
+	// Memoised delivered-ID set, for the forward-backfill delivery check in
+	// undeliveredScrubbedInWindow. See cachedBridgedGUIDSet.
+	bridgedMu       sync.Mutex
+	bridgedSet      map[string]struct{}
+	bridgedSetFor   string
+	bridgedSetAtNow time.Time
+
+	// now is the clock, injectable so tests can drive the cache's expiry
+	// without sleeping. nil means time.Now.
+	now func() time.Time
 }
+
+// bridgedSetCacheTTL bounds how stale the memoised delivered-ID set may be.
+//
+// What makes the cache sound is that delivery only ever ADDS rows to bridgev2's
+// message table. A cached set is therefore always a subset of the true
+// delivered set: it may be missing a row that has since been delivered, but it
+// can never contain a row that was not. So staleness can only over-report rows
+// as undelivered, which takes the conservative recovery path, and can never
+// under-report and hide a real loss.
+//
+// A false alarm inside the TTL is therefore possible, not excluded: a portal
+// whose rows were delivered after the cached load and scrubbed before its check
+// will take the recovery path. That is safe, and no worse for that portal than
+// the behaviour before this guard existed.
+//
+// Note in particular that the scrub grace window does NOT prevent this. That
+// window is keyed on cloud_message.updated_ts, and delivery writes bridgev2's
+// message table without touching it — the only writers of updated_ts are
+// ingest, delete, re-key, heal, undelete and un-scrub. A row ingested long ago
+// and delivered now keeps its old updated_ts, so the next scrub pass can clear
+// it immediately.
+//
+// The TTL is purely a trade between how often that false alarm can happen and
+// how often the full delivered set is reloaded. Raising it keeps the same
+// safety property; it is not bounded by the grace window or anything else.
+//
+// The subset property assumes message rows are only ever ADDED within the TTL.
+// That holds today — nothing in this bridge deletes or rewrites a delivered
+// row's id outside portal deletion, which takes the rows and the cloud rows
+// together. A future redaction or dedup path that removed message rows while
+// leaving cloud_message behind would break it: the cache could then report a
+// row delivered after its message row was gone, which is the one direction that
+// hides loss. Such a path must invalidate this cache.
+const bridgedSetCacheTTL = 2 * time.Minute
 
 type cloudMessageRow struct {
 	GUID        string
@@ -3077,34 +3123,6 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
-// hasScrubbedBackfillableMessages reports whether a portal has non-deleted,
-// deliverable rows whose bodies were cleared by the privacy scrubber
-// (body_scrubbed=TRUE, not a reaction). cloudRowToBackfillMessages skips EVERY
-// such row (see its `row.BodyScrubbed && !isCloudReactionRow` guard) regardless
-// of has_body, so a portal where ALL deliverable rows are scrubbed converts to
-// zero backfill messages — and the forward-backfill empty path would then mark
-// it done with nothing delivered (silent data loss). Forward backfill uses this
-// to decide whether to rehydrate from CloudKit before marking a portal done.
-//
-// The predicate must mirror conversion's skip exactly, so it deliberately does
-// NOT require has_body=TRUE: an attachment-only (photo/video) portal has
-// scrubbed rows with has_body=FALSE, and gating on has_body would let that
-// portal reach the empty path unguarded — the precise silent loss this catches.
-func (s *cloudBackfillStore) hasScrubbedBackfillableMessages(ctx context.Context, portalID string) (bool, error) {
-	var count int
-	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM cloud_message
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND body_scrubbed=TRUE
-		  AND (tapback_type IS NULL OR tapback_type < 2000)
-	`, s.loginID, portalID).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
 // countBackfillableMessages returns the number of rows FetchMessages can read
 // for a portal (deleted=FALSE and record_name <> ”).
 // When requireContentful is true, only rows with text or attachments count.
@@ -3202,6 +3220,14 @@ func (s *cloudBackfillStore) guidsDeliveredInOtherRoom(ctx context.Context, brid
 // (SQLite defaults to 999, older builds; 32766, newer) at exactly the ~9k-reaction
 // scale this filter exists to handle — and the caller fails OPEN on error, so a
 // blown limit would resurrect the very flood this prevents.
+// Related but NOT interchangeable with loadBridgedGUIDSet, which answers the
+// same "is this delivered" question for the scrubber. The two differ in scope
+// and in case sensitivity: this one takes a bounded guid list and matches ids
+// exactly, that one reads the whole set and case-folds, because APNs-delivered
+// ids are uppercase while CloudKit guids are mixed-case. So a case-mismatched
+// id reads as delivered there and as undelivered here. Neither caller has been
+// observed to care — this one fails open, dropping fewer reactions than it
+// could — but the asymmetry is not by design and should not be relied on.
 func (s *cloudBackfillStore) guidsWithDeliveredMessage(ctx context.Context, bridgeID string, guids []string) (map[string]bool, error) {
 	if len(guids) == 0 {
 		return nil, nil
@@ -4719,58 +4745,99 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	}
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 
-	// Small chunks + a brief yield between chunks so the scrubber doesn't
-	// contend with live upsertMessageBatch / APNs ingestion when the
-	// first-boot backlog is large.
-	const chunkSize = 1000
+	// Small pages + a brief yield between them so the scrubber doesn't contend
+	// with live upsertMessageBatch / APNs ingestion when the first-boot backlog
+	// is large.
+	const pageSize = 1000
 
-	// Enumerate the whole eligible population once, index-backed. Deliberately
-	// unbounded: capping it and ordering by updated_ts would let a prefix of
-	// old-but-undelivered rows block progress forever, since every pass would
-	// re-examine the same prefix and scrub none of it. The rows are (guid, bool),
-	// so even a very large backlog costs a few tens of MB for one pass.
-	candidates, err := s.scrubCandidates(ctx, cutoff, excludePortals, backfillActive)
-	if err != nil {
-		return 0, err
-	}
-	if len(candidates) == 0 {
-		return 0, nil
-	}
-
-	// The delivered set replaces what used to be a UNION over the whole
-	// bridgev2 message table evaluated inside EVERY chunk's UPDATE. On a live
-	// Postgres install that was two sequential scans of a 330k-row / 165MB
-	// table per chunk — measured at 423ms just for the scan, inside a statement
-	// that then hit its two-minute timeout and rolled back, so the backlog
-	// never drained at all. Now it is one scan per pass, in Go.
+	// Paged with a keyset cursor on (updated_ts, guid) rather than enumerating
+	// the whole population upfront.
 	//
-	// Deleted candidates do not need the membership test, so a pass that has
-	// only deleted rows to scrub skips the message table entirely.
-	var bridged map[string]struct{}
-	for _, candidate := range candidates {
-		if candidate.deleted {
-			continue
-		}
-		bridged, err = s.loadBridgedGUIDSet(ctx, bridgeID)
+	// Enumerating upfront meant nothing was committed until the full SELECT
+	// returned, so a scan that outran runBodyScrubLoop's five-minute budget did
+	// zero work — the same "backlog never drains" failure this change exists to
+	// fix, relocated to the enumeration step. Paging commits each page as it
+	// goes, so a pass that is cut short still makes progress.
+	//
+	// The cursor is what makes paging safe here. A plain LIMIT would re-read the
+	// same prefix every pass, because rows this pass declines to scrub (not yet
+	// delivered) stay in the candidate set and would keep filling that prefix
+	// forever. Carrying (updated_ts, guid) forward steps past them instead, so
+	// one pass sees every candidate once.
+	//
+	// guid is in the cursor, not just updated_ts, because upsert batches share
+	// one updated_ts: the largest tie group measured on a live install is 1,704
+	// rows, wider than a page, so ordering by updated_ts alone could not
+	// advance past it deterministically.
+	//
+	// cloud_message_scrub_idx is (login_id, updated_ts) and so provides only the
+	// leading key; the guid tiebreak needs a sort step. Postgres 13+ resolves
+	// that as an Incremental Sort over each tie group rather than sorting the
+	// whole remaining candidate set. Measured mid-backlog on Postgres 18:
+	//
+	//   Limit (actual time=0.154..1.549 rows=1000)
+	//     Incremental Sort  Presorted Key: updated_ts  Peak Memory: 32kB
+	//       Index Scan using cloud_message_scrub_idx  rows=1006
+	//     Buffers: shared hit=390
+	//
+	// 1.5ms per page, reading 1,006 rows to return 1,000. Adding guid to the
+	// index would remove the sort entirely but costs space on every install for
+	// a step that is already negligible — and it would need a NEW index name,
+	// since ensureIndex matches on name alone and existing installs already
+	// carry this one. On Postgres before 13 (EOL since Nov 2024) there is no
+	// Incremental Sort and each page sorts every remaining candidate; that is
+	// the configuration where adding guid would be worth it.
+	var (
+		total      int64
+		bridged    map[string]struct{}
+		bridgedSet bool
+		cursorTS   int64
+		cursorGUID string
+		hasCursor  bool
+	)
+	for {
+		page, err := s.scrubCandidates(ctx, cutoff, excludePortals, backfillActive,
+			cursorTS, cursorGUID, hasCursor, pageSize)
 		if err != nil {
-			return 0, err
+			return total, err
 		}
-		break
-	}
+		if len(page) == 0 {
+			return total, nil
+		}
 
-	var total int64
-	for start := 0; start < len(candidates); start += chunkSize {
-		end := start + chunkSize
-		if end > len(candidates) {
-			end = len(candidates)
+		// The delivered set replaces what used to be a UNION over the whole
+		// bridgev2 message table evaluated inside EVERY chunk's UPDATE. On a
+		// live Postgres install that was two sequential scans of a 330k-row /
+		// 165MB table per chunk — 423ms just for the scan, inside a statement
+		// that then hit its two-minute timeout and rolled back, so the backlog
+		// never drained at all. Now it is one read per pass, in Go, and only
+		// when some candidate actually needs it: deleted rows are eligible
+		// without a delivery check, so a deleted-only pass never touches the
+		// message table.
+		if !bridgedSet {
+			for _, candidate := range page {
+				if candidate.deleted {
+					continue
+				}
+				bridged, err = s.loadBridgedGUIDSet(ctx, bridgeID)
+				if err != nil {
+					return total, err
+				}
+				bridgedSet = true
+				break
+			}
 		}
-		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridged, candidates[start:end], backfillActive)
+
+		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridged, page, backfillActive)
 		if err != nil {
 			return total, err
 		}
 		total += n
-		if end == len(candidates) {
-			break
+
+		last := page[len(page)-1]
+		cursorTS, cursorGUID, hasCursor = last.updatedTS, last.guid, true
+		if len(page) < pageSize {
+			return total, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -4778,7 +4845,6 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return total, nil
 }
 
 // cloudScrubCandidate is one row the current pass may scrub. deleted rows are
@@ -4786,6 +4852,8 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 type cloudScrubCandidate struct {
 	guid    string
 	deleted bool
+	// updatedTS is the keyset cursor's leading column; see scrubBridgedBodies.
+	updatedTS int64
 }
 
 // scrubBackfillGateSQL returns the predicate deciding WHEN a delivered row may
@@ -4823,6 +4891,31 @@ func scrubBackfillGateSQL(backfillActive bool) string {
 // (`<guid>_<part>`) also contributes its base guid, since guids are UUIDs and
 // carry no underscore of their own. Receiver scoping keeps one login's delivery
 // from making another login's row eligible.
+//
+// See also guidsWithDeliveredMessage, which answers the same question for a
+// bounded guid list and does NOT case-fold; the two are not interchangeable.
+//
+// Scoped by receiver and NOT by room, unlike reconcileGappedPortals, which
+// joins x.room_id = m.portal_id for a superficially similar question. The two
+// ask different things and pay differently for a wrong answer:
+//
+//   - reconcileGappedPortals asks "does this ROOM lack messages", and acts by
+//     nudging backfill to re-dispatch. Its own comment calls over-flagging
+//     "harmless for a re-dispatch nudge", so room scoping costs it nothing.
+//   - This set answers "is this content in Matrix at all", which is what
+//     decides whether the cloud copy of a body is still the only copy. That is
+//     a per-login fact, not a per-room one.
+//
+// Room-scoping it would also be actively harmful. message_real_pkey is
+// (bridge_id, room_receiver, id, part_id) with no room column, so a guid exists
+// in exactly one portal; after a re-key, a conversation's rows can sit under a
+// room that differs from its current portal_id. A room-scoped read would call
+// those undelivered and trigger recovery — which cannot deliver anything,
+// because backfill deliberately DROPS messages already bridged into another
+// portal ("sending them would post a duplicate that cannot be saved"). The
+// portal would be un-scrubbed, re-fetched from CloudKit, produce nothing, and
+// log unrecoverable loss: exactly the false-alarm loop this change removes,
+// reinstated for every re-keyed portal, and leaving its plaintext restored.
 func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id FROM message
@@ -4851,17 +4944,105 @@ func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID st
 	return set, nil
 }
 
-// scrubCandidates lists the rows this pass may scrub, without consulting the
-// bridgev2 message table at all — the delivery test moves to Go. The partial
-// index cloud_message_scrub_idx serves the (login_id, updated_ts) prefix with
-// body_scrubbed=FALSE, so this is an ordered index scan rather than the seq
-// scan plus sort the old per-chunk selection produced.
+// cachedBridgedGUIDSet returns the delivered-ID set, reusing a recent load.
+//
+// loadBridgedGUIDSet reads every delivered id for the login — on the install
+// this was measured against, 330,765 ids and ~380ms — so calling it once per
+// portal reintroduces exactly the cost the scrubber restructure removed: a
+// whole-table read repeated per unit of work. Group consolidation resets
+// fwd_backfill_done for every group, which sends a wave of
+// delivered-and-scrubbed portals down the zero-message forward-backfill path
+// at once, so the per-portal call is not a rare case; that install has 2,734
+// portals carrying a scrubbed row.
+//
+// The scrubber deliberately does NOT use this: it loads the set fresh once per
+// pass, which is already proportional to its work, and its decision about what
+// to scrub should not run on a cached view.
+// The lock is held across a cache-miss load (~380ms at one install's size) so
+// that a wave of portals arriving together performs one load rather than one
+// each. sync.Mutex is not ctx-aware, so a portal whose deadline expires while
+// waiting here fails its delivery check — which is why the caller treats a
+// failed check as "assume recovery is needed" rather than as zero undelivered
+// rows.
+func (s *cloudBackfillStore) cachedBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
+	s.bridgedMu.Lock()
+	defer s.bridgedMu.Unlock()
+	if s.bridgedSet != nil && s.bridgedSetFor == bridgeID &&
+		s.clock().Sub(s.bridgedSetAtNow) < bridgedSetCacheTTL {
+		return s.bridgedSet, nil
+	}
+	set, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		return nil, err
+	}
+	s.bridgedSet = set
+	s.bridgedSetFor = bridgeID
+	s.bridgedSetAtNow = s.clock()
+	return set, nil
+}
+
+// clock returns the store's time source, defaulting to time.Now.
+func (s *cloudBackfillStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// releaseExpiredBridgedGUIDSet drops the memoised delivered-ID set once it is
+// past its TTL.
+//
+// Expiry is otherwise only noticed on the next read, so a set built during one
+// forward-backfill wave stays referenced until another portal happens to reach
+// the same path — which on a quiet bridge may be never. Measured at one
+// install's size that is about 30MB held for the life of the process: not
+// growth, but not worth keeping either, on top of the transient copy the
+// scrubber builds every pass. Called from the periodic scrub loop, which
+// already ticks often enough to bound the retention.
+func (s *cloudBackfillStore) releaseExpiredBridgedGUIDSet() {
+	s.bridgedMu.Lock()
+	defer s.bridgedMu.Unlock()
+	if s.bridgedSet == nil {
+		return
+	}
+	if s.clock().Sub(s.bridgedSetAtNow) >= bridgedSetCacheTTL {
+		s.bridgedSet = nil
+		s.bridgedSetFor = ""
+	}
+}
+
+// scrubEligibleRowsSQL is the predicate for "a row this pass may scrub",
+// shared by the page enumeration and the write that applies it.
+//
+// Shared deliberately: the enumeration is a snapshot and the write re-checks,
+// so if the two ever diverged the write could clear a row the enumeration never
+// approved, or silently decline every row it picked. Divergence between a guard
+// and its re-check is the class of bug this whole change is about.
+//
+// $1 is login_id and $2 the grace-window cutoff at both call sites.
+func scrubEligibleRowsSQL(backfillActive bool) string {
+	return `login_id=$1
+		  AND body_scrubbed=FALSE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND updated_ts < $2
+		  AND (deleted=TRUE OR (` + scrubBackfillGateSQL(backfillActive) + `))`
+}
+
+// scrubCandidates returns one page of rows this pass may scrub, after the given
+// keyset cursor, without consulting the bridgev2 message table at all — the
+// delivery test moves to Go. The partial index cloud_message_scrub_idx serves
+// the (login_id, updated_ts) prefix with body_scrubbed=FALSE, so this is an
+// ordered index scan rather than the seq scan plus sort the old per-chunk
+// selection produced.
 //
 // Active restore portals are excluded here exactly as before: a large portal
 // can take many minutes to backfill and the grace window only buys about five,
 // so without the exclusion the scrubber would clear bodies partway through and
 // cloudRowToBackfillMessages' skip would silently drop the un-backfilled tail.
-func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, excludePortals []string, backfillActive bool) ([]cloudScrubCandidate, error) {
+func (s *cloudBackfillStore) scrubCandidates(
+	ctx context.Context, cutoff int64, excludePortals []string, backfillActive bool,
+	cursorTS int64, cursorGUID string, hasCursor bool, limit int,
+) ([]cloudScrubCandidate, error) {
 	args := []any{s.loginID, cutoff}
 	exclusionSQL := ""
 	if len(excludePortals) > 0 {
@@ -4872,34 +5053,68 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 		}
 		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
 	}
+	cursorSQL := ""
+	if hasCursor {
+		args = append(args, cursorTS, cursorGUID)
+		cursorSQL = fmt.Sprintf(" AND (updated_ts, guid) > ($%d, $%d)", len(args)-1, len(args))
+	}
+	args = append(args, limit)
+	limitSQL := fmt.Sprintf(" LIMIT $%d", len(args))
 
-	rows, err := s.db.Query(ctx, `
-		SELECT guid, COALESCE(deleted, FALSE)
+	query := `
+		SELECT guid, COALESCE(deleted, FALSE), updated_ts
 		FROM cloud_message
-		WHERE login_id=$1
-		  AND body_scrubbed=FALSE
-		  AND (tapback_type IS NULL OR tapback_type < 2000)
-		  AND updated_ts < $2
-		  AND (deleted=TRUE OR (`+scrubBackfillGateSQL(backfillActive)+`))`+exclusionSQL+`
-		ORDER BY updated_ts ASC`, args...)
-	if err != nil {
+		WHERE ` + scrubEligibleRowsSQL(backfillActive) + exclusionSQL + cursorSQL + `
+		ORDER BY updated_ts ASC, guid ASC` + limitSQL
+
+	var out []cloudScrubCandidate
+	scan := func(ctx context.Context) error {
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			var c cloudScrubCandidate
+			if err := rows.Scan(&c.guid, &c.deleted, &c.updatedTS); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	}
+
+	// Bounded server-side for the same reason the write is: if this process is
+	// replaced mid-scan the Postgres backend keeps running the statement, since
+	// a dead client sends no cancel. Every other scrubber statement in this
+	// file carries the bound; the read path had been left without one.
+	if err := s.withScrubStatementTimeout(ctx, scan); err != nil {
 		return nil, fmt.Errorf("failed to list scrub candidates: %w", err)
 	}
-	defer rows.Close()
-
-	var candidates []cloudScrubCandidate
-	for rows.Next() {
-		var candidate cloudScrubCandidate
-		if err := rows.Scan(&candidate.guid, &candidate.deleted); err != nil {
-			return nil, fmt.Errorf("scan scrub candidate: %w", err)
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate scrub candidates: %w", err)
-	}
-	return candidates, nil
+	return out, nil
 }
+
+// withScrubStatementTimeout runs fn under a server-side statement_timeout on
+// Postgres, and plainly elsewhere. SQLite has no statement_timeout and its
+// local statements are fast.
+func (s *cloudBackfillStore) withScrubStatementTimeout(ctx context.Context, fn func(context.Context) error) error {
+	if s.db.Dialect != dbutil.Postgres {
+		return fn(ctx)
+	}
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		// SET LOCAL is scoped to this transaction and reverts on
+		// commit/rollback, so it never leaks to other pooled connections.
+		// Bare integer value is interpreted as milliseconds.
+		if _, err := s.db.Exec(ctx, fmt.Sprintf(`SET LOCAL statement_timeout = %d`, scrubStatementTimeout.Milliseconds())); err != nil {
+			return err
+		}
+		return fn(ctx)
+	})
+}
+
+// scrubStatementTimeout bounds each scrubber statement server-side.
+const scrubStatementTimeout = 2 * time.Minute
 
 // scrubBatchIfEligible filters one chunk of candidates through the delivered
 // set and applies a small UPDATE naming those guids explicitly.
@@ -4933,6 +5148,10 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(
 		args = append(args, guid)
 		placeholders[i] = fmt.Sprintf("$%d", i+3)
 	}
+	// Same predicate as the enumeration, re-checked at write time so a
+	// concurrent upsert or clearBodyScrubByPortalID landing between the two
+	// cannot be silently overwritten: the page is a snapshot, and only the
+	// row's state now may authorise the scrub.
 	query := `
 		UPDATE cloud_message
 		SET text=NULL,
@@ -4940,37 +5159,15 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(
 		    sender='',
 		    tapback_emoji=NULL,
 		    body_scrubbed=TRUE
-		WHERE login_id=$1
-		  AND body_scrubbed=FALSE
-		  AND (tapback_type IS NULL OR tapback_type < 2000)
-		  AND updated_ts < $2
-		  AND (deleted=TRUE OR (` + scrubBackfillGateSQL(backfillActive) + `))
+		WHERE ` + scrubEligibleRowsSQL(backfillActive) + `
 		  AND guid IN (` + strings.Join(placeholders, ",") + `)`
 
-	// Bound the write server-side. The statement is now small and guid-keyed,
-	// so this should never fire — but an UPDATE holds a ROW EXCLUSIVE lock on
-	// cloud_message for its duration, and if this process is replaced mid-write
-	// the Postgres backend keeps running it (a dead client sends no cancel),
-	// orphaning that lock. A server-side statement_timeout is the only thing
-	// that reliably kills such an orphan. SQLite has no statement_timeout and
-	// its local writes are fast, so it runs plain.
-	const scrubChunkTimeout = 2 * time.Minute
-	if s.db.Dialect != dbutil.Postgres {
-		result, err := s.db.Exec(ctx, query, args...)
-		if err != nil {
-			return 0, fmt.Errorf("failed to scrub bridged bodies: %w", err)
-		}
-		n, _ := result.RowsAffected()
-		return n, nil
-	}
+	// Bounded server-side. The statement is small and guid-keyed so this should
+	// never fire, but an UPDATE holds a ROW EXCLUSIVE lock on cloud_message for
+	// its duration, and if this process is replaced mid-write the backend keeps
+	// running it and orphans that lock.
 	var n int64
-	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		// SET LOCAL is scoped to this transaction and reverts on
-		// commit/rollback, so it never leaks to other pooled connections.
-		// Bare integer value is interpreted as milliseconds.
-		if _, err := s.db.Exec(ctx, fmt.Sprintf(`SET LOCAL statement_timeout = %d`, scrubChunkTimeout.Milliseconds())); err != nil {
-			return err
-		}
+	err := s.withScrubStatementTimeout(ctx, func(ctx context.Context) error {
 		result, err := s.db.Exec(ctx, query, args...)
 		if err != nil {
 			return err

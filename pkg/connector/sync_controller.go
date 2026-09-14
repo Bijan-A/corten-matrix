@@ -2069,6 +2069,11 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 			// before a post-sync pass are still inside the grace window and get
 			// skipped, so without a later periodic pass they'd never be scrubbed.
 			c.runUnbridgedTailScrub(ctx, log)
+			// Drop the forward-backfill delivery check's memoised set if it has
+			// expired. Nothing else notices expiry until the next portal reaches
+			// that path, which on a quiet bridge may be never, so without this
+			// the set stays referenced for the life of the process.
+			c.cloudStore.releaseExpiredBridgedGUIDSet()
 			cancel()
 		}
 	}
