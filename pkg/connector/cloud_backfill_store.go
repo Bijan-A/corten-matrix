@@ -21,8 +21,8 @@ type cloudBackfillStore struct {
 	db      *dbutil.Database
 	loginID networkid.UserLoginID
 
-	// Memoised delivered-ID set, for the per-portal delivery check in
-	// countUndeliveredScrubbedMessages. See cachedBridgedGUIDSet.
+	// Memoised delivered-ID set, for the forward-backfill delivery check in
+	// undeliveredScrubbedInWindow. See cachedBridgedGUIDSet.
 	bridgedMu       sync.Mutex
 	bridgedSet      map[string]struct{}
 	bridgedSetFor   string
@@ -3006,92 +3006,6 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 	return count > 0, nil
 }
 
-// countScrubbedBackfillableMessages reports how many non-deleted,
-// deliverable rows whose bodies were cleared by the privacy scrubber
-// (body_scrubbed=TRUE, not a reaction). cloudRowToBackfillMessages skips EVERY
-// such row (see its `row.BodyScrubbed && !isCloudReactionRow` guard) regardless
-// of has_body, so a portal where ALL deliverable rows are scrubbed converts to
-// zero backfill messages — and the forward-backfill empty path would then mark
-// it done with nothing delivered (silent data loss). Forward backfill uses this
-// to decide whether to rehydrate from CloudKit before marking a portal done.
-//
-// The predicate must mirror conversion's skip exactly, so it deliberately does
-// NOT require has_body=TRUE: an attachment-only (photo/video) portal has
-// scrubbed rows with has_body=FALSE, and gating on has_body would let that
-// portal reach the empty path unguarded — the precise silent loss this catches.
-func (s *cloudBackfillStore) countScrubbedBackfillableMessages(ctx context.Context, portalID string) (int, error) {
-	var count int
-	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM cloud_message
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND body_scrubbed=TRUE
-		  AND (tapback_type IS NULL OR tapback_type < 2000)
-	`, s.loginID, portalID).Scan(&count)
-	if err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-// countUndeliveredScrubbedMessages returns how many of a portal's scrubbed,
-// backfillable rows have NO corresponding bridgev2 message row — that is, how
-// many were scrubbed without ever reaching Matrix.
-//
-// countScrubbedBackfillableMessages answers a strictly weaker question: how
-// many scrubbed rows the portal has, delivered or not. For a portal whose history was
-// delivered and then legitimately scrubbed, that is true forever, which made
-// every later forward-backfill run of a healthy portal look like the
-// scrubbed-before-delivery data-loss case. The caller then un-scrubbed the
-// whole portal and re-fetched it from CloudKit to recover content that was
-// never missing.
-//
-// Delivery is decided by the same loadBridgedGUIDSet the scrubber uses to pick
-// what it may scrub. That sharing is deliberate: if the scrubber's notion of
-// "delivered" and this guard's ever diverged, the guard would either raise
-// false alarms about rows the scrubber correctly cleared, or miss the real
-// loss it exists to catch.
-func (s *cloudBackfillStore) countUndeliveredScrubbedMessages(ctx context.Context, bridgeID, portalID string) (int, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT guid
-		FROM cloud_message
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND body_scrubbed=TRUE
-		  AND (tapback_type IS NULL OR tapback_type < 2000)`,
-		s.loginID, portalID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to list scrubbed rows for %s: %w", portalID, err)
-	}
-	var guids []string
-	for rows.Next() {
-		var guid string
-		if err := rows.Scan(&guid); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("scan scrubbed guid: %w", err)
-		}
-		guids = append(guids, guid)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("iterate scrubbed rows: %w", err)
-	}
-	if len(guids) == 0 {
-		return 0, nil
-	}
-
-	bridged, err := s.cachedBridgedGUIDSet(ctx, bridgeID)
-	if err != nil {
-		return 0, err
-	}
-	undelivered := 0
-	for _, guid := range guids {
-		if _, ok := bridged[strings.ToLower(guid)]; !ok {
-			undelivered++
-		}
-	}
-	return undelivered, nil
-}
-
 // countBackfillableMessages returns the number of rows FetchMessages can read
 // for a portal (deleted=FALSE and record_name <> ”).
 // When requireContentful is true, only rows with text or attachments count.
@@ -4617,8 +4531,30 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// same prefix every pass, because rows this pass declines to scrub (not yet
 	// delivered) stay in the candidate set and would keep filling that prefix
 	// forever. Carrying (updated_ts, guid) forward steps past them instead, so
-	// one pass sees every candidate once. cloud_message_scrub_idx serves the
-	// cursor directly.
+	// one pass sees every candidate once.
+	//
+	// guid is in the cursor, not just updated_ts, because upsert batches share
+	// one updated_ts: the largest tie group measured on a live install is 1,704
+	// rows, wider than a page, so ordering by updated_ts alone could not
+	// advance past it deterministically.
+	//
+	// cloud_message_scrub_idx is (login_id, updated_ts) and so provides only the
+	// leading key; the guid tiebreak needs a sort step. Postgres 13+ resolves
+	// that as an Incremental Sort over each tie group rather than sorting the
+	// whole remaining candidate set. Measured mid-backlog on Postgres 18:
+	//
+	//   Limit (actual time=0.154..1.549 rows=1000)
+	//     Incremental Sort  Presorted Key: updated_ts  Peak Memory: 32kB
+	//       Index Scan using cloud_message_scrub_idx  rows=1006
+	//     Buffers: shared hit=390
+	//
+	// 1.5ms per page, reading 1,006 rows to return 1,000. Adding guid to the
+	// index would remove the sort entirely but costs space on every install for
+	// a step that is already negligible — and it would need a NEW index name,
+	// since ensureIndex matches on name alone and existing installs already
+	// carry this one. On Postgres before 13 (EOL since Nov 2024) there is no
+	// Incremental Sort and each page sorts every remaining candidate; that is
+	// the configuration where adding guid would be worth it.
 	var (
 		total      int64
 		bridged    map[string]struct{}

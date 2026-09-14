@@ -4852,6 +4852,53 @@ func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger
 // one per scrubbed portal inline would serialise the entire backfill. The
 // fetchCtx timeout is best-effort only (it cannot interrupt the in-flight CGO
 // call), which is why bounding the WORK via the targeted-only path matters.
+// undeliveredScrubbedInWindow returns the guids of rows in this conversion
+// window that were scrubbed and never reached Matrix — the rows whose loss the
+// caller must try to recover before marking the portal done.
+//
+// Scoped to the window rather than the portal so the unreachable tail on a
+// capped install cannot be mistaken for loss; see the caller for why that is
+// structural rather than another predicate.
+//
+// The second return reports that delivery could not be established. The caller
+// must treat that as "recovery is needed" rather than as an empty result: the
+// pool exhaustion or expired deadline that prevents the delivered set from
+// loading is exactly the condition under which silently marking a portal done
+// loses history. In that degraded case the returned guids are every scrubbed
+// row in the window, which is an upper bound rather than a measurement.
+func (c *IMClient) undeliveredScrubbedInWindow(
+	ctx context.Context, log *zerolog.Logger, bridgeID, portalID string, rows []cloudMessageRow,
+) (undelivered []string, deliveryCheckFailed bool) {
+	scrubbed := make([]string, 0, 8)
+	for _, row := range rows {
+		if !row.BodyScrubbed {
+			continue
+		}
+		// Reactions are scrubbed by scrubReactionText on their own terms and
+		// never convert to a backfill message, so their absence is not loss.
+		if row.TapbackType != nil && *row.TapbackType >= 2000 {
+			continue
+		}
+		scrubbed = append(scrubbed, row.GUID)
+	}
+	if len(scrubbed) == 0 {
+		return nil, false
+	}
+
+	bridged, err := c.cloudStore.cachedBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Int("scrubbed_in_window", len(scrubbed)).
+			Msg("Forward backfill: could not load the delivered set — assuming the window's scrubbed rows are lost rather than marking done")
+		return scrubbed, true
+	}
+	for _, guid := range scrubbed {
+		if _, ok := bridged[strings.ToLower(guid)]; !ok {
+			undelivered = append(undelivered, guid)
+		}
+	}
+	return undelivered, false
+}
+
 func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logger, portalID string) bool {
 	if c.cloudStore == nil || c.client == nil {
 		return false
@@ -8478,58 +8525,37 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// marking done would strand real history permanently. Detect that case
 			// and rehydrate from CloudKit, then retry conversion once.
 			if c.cloudStore != nil {
-				// Only rows that were scrubbed WITHOUT reaching Matrix are a
-				// loss. A portal whose history was delivered and then
-				// legitimately scrubbed also converts to zero messages here —
-				// correctly, since there is nothing left to deliver — and
-				// treating that as loss un-scrubbed the whole portal and
-				// re-fetched it from CloudKit for nothing. Observed on a live
-				// bridge: 7,059 delivered rows cleared and re-fetched in one
-				// run, with a "VISIBLE data loss" error for history that was
-				// fully present in Matrix.
-				// needsRecovery is the decision; scrubbedCount is only what the
-				// log may claim it measured. Keeping them separate matters
-				// because in the degraded branches the count is not an
-				// undelivered count at all.
-				undelivered, undelErr := c.cloudStore.countUndeliveredScrubbedMessages(ctx, string(c.Main.Bridge.ID), portalID)
-				needsRecovery := undelivered > 0
-				scrubbedCount, deliveryCheckFailed := undelivered, false
-				if undelErr != nil {
-					// Can't prove the portal is safe, so fall back to the
-					// weaker count rather than skipping a possible loss.
-					deliveryCheckFailed = true
-					log.Warn().Err(undelErr).Str("portal_id", portalID).
-						Msg("Forward backfill: could not check delivery of scrubbed rows — falling back to the total scrubbed count")
-					total, totalErr := c.cloudStore.countScrubbedBackfillableMessages(ctx, portalID)
-					if totalErr != nil {
-						// Both queries failed, which is one condition and not
-						// two: the pool exhaustion or expired deadline that
-						// broke the first breaks the second, and that is
-						// exactly the post-consolidation wave this guard is
-						// for. Dropping this error left undelivered at 0, so
-						// the portal was marked forward-backfill-done with no
-						// rehydrate and nothing logged — silent loss of the
-						// kind this guard exists to prevent. Fail toward
-						// recovering instead.
-						log.Err(totalErr).Str("portal_id", portalID).
-							Msg("Forward backfill: scrubbed-row count also failed — assuming recovery is needed rather than marking done")
-						needsRecovery = true
-						scrubbedCount = -1
-					} else {
-						scrubbedCount = total
-						needsRecovery = total > 0
-					}
-				}
+				// Judged over the rows this window actually tried to convert,
+				// not the portal as a whole. Two reasons.
+				//
+				// A portal whose history was delivered and then legitimately
+				// scrubbed also converts to zero messages here — correctly,
+				// since nothing is left to deliver — so a portal-wide "has any
+				// scrubbed row" test called every healthy portal a loss. That
+				// un-scrubbed the whole portal and re-fetched it from CloudKit
+				// for nothing: observed on a live bridge as 7,059 delivered
+				// rows cleared in one run, with a "VISIBLE data loss" error for
+				// history that was fully present in Matrix.
+				//
+				// A portal-wide test also counts the unreachable tail on
+				// installs with backfill.max_initial_messages capped.
+				// scrubUnbridgedTail deliberately clears rows older than the
+				// newest N without a delivery check, because backfill can never
+				// reach them, so those rows are scrubbed AND undelivered by
+				// design and would make every capped portal look lost. Scoping
+				// to allRows excludes them structurally rather than by another
+				// predicate that could drift: the tail threshold is computed
+				// with listLatestMessages' own predicate and ordering, and
+				// allRows is what that same call returned, so a tail row cannot
+				// appear here.
+				undelivered, deliveryCheckFailed := c.undeliveredScrubbedInWindow(ctx, log, string(c.Main.Bridge.ID), portalID, allRows)
+				needsRecovery := len(undelivered) > 0
 				logCount := func(e *zerolog.Event) *zerolog.Event {
-					if !deliveryCheckFailed {
-						return e.Int("undelivered", scrubbedCount)
+					if deliveryCheckFailed {
+						return e.Bool("delivery_check_failed", true).
+							Int("scrubbed_in_window", len(undelivered))
 					}
-					e = e.Bool("delivery_check_failed", true)
-					if scrubbedCount < 0 {
-						// Neither query answered; no count may be claimed.
-						return e.Bool("scrubbed_count_unknown", true)
-					}
-					return e.Int("scrubbed_total", scrubbedCount)
+					return e.Int("undelivered", len(undelivered))
 				}
 				if needsRecovery {
 					// Wording differs by branch on purpose: in the degraded
@@ -8557,6 +8583,22 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						allMessages = c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
 					}
 					if len(allMessages) == 0 {
+						if deliveryCheckFailed {
+							// Delivery was never established, so whether this
+							// is loss at all is unknown — and returning nothing
+							// here would mark the portal forward-backfill-done
+							// on that unknown, which is the silent loss this
+							// guard exists to prevent. Fail the run instead so
+							// fwd_backfill_done stays FALSE and the next one
+							// retries, the same way the re-query failure above
+							// does. This is reachable precisely in the case the
+							// degraded path names: an expired deadline also
+							// fails rehydrateScrubbedPortal's first statement,
+							// so recovery could not have succeeded either.
+							logCount(log.Warn().Str("portal_id", portalID)).
+								Msg("Forward backfill: could not establish delivery and recovery did not succeed — leaving the portal not-done to retry")
+							return nil, fmt.Errorf("forward backfill for %s: delivery of %d scrubbed rows could not be established", portalID, len(undelivered))
+						}
 						// CloudKit had no copy to restore — the scrubbed content is
 						// genuinely unrecoverable. Surface the loss loudly (it was
 						// silent before) and mark done so the backward-backfill queue

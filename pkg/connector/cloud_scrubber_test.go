@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 )
 
@@ -258,82 +259,6 @@ func TestScrubBridgedBodiesCrossesChunkBoundary(t *testing.T) {
 	}
 }
 
-// TestCountUndeliveredScrubbedMessages is the regression test for a false
-// "VISIBLE data loss" alarm.
-//
-// Forward backfill converts zero messages for a portal whose history was
-// delivered and then scrubbed — correctly, since nothing is left to deliver.
-// The old guard asked only "does this portal have scrubbed rows", which is
-// true forever afterwards, so every later backfill run of a healthy portal
-// looked like the scrubbed-before-delivery case. On a live bridge that
-// un-scrubbed 7,059 delivered rows and re-fetched them from CloudKit to
-// recover history that was fully present in Matrix.
-//
-// Only rows that were scrubbed WITHOUT reaching Matrix may count.
-func TestCountUndeliveredScrubbedMessages(t *testing.T) {
-	store, db, ctx := scrubTestStore(t)
-
-	insert := func(guid, portal string) {
-		t.Helper()
-		if _, err := db.Exec(ctx, `
-			INSERT INTO cloud_message
-			  (login_id, guid, portal_id, timestamp_ms, is_from_me, record_name,
-			   body_scrubbed, deleted, created_ts, updated_ts)
-			VALUES ($1, $2, $3, 1000, FALSE, 'r', TRUE, FALSE, 1000, 1000)`,
-			testSQLLoginID, guid, portal); err != nil {
-			t.Fatalf("insert %s: %v", guid, err)
-		}
-	}
-	// A healthy portal: every scrubbed row reached Matrix.
-	insert("G-DELIVERED-1", "p-healthy")
-	insert("G-DELIVERED-2", "p-healthy")
-	// A damaged portal: scrubbed, never delivered.
-	insert("G-LOST", "p-damaged")
-	// Mixed: one delivered, one not.
-	insert("G-MIXED-OK", "p-mixed")
-	insert("G-MIXED-LOST", "p-mixed")
-
-	for _, id := range []string{"g-delivered-1", "G-DELIVERED-2", "G-MIXED-OK"} {
-		// Deliberately mixed case: delivery matching is case-insensitive.
-		if _, err := db.Exec(ctx,
-			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-			id, "test-bridge", string(testSQLLoginID)); err != nil {
-			t.Fatalf("insert message %s: %v", id, err)
-		}
-	}
-
-	for _, tc := range []struct {
-		portal string
-		want   int
-	}{
-		{"p-healthy", 0}, // the false-alarm case
-		{"p-damaged", 1}, // the real loss this guard exists for
-		{"p-mixed", 1},
-		{"p-empty", 0},
-	} {
-		got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", tc.portal)
-		if err != nil {
-			t.Fatalf("countUndeliveredScrubbedMessages(%s): %v", tc.portal, err)
-		}
-		if got != tc.want {
-			t.Errorf("countUndeliveredScrubbedMessages(%s) = %d, want %d", tc.portal, got, tc.want)
-		}
-	}
-
-	// Another login's delivery must not make our scrubbed row look delivered.
-	insert("G-OTHER-LOGIN", "p-other")
-	if _, err := db.Exec(ctx,
-		`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
-		"g-other-login", "test-bridge", "someone-else"); err != nil {
-		t.Fatalf("insert foreign message: %v", err)
-	}
-	if got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", "p-other"); err != nil {
-		t.Fatalf("countUndeliveredScrubbedMessages(p-other): %v", err)
-	} else if got != 1 {
-		t.Errorf("countUndeliveredScrubbedMessages(p-other) = %d, want 1 — another login's delivery is not ours", got)
-	}
-}
-
 // TestCachedBridgedGUIDSetReusesOneLoad pins the memoisation that keeps the
 // per-portal delivery check from re-reading the whole message table.
 //
@@ -374,24 +299,10 @@ func TestCachedBridgedGUIDSetReusesOneLoad(t *testing.T) {
 		t.Error("cachedBridgedGUIDSet re-read the table; the wave would pay a full scan per portal")
 	}
 
-	// Staleness must only ever over-report undelivered, never under-report:
-	// a row missing from the cached set is treated as not delivered, which is
-	// the conservative answer. G-TWO is scrubbed but absent from the warm set.
-	if _, err := db.Exec(ctx, `
-		INSERT INTO cloud_message
-		  (login_id, guid, portal_id, timestamp_ms, is_from_me, record_name,
-		   body_scrubbed, deleted, created_ts, updated_ts)
-		VALUES ($1, 'G-TWO', 'p-stale', 1000, FALSE, 'r', TRUE, FALSE, 1000, 1000)`,
-		testSQLLoginID); err != nil {
-		t.Fatalf("insert cloud_message: %v", err)
-	}
-	got, err := store.countUndeliveredScrubbedMessages(ctx, "test-bridge", "p-stale")
-	if err != nil {
-		t.Fatalf("countUndeliveredScrubbedMessages: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("countUndeliveredScrubbedMessages = %d, want 1 — a stale set must err toward reporting loss", got)
-	}
+	// The assertion above is also the safety property: a row delivered after
+	// the load is absent from the cached set, so it reads as NOT delivered.
+	// That is the conservative direction — it can over-report loss and take the
+	// recovery path, never under-report and mark a portal done on a stale view.
 
 	// A different bridge id must not be served from the cache.
 	other, err := store.cachedBridgedGUIDSet(ctx, "other-bridge")
@@ -516,5 +427,90 @@ func TestScrubBridgedBodiesPagesPastUndeliveredPrefix(t *testing.T) {
 	}
 	if leftover != undeliveredCount {
 		t.Errorf("%d rows left unscrubbed, want %d (the undelivered prefix only)", leftover, undeliveredCount)
+	}
+}
+
+// TestUndeliveredScrubbedInWindowIgnoresUnreachableTail is the capped-install
+// regression test.
+//
+// With backfill.max_initial_messages capped, scrubUnbridgedTail clears rows
+// older than the newest N without a delivery check, because backfill can never
+// reach them. Those rows are therefore scrubbed AND undelivered by design. A
+// portal-wide delivery check counted them as loss, so every capped portal that
+// converted to zero messages got its whole history un-scrubbed and re-fetched
+// from CloudKit — which the tail scrubber then cleared again on a later tick.
+//
+// Judging only the conversion window excludes them structurally: the tail
+// threshold is computed with listLatestMessages' own predicate and ordering,
+// and the window is what that call returned.
+func TestUndeliveredScrubbedInWindowIgnoresUnreachableTail(t *testing.T) {
+	store, db, ctx := scrubTestStore(t)
+	c := &IMClient{cloudStore: store}
+
+	// Stand in for what listLatestMessages returned: the newest rows only.
+	// All are scrubbed and all were delivered, so nothing is lost.
+	window := []cloudMessageRow{
+		{GUID: "G-NEW-1", BodyScrubbed: true},
+		{GUID: "G-NEW-2", BodyScrubbed: true},
+	}
+	for _, id := range []string{"g-new-1", "G-NEW-2"} {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO message (id, bridge_id, room_receiver) VALUES ($1, $2, $3)`,
+			id, "", string(testSQLLoginID)); err != nil {
+			t.Fatalf("insert message %s: %v", id, err)
+		}
+	}
+	// The unreachable tail: scrubbed, never delivered, and deliberately NOT in
+	// the window. A portal-wide check would have counted these.
+	for i := 0; i < 500; i++ {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_message
+			  (login_id, guid, portal_id, timestamp_ms, is_from_me, record_name,
+			   body_scrubbed, deleted, created_ts, updated_ts)
+			VALUES ($1, $2, 'p-capped', $3, FALSE, 'r', TRUE, FALSE, $3, $3)`,
+			testSQLLoginID, fmt.Sprintf("G-TAIL-%03d", i), 1000+int64(i)); err != nil {
+			t.Fatalf("insert tail row: %v", err)
+		}
+	}
+
+	log := zerolog.Nop()
+	undelivered, failed := c.undeliveredScrubbedInWindow(ctx, &log, "", "p-capped", window)
+	if failed {
+		t.Fatal("delivery check reported failure on a healthy database")
+	}
+	if len(undelivered) != 0 {
+		t.Errorf("undelivered = %v, want none — the unreachable tail is not loss", undelivered)
+	}
+
+	// A genuinely lost row INSIDE the window must still be caught, or the
+	// rescoping would have removed the guard's reason to exist.
+	window = append(window, cloudMessageRow{GUID: "G-LOST", BodyScrubbed: true})
+	undelivered, failed = c.undeliveredScrubbedInWindow(ctx, &log, "", "p-capped", window)
+	if failed {
+		t.Fatal("unexpected delivery-check failure")
+	}
+	if len(undelivered) != 1 || undelivered[0] != "G-LOST" {
+		t.Errorf("undelivered = %v, want exactly [G-LOST]", undelivered)
+	}
+}
+
+// Rows the window carries that are not scrubbed, or are reactions, are not loss
+// and must not drag the portal into recovery.
+func TestUndeliveredScrubbedInWindowSkipsUnscrubbedAndReactions(t *testing.T) {
+	store, _, ctx := scrubTestStore(t)
+	c := &IMClient{cloudStore: store}
+	reaction := uint32(2000)
+
+	window := []cloudMessageRow{
+		{GUID: "G-LIVE"}, // not scrubbed
+		{GUID: "G-REACTION", BodyScrubbed: true, TapbackType: &reaction}, // scrubbed reaction
+	}
+	log := zerolog.Nop()
+	undelivered, failed := c.undeliveredScrubbedInWindow(ctx, &log, "", "p", window)
+	if failed {
+		t.Fatal("unexpected delivery-check failure")
+	}
+	if len(undelivered) != 0 {
+		t.Errorf("undelivered = %v, want none", undelivered)
 	}
 }
