@@ -789,6 +789,13 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 			t.Fatalf("insert chat %s: %v", cid, err)
 		}
 	}
+	deletedChat := func(cid, groupID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,0,1)`,
+			testSQLLoginID, cid, groupID, portalID, now); err != nil {
+			t.Fatalf("insert deleted chat %s: %v", cid, err)
+		}
+	}
 	room := func(portalID string) {
 		if _, err := db.Exec(ctx,
 			`INSERT INTO portal (bridge_id, id, receiver, mxid) VALUES ($1,$2,$3,$4)`,
@@ -842,6 +849,34 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	chat("c-amb-a", "iiii", "tel:+10,tel:+11")
 	chat("c-amb-b", "iiii", "tel:+10,tel:+12")
 
+	// p_stillowned: looks exactly like p_orphan from the join's point of view —
+	// a chat sharing its group_id sits at a participant key — but a second,
+	// live conversation still points at gid:jjjj itself. That happens when one
+	// group_id spans a real group and a degenerate one (a group-style chat with
+	// fewer than two non-self members): resolvePortalIDForCloudChat parks the
+	// degenerate one at gid:<group_id>, and consolidateGroupPortals skips it at
+	// the same >=2 gate, so nothing ever re-keys it. Re-IDing the room away
+	// cannot stick — createPortalsFromCloudSync rebuilds it from those rows on
+	// the next pass — so consolidation tombstones and recreates the room once
+	// per restart, handing the operator a new empty room every time. A portal
+	// that still owns live rows is not orphaned.
+	room("gid:jjjj")
+	chat("c-still-group", "jjjj", "tel:+13,tel:+14")
+	chat("c-still-degenerate", "jjjj", "gid:jjjj")
+
+	// p_deletednominee: the only row nominating a canonical for this group_id
+	// is soft-deleted. Its portal_id records where a conversation used to live,
+	// which is no authority to tombstone a room that still exists.
+	room("gid:kkkk")
+	deletedChat("c-deleted", "kkkk", "tel:+15,tel:+16")
+
+	// p_deletedplus: a deleted row must not create ambiguity either. The live
+	// row alone decides, so this one is still resolved rather than reported as
+	// having two candidate canonicals.
+	room("gid:llll")
+	chat("c-live", "llll", "tel:+17,tel:+18")
+	deletedChat("c-gone", "llll", "tel:+17,tel:+19")
+
 	got, ambiguous, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
 	if err != nil {
 		t.Fatalf("orphanedGroupRoomPortalIDs: %v", err)
@@ -849,6 +884,7 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	want := map[string]string{
 		"gid:aaaa": "tel:+1,tel:+2",
 		"gid:eeee": "tel:+7,tel:+8",
+		"gid:llll": "tel:+17,tel:+18",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("orphanedGroupRoomPortalIDs() = %#v, want %#v", got, want)

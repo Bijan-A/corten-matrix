@@ -2552,6 +2552,29 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 // gid:<group_id> is a different problem — its canonical target would itself be
 // a gid: key, which is not what moveGroupRooms is being handed here — and is
 // left for the normal participant-key path rather than widened into this one.
+// Two conditions decide whether a gid: room is actually orphaned, and both had
+// to be added after this shipped: without them the function nominated rooms
+// that were still in use, and consolidation churned them once per restart.
+//
+// A gid: portal that still owns live cloud_chat rows is not an orphan. The
+// join only proves that ONE row sharing its group_id has moved to a
+// participant key; other rows can still point at the gid: portal itself, and
+// re-IDing it away from a key its own rows still use cannot stick.
+// createPortalsFromCloudSync sees those rows on the next pass and builds the
+// room again, so the tombstone-and-recreate repeats forever, leaving the
+// operator a new empty room after every restart. That happens whenever one
+// group_id spans both a real group and a degenerate conversation: the
+// degenerate one is parked at gid:<group_id> because resolvePortalIDForCloudChat
+// wants two non-self members for a participant key, and consolidateGroupPortals
+// skips it at the same gate, so nothing ever re-keys it. Keying the room-level
+// decision on group_id while the row-level decision keys on participants is
+// what lets the two disagree permanently; issue #10 proposes removing that
+// asymmetry, and until then the NOT EXISTS keeps this side from acting on it.
+//
+// A soft-deleted chat cannot nominate a canonical either. Its portal_id is a
+// record of where a conversation used to live, and tombstoning a live room on
+// that authority destroys a room to satisfy a chat that no longer exists.
+//
 // Returns the unambiguous mappings, plus the gid: portals deliberately left
 // out because their group_id resolves to more than one canonical key (see
 // resolveOrphanedGroupRooms), so the caller can say so rather than silently
@@ -2567,12 +2590,18 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 		FROM portal p
 		JOIN cloud_chat cc
 		  ON cc.login_id = $1
+		 AND cc.deleted = FALSE
 		 AND cc.group_id <> ''
 		 AND (LOWER(cc.group_id) = LOWER(SUBSTR(p.id, 5))
 		      OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(p.id, 5)))
 		WHERE p.bridge_id = $2 AND p.receiver = $1 AND p.mxid <> '' AND p.id LIKE 'gid:%'
 		  AND cc.portal_id <> p.id
 		  AND cc.portal_id NOT LIKE 'gid:%'
+		  AND NOT EXISTS (
+		        SELECT 1 FROM cloud_chat own
+		        WHERE own.login_id = $1 AND own.portal_id = p.id
+		          AND own.deleted = FALSE
+		      )
 	`, s.loginID, bridgeID)
 	if err != nil {
 		return nil, nil, err
