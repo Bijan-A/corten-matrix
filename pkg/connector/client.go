@@ -9701,12 +9701,20 @@ func (c *IMClient) downloadAndUploadAttachment(
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
+	// Read once from the final bytes: for HEIC that is the converted JPEG, into
+	// which writeJPEGWithMetadata re-embedded the source's EXIF, and otherwise
+	// the original. A non-JPEG (PNG, TIFF, GIF) yields 1 and everything below
+	// is a no-op.
+	orientation := exifOrientation(data)
 	if heicImg != nil {
 		// Use the already-decoded image from HEIC conversion
 		b := heicImg.Bounds()
-		imgWidth, imgHeight = b.Dx(), b.Dy()
+		// Report the dimensions the image is displayed at, not the decoded
+		// ones: for the common portrait-phone orientation they are transposed,
+		// and clients size the placeholder from these.
+		imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 		if imgWidth > 800 || imgHeight > 800 {
-			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, b.Dx(), b.Dy(), orientation)
 		}
 	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
@@ -9715,7 +9723,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}
 		} else if img, fmtName, _ := decodeImageData(data); img != nil {
 			b := img.Bounds()
-			imgWidth, imgHeight = b.Dx(), b.Dy()
+			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
 			if fmtName == "tiff" {
 				var buf bytes.Buffer
@@ -9726,7 +9734,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
-				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, b.Dx(), b.Dy(), orientation)
 			}
 		}
 	}
@@ -12838,12 +12846,20 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
+	// Read once from the final bytes: for HEIC that is the converted JPEG, into
+	// which writeJPEGWithMetadata re-embedded the source's EXIF, and otherwise
+	// the original. A non-JPEG (PNG, TIFF, GIF) yields 1 and everything below
+	// is a no-op.
+	orientation := exifOrientation(inlineData)
 	if heicImg != nil {
 		// Use the already-decoded image from HEIC conversion
 		b := heicImg.Bounds()
-		imgWidth, imgHeight = b.Dx(), b.Dy()
+		// Report the dimensions the image is displayed at, not the decoded
+		// ones: for the common portrait-phone orientation they are transposed,
+		// and clients size the placeholder from these.
+		imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 		if imgWidth > 800 || imgHeight > 800 {
-			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, b.Dx(), b.Dy(), orientation)
 		}
 	} else if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
 		log := zerolog.Ctx(ctx)
@@ -12855,7 +12871,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			}
 		} else if img, fmtName, _ := decodeImageData(inlineData); img != nil {
 			b := img.Bounds()
-			imgWidth, imgHeight = b.Dx(), b.Dy()
+			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Msg("Image decoded successfully")
 			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
 			if fmtName == "tiff" {
@@ -12870,7 +12886,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
-				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, b.Dx(), b.Dy(), orientation)
 			}
 		} else {
 			log.Warn().Str("mime_type", mimeType).Msg("Failed to decode image data")
@@ -13038,10 +13054,26 @@ func extractReplyInfo(replyTo *database.Message) (*string, *string) {
 
 // scaleAndEncodeThumb generates a JPEG thumbnail capped at 800px on the
 // longest side using nearest-neighbor scaling (no external dependencies).
-func scaleAndEncodeThumb(img image.Image, origW, origH int) ([]byte, int, int) {
-	scale := min(800.0/float64(origW), 800.0/float64(origH))
-	thumbW := int(float64(origW) * scale)
-	thumbH := int(float64(origH) * scale)
+//
+// origW/origH are the DECODED dimensions; orientation is the source's EXIF
+// orientation, applied here so the thumbnail comes out upright. Rotating in
+// pixels rather than copying the EXIF tag forward means the thumbnail renders
+// correctly in every client whether or not it reads EXIF, and avoids embedding
+// the full-size image's metadata into a scaled-down copy.
+//
+// The transform is folded into this pass rather than run as a separate step:
+// the loop already maps each destination pixel back to a source coordinate, so
+// orienting is a change to that mapping and costs no extra allocation.
+//
+// Returns the thumbnail's DISPLAY dimensions, transposed relative to the source
+// for the 90 degree orientations.
+func scaleAndEncodeThumb(img image.Image, origW, origH, orientation int) ([]byte, int, int) {
+	// Fit the box against how the image will be shown, not how it decoded, or a
+	// portrait photo stored as landscape pixels is scaled against the wrong axis.
+	dispW, dispH := displayDims(origW, origH, orientation)
+	scale := min(800.0/float64(dispW), 800.0/float64(dispH))
+	thumbW := int(float64(dispW) * scale)
+	thumbH := int(float64(dispH) * scale)
 	if thumbW < 1 {
 		thumbW = 1
 	}
@@ -13052,10 +13084,19 @@ func scaleAndEncodeThumb(img image.Image, origW, origH int) ([]byte, int, int) {
 	srcBounds := img.Bounds()
 	dst := image.NewRGBA(image.Rect(0, 0, thumbW, thumbH))
 	for y := range thumbH {
-		srcY := srcBounds.Min.Y + y*srcBounds.Dy()/thumbH
 		for x := range thumbW {
-			srcX := srcBounds.Min.X + x*srcBounds.Dx()/thumbW
-			dst.Set(x, y, img.At(srcX, srcY))
+			// Scale within the display frame, then map back through the
+			// orientation to the decoded pixel.
+			ux := x * dispW / thumbW
+			uy := y * dispH / thumbH
+			sx, sy := orientedSourcePixel(ux, uy, dispW, dispH, orientation)
+			if sx >= srcBounds.Dx() {
+				sx = srcBounds.Dx() - 1
+			}
+			if sy >= srcBounds.Dy() {
+				sy = srcBounds.Dy() - 1
+			}
+			dst.Set(x, y, img.At(srcBounds.Min.X+sx, srcBounds.Min.Y+sy))
 		}
 	}
 

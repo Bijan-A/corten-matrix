@@ -415,11 +415,19 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
+	// Read once from the final bytes: for HEIC that is the converted JPEG, into
+	// which writeJPEGWithMetadata re-embedded the source's EXIF, and otherwise
+	// the original. A non-JPEG (PNG, TIFF, GIF) yields 1 and everything below
+	// is a no-op.
+	orientation := exifOrientation(data)
 	if heicImg != nil {
 		b := heicImg.Bounds()
-		imgWidth, imgHeight = b.Dx(), b.Dy()
+		// Report the dimensions the image is displayed at, not the decoded
+		// ones: for the common portrait-phone orientation they are transposed,
+		// and clients size the placeholder from these.
+		imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 		if imgWidth > 800 || imgHeight > 800 {
-			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, b.Dx(), b.Dy(), orientation)
 		}
 	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
@@ -428,7 +436,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			}
 		} else if img, fmtName, _ := decodeImageData(data); img != nil {
 			b := img.Bounds()
-			imgWidth, imgHeight = b.Dx(), b.Dy()
+			imgWidth, imgHeight = displayDims(b.Dx(), b.Dy(), orientation)
 			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
 			if fmtName == "tiff" {
 				var buf bytes.Buffer
@@ -439,7 +447,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
-				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, b.Dx(), b.Dy(), orientation)
 			}
 		}
 	}
