@@ -482,23 +482,8 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to add thumb_version to cloud_attachment_cache: %w", err)
 		}
 	}
-	// Drop entries produced before the current generation that actually carry a
-	// thumbnail. Scoped to those deliberately: an entry without one cannot be
-	// affected, and discarding it would force a needless re-download and
-	// re-upload of the attachment it already has an mxc URI for.
-	if _, err := s.db.Exec(ctx, `
-		DELETE FROM cloud_attachment_cache
-		WHERE login_id=$1 AND thumb_version < $2
-		  AND CAST(content_json AS TEXT) LIKE '%thumbnail%'`,
-		s.loginID, thumbCacheVersion); err != nil {
-		return fmt.Errorf("failed to invalidate stale thumbnail cache entries: %w", err)
-	}
-	// Everything surviving is current, so this whole step is a no-op next run.
-	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_attachment_cache SET thumb_version=$2 WHERE login_id=$1 AND thumb_version < $2`,
-		s.loginID, thumbCacheVersion); err != nil {
-		return fmt.Errorf("failed to stamp thumbnail cache version: %w", err)
-	}
+	// Stale entries are skipped at load rather than deleted here; see
+	// loadAttachmentCacheJSON for why.
 
 	// Migration: add cloud_attachment_dead table if missing. Persists
 	// record_names that CloudKit no longer serves (Apple aged out the MMCS
@@ -4110,9 +4095,32 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 // *event.MessageEventContent and populates the in-memory attachmentContentCache
 // so pre-upload skips already-uploaded attachments without touching CloudKit.
 func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[string][]byte, error) {
+	// Skip entries whose thumbnail predates the current generation, so they are
+	// regenerated on next use instead of being replayed. Entries WITHOUT a
+	// thumbnail are unaffected by a thumbnail change and are always loaded:
+	// they still hold the mxc URI of an already-uploaded attachment, and
+	// dropping them would force a pointless re-download and re-upload.
+	//
+	// Skipped rather than deleted, which is the difference between paying for
+	// every stale entry at once and paying only for the ones actually used
+	// again. On the install this was written against, half the cache (12,231 of
+	// 24,186) carries a thumbnail, and most of those attachments will never be
+	// re-sent; a mass delete would re-fetch all of them from CloudKit up front.
+	// A skipped row is overwritten by saveAttachmentCacheEntry, stamped current,
+	// the first time its attachment is used again.
+	//
+	// The thumbnail test is dialect-specific because content_json is BYTEA on
+	// Postgres, where CAST(... AS TEXT) yields the hex escape form (\x7b22...)
+	// and a LIKE for readable text silently matches nothing — the first version
+	// of this did exactly that and invalidated nothing at all.
+	hasThumb := `CAST(content_json AS TEXT) LIKE '%thumbnail%'`
+	if s.db.Dialect == dbutil.Postgres {
+		hasThumb = `position('\x7468756d626e61696c'::bytea in content_json) > 0` // "thumbnail"
+	}
 	rows, err := s.db.Query(ctx,
-		`SELECT record_name, content_json FROM cloud_attachment_cache WHERE login_id=$1`,
-		s.loginID,
+		`SELECT record_name, content_json FROM cloud_attachment_cache
+		 WHERE login_id=$1 AND (thumb_version >= $2 OR NOT (`+hasThumb+`))`,
+		s.loginID, thumbCacheVersion,
 	)
 	if err != nil {
 		return nil, err
