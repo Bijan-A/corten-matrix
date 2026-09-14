@@ -7,6 +7,7 @@ package connector
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -17,6 +18,38 @@ import (
 // entry. One builder for every case: three near-copies drifted apart before,
 // and that is how the APP1 offset bug in the failure tests survived.
 func buildTIFF(orientation uint32, bigEndian bool, typ uint16) []byte {
+	return buildTIFFEntries(orientation, bigEndian, typ, nil, nil)
+}
+
+// exifDecoy is a non-Orientation IFD0 entry whose value fits the inline 4-byte
+// field, used to pad IFD0 the way a real camera file does.
+type exifDecoy struct {
+	tag   uint16
+	typ   uint16
+	count uint32
+}
+
+// Tags a phone actually writes ahead of Orientation (0x0112), in the ascending
+// order the TIFF spec requires: ImageWidth, ImageLength, Make, Model. Make and
+// Model are cut to three characters so their value stays inline rather than
+// becoming an offset, which keeps the fixture self-contained.
+var exifDecoysBefore = []exifDecoy{
+	{tag: 0x0100, typ: 4, count: 1}, // ImageWidth  (LONG)
+	{tag: 0x0101, typ: 4, count: 1}, // ImageLength (LONG)
+	{tag: 0x010F, typ: 2, count: 3}, // Make        (ASCII)
+	{tag: 0x0110, typ: 2, count: 3}, // Model       (ASCII)
+}
+
+// And two that follow it, so a walk that runs on past Orientation is not
+// mistaken for one that stopped at it.
+var exifDecoysAfter = []exifDecoy{
+	{tag: 0x011A, typ: 5, count: 1}, // XResolution     (RATIONAL)
+	{tag: 0x0128, typ: 3, count: 1}, // ResolutionUnit  (SHORT)
+}
+
+// buildTIFFEntries produces a raw TIFF/EXIF block whose IFD0 holds the given
+// decoy entries around one Orientation entry.
+func buildTIFFEntries(orientation uint32, bigEndian bool, typ uint16, before, after []exifDecoy) []byte {
 	var bo binary.ByteOrder = binary.LittleEndian
 	order := []byte("II")
 	if bigEndian {
@@ -26,7 +59,19 @@ func buildTIFF(orientation uint32, bigEndian bool, typ uint16) []byte {
 	b.Write(order)
 	_ = binary.Write(&b, bo, uint16(42))
 	_ = binary.Write(&b, bo, uint32(8)) // IFD0 at offset 8
-	_ = binary.Write(&b, bo, uint16(1)) // one entry
+	_ = binary.Write(&b, bo, uint16(len(before)+1+len(after)))
+	writeDecoy := func(d exifDecoy) {
+		_ = binary.Write(&b, bo, d.tag)
+		_ = binary.Write(&b, bo, d.typ)
+		_ = binary.Write(&b, bo, d.count)
+		// A plausible non-zero value. If the walk mistook one of these for the
+		// Orientation entry it would read something out of the 1..8 range and
+		// the assertion would show which.
+		_ = binary.Write(&b, bo, uint32(0x00414141))
+	}
+	for _, d := range before {
+		writeDecoy(d)
+	}
 	_ = binary.Write(&b, bo, uint16(0x0112))
 	_ = binary.Write(&b, bo, typ)
 	_ = binary.Write(&b, bo, uint32(1))
@@ -35,6 +80,9 @@ func buildTIFF(orientation uint32, bigEndian bool, typ uint16) []byte {
 	} else { // SHORT sits in the first half
 		_ = binary.Write(&b, bo, uint16(orientation))
 		_ = binary.Write(&b, bo, uint16(0))
+	}
+	for _, d := range after {
+		writeDecoy(d)
 	}
 	_ = binary.Write(&b, bo, uint32(0)) // no next IFD
 	return b.Bytes()
@@ -151,6 +199,26 @@ func TestDisplayDimsSwapsOnlyQuarterTurns(t *testing.T) {
 	}
 }
 
+// orientedCorners maps an EXIF orientation to markerImage's four corners as
+// they must appear once displayed, read clockwise from the top-left, for a
+// source whose corners are R/G/W/B in that order.
+//
+// Derived from the EXIF definitions rather than from the implementation: 2
+// flips horizontally, 3 rotates 180, 4 flips vertically, 5 transposes about the
+// main diagonal, 6 rotates 90 clockwise, 7 transposes about the anti-diagonal,
+// 8 rotates 270 clockwise. Shared by the thumbnail and full-size tests so the
+// two cannot drift apart.
+var orientedCorners = map[int]string{
+	1: "RGWB", // identity
+	2: "GRBW", // flip horizontal
+	3: "WBRG", // rotate 180
+	4: "BWGR", // flip vertical
+	5: "RBWG", // transpose
+	6: "BRGW", // rotate 90 CW
+	7: "WGRB", // anti-transpose
+	8: "GWBR", // rotate 270 CW
+}
+
 // markerImage is a 1200x800 image of four solid quadrants:
 //
 //	R | G      R=red   G=green
@@ -211,17 +279,7 @@ func nearestMarker(c color.Color) string {
 // 180, 4 flips vertically, 5 transposes about the main diagonal, 6 rotates 90
 // clockwise, 7 transposes about the anti-diagonal, 8 rotates 270 clockwise.
 func TestScaleAndEncodeThumbOrientsPixels(t *testing.T) {
-	// Display corners read clockwise from top-left, for source R/G/W/B.
-	want := map[int]string{
-		1: "RGWB", // identity
-		2: "GRBW", // flip horizontal
-		3: "WBRG", // rotate 180
-		4: "BWGR", // flip vertical
-		5: "RBWG", // transpose
-		6: "BRGW", // rotate 90 CW
-		7: "WGRB", // anti-transpose
-		8: "GWBR", // rotate 270 CW
-	}
+	want := orientedCorners
 	for o := 1; o <= 8; o++ {
 		data, w, h := scaleAndEncodeThumb(markerImage(), o)
 		if data == nil {
@@ -362,5 +420,167 @@ func TestExifOrientationRejectsIFDInsideHeader(t *testing.T) {
 	}
 	if got := exifOrientation(wrapJPEG(t, nil, tiff)); got != orientationNormal {
 		t.Errorf("exifOrientation(same, wrapped in APP1) = %d, want 1", got)
+	}
+}
+
+// A real camera JPEG's IFD0 carries a dozen tags and Orientation is not the
+// first. Every other fixture here builds a single-entry IFD0, which never
+// exercises the walk past a non-matching tag — so a parser that gave up on the
+// first entry instead of continuing would pass the whole suite while failing on
+// every photo a phone produces.
+func TestExifOrientationWalksPastOtherTags(t *testing.T) {
+	for want := 1; want <= 8; want++ {
+		for _, be := range []bool{false, true} {
+			tiff := buildTIFFEntries(uint32(want), be, 3, exifDecoysBefore, exifDecoysAfter)
+			for _, tc := range []struct {
+				name string
+				data []byte
+			}{
+				{"bare TIFF", tiff},
+				{"JPEG APP1", wrapJPEG(t, nil, tiff)},
+			} {
+				if got := exifOrientation(tc.data); got != want {
+					t.Errorf("%s (orientation %d, bigEndian=%v): got %d, want %d",
+						tc.name, want, be, got, want)
+				}
+			}
+		}
+	}
+}
+
+// markerSubImage returns markerImage's content as a sub-image of a larger
+// black-bordered canvas, so its Pix slice and Bounds.Min start at (100, 100)
+// rather than the origin.
+//
+// orientImage reads the source two different ways depending on its type — by
+// Bounds().Min through At in the generic path, and from Pix[0] in the
+// four-byte-per-pixel fast path — and both have to land on the same pixel. An
+// origin-anchored fixture cannot tell a correct offset from a missing one,
+// because Min is (0, 0) either way. Here a mistake pulls in the black border.
+func markerSubImage() image.Image {
+	canvas := image.NewRGBA(image.Rect(0, 0, 1400, 1000))
+	for y := range 1000 {
+		for x := range 1400 {
+			canvas.Set(x, y, color.RGBA{A: 255})
+		}
+	}
+	marker := markerImage()
+	for y := range 800 {
+		for x := range 1200 {
+			canvas.Set(100+x, 100+y, marker.At(x, y))
+		}
+	}
+	return canvas.SubImage(image.Rect(100, 100, 1300, 900))
+}
+
+// genericImage hides an image's concrete type so orientImage cannot take its
+// Pix fast path and must fall back to At/Set.
+type genericImage struct{ image.Image }
+
+// cornersOf reads img's four corner quadrants clockwise from the top-left.
+func cornersOf(img image.Image) string {
+	b := img.Bounds()
+	at := func(fx, fy float64) string {
+		return nearestMarker(img.At(
+			b.Min.X+int(float64(b.Dx())*fx),
+			b.Min.Y+int(float64(b.Dy())*fy)))
+	}
+	return at(0.25, 0.25) + at(0.75, 0.25) + at(0.75, 0.75) + at(0.25, 0.75)
+}
+
+// orientImage rotates the FULL-SIZE image — the path a TIFF takes, since it is
+// re-encoded as a JPEG that carries no EXIF — and had no test at all.
+func TestOrientImageOrientsPixels(t *testing.T) {
+	for o := 1; o <= 8; o++ {
+		for _, src := range []struct {
+			name string
+			img  image.Image
+		}{
+			{"RGBA", markerImage()},
+			{"NRGBA", asNRGBA(markerImage())},
+			{"generic", genericImage{markerImage()}},
+			{"sub-image", markerSubImage()},
+			{"generic sub-image", genericImage{markerSubImage()}},
+		} {
+			got := orientImage(src.img, o)
+			wantW, wantH := displayDims(1200, 800, o)
+			if got.Bounds().Dx() != wantW || got.Bounds().Dy() != wantH {
+				t.Errorf("orientation %d (%s): size %dx%d, want %dx%d", o, src.name,
+					got.Bounds().Dx(), got.Bounds().Dy(), wantW, wantH)
+			}
+			if c := cornersOf(got); c != orientedCorners[o] {
+				t.Errorf("orientation %d (%s): corners clockwise from top-left = %q, want %q",
+					o, src.name, c, orientedCorners[o])
+			}
+		}
+	}
+}
+
+// asNRGBA re-renders an image in the other four-byte layout orientImage has a
+// fast path for. The markers are opaque, so the two encodings hold identical
+// bytes and any difference in output comes from the code, not the format.
+func asNRGBA(src image.Image) *image.NRGBA {
+	b := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	for y := range b.Dy() {
+		for x := range b.Dx() {
+			dst.Set(x, y, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+// The byte-copy fast path is an optimisation, so it has to be indistinguishable
+// from the generic path it replaces — pixel for pixel, not just corner for
+// corner, which a transposition bug in the interior could survive.
+func TestOrientImageFastPathMatchesGenericPath(t *testing.T) {
+	for o := 1; o <= 8; o++ {
+		for _, src := range []struct {
+			name string
+			img  image.Image
+		}{
+			{"RGBA", markerImage()},
+			{"NRGBA", asNRGBA(markerImage())},
+			{"sub-image", markerSubImage()},
+		} {
+			fast := orientImage(src.img, o)
+			slow := orientImage(genericImage{src.img}, o)
+			if diff := firstPixelDiff(fast, slow); diff != "" {
+				t.Errorf("orientation %d (%s): fast path differs from generic path at %s",
+					o, src.name, diff)
+			}
+		}
+	}
+}
+
+// firstPixelDiff returns a description of the first differing pixel, or "" if
+// the two images match.
+func firstPixelDiff(a, b image.Image) string {
+	ab, bb := a.Bounds(), b.Bounds()
+	if ab.Dx() != bb.Dx() || ab.Dy() != bb.Dy() {
+		return fmt.Sprintf("size %dx%d vs %dx%d", ab.Dx(), ab.Dy(), bb.Dx(), bb.Dy())
+	}
+	for y := range ab.Dy() {
+		for x := range ab.Dx() {
+			ar, ag, al, aa := a.At(ab.Min.X+x, ab.Min.Y+y).RGBA()
+			br, bg, bl, ba := b.At(bb.Min.X+x, bb.Min.Y+y).RGBA()
+			if ar != br || ag != bg || al != bl || aa != ba {
+				return fmt.Sprintf("(%d,%d): %v,%v,%v,%v vs %v,%v,%v,%v",
+					x, y, ar, ag, al, aa, br, bg, bl, ba)
+			}
+		}
+	}
+	return ""
+}
+
+// An upright image must come back untouched — the same image, not a copy —
+// since orientImage runs on every full-size TIFF and copying a 24-megapixel
+// frame to change nothing is the common case.
+func TestOrientImageLeavesUprightImagesAlone(t *testing.T) {
+	src := markerImage()
+	for _, o := range []int{orientationNormal, 0, -1, 9, 100} {
+		if got := orientImage(src, o); got != src {
+			t.Errorf("orientation %d: returned a new image, want the input unchanged", o)
+		}
 	}
 }

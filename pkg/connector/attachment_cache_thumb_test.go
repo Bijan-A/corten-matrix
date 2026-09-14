@@ -7,6 +7,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"go.mau.fi/util/dbutil"
@@ -177,5 +178,92 @@ func TestStripCachedThumbnailLeavesUnparseableAlone(t *testing.T) {
 				t.Errorf("stripCachedThumbnail() = %q, want it unchanged", got)
 			}
 		})
+	}
+}
+
+// The encrypted form of a cached image: in an E2EE portal the mxc URIs live in
+// "file"/"thumbnail_file" objects and the plain "url"/"thumbnail_url" keys are
+// absent entirely. Stripping only the plaintext keys would leave every
+// encrypted room replaying its sideways thumbnails.
+const cachedEncryptedImageJSON = `{"msgtype":"m.image","body":"IMG.jpg",` +
+	`"filename":"IMG.jpg",` +
+	`"file":{"url":"mxc://example.org/full-enc","v":"v2",` +
+	`"key":{"alg":"A256CTR","ext":true,"k":"AAA","key_ops":["encrypt","decrypt"],"kty":"oct"},` +
+	`"iv":"BBB","hashes":{"sha256":"CCC"}},` +
+	`"info":{"w":4032,"h":3024,"size":2048576,"mimetype":"image/jpeg",` +
+	`"xyz.amorgan.blurhash":"LEHV6nWB",` +
+	`"thumbnail_file":{"url":"mxc://example.org/thumb-enc","v":"v2",` +
+	`"key":{"alg":"A256CTR","ext":true,"k":"DDD","key_ops":["encrypt","decrypt"],"kty":"oct"},` +
+	`"iv":"EEE","hashes":{"sha256":"FFF"}},` +
+	`"thumbnail_info":{"w":800,"h":600,"size":40960,"mimetype":"image/jpeg"}}}`
+
+// The strip has to be surgical: it removes three keys and must leave the
+// document otherwise byte-for-byte equivalent. Asserting only that the
+// thumbnail is gone would pass just as well if the encryption key, the blurhash
+// or the filename went with it — and losing "file" would lose the photo.
+func TestStripCachedThumbnailRemovesEncryptedThumbnailAndKeepsTheRest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"plaintext", cachedImageJSON},
+		{"encrypted", cachedEncryptedImageJSON},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Expected value built by deleting the three keys from the parsed
+			// fixture, so the assertion describes the intent rather than
+			// restating whatever the function happens to emit.
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tc.input), &want); err != nil {
+				t.Fatalf("unmarshal fixture: %v", err)
+			}
+			wantInfo := want["info"].(map[string]any)
+			removed := 0
+			for _, key := range []string{"thumbnail_url", "thumbnail_file", "thumbnail_info"} {
+				if _, present := wantInfo[key]; present {
+					removed++
+				}
+				delete(wantInfo, key)
+			}
+			if removed == 0 {
+				t.Fatal("fixture carries no thumbnail keys, so this test proves nothing")
+			}
+
+			var got map[string]any
+			if err := json.Unmarshal(stripCachedThumbnail([]byte(tc.input)), &got); err != nil {
+				t.Fatalf("unmarshal stripped: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("stripped document differs from fixture-minus-thumbnail\n got: %#v\nwant: %#v", got, want)
+			}
+		})
+	}
+}
+
+// The version gate has to run on encrypted entries too, through the real
+// database path rather than only the helper.
+func TestLoadAttachmentCacheStripsEncryptedThumbnail(t *testing.T) {
+	store, db, ctx := thumbCacheStore(t)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts, thumb_version)
+		VALUES ($1, 'stale-enc', $2, 1000, 0)`, testSQLLoginID, []byte(cachedEncryptedImageJSON)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	cache, err := store.loadAttachmentCacheJSON(ctx)
+	if err != nil {
+		t.Fatalf("loadAttachmentCacheJSON: %v", err)
+	}
+	var c map[string]any
+	if err := json.Unmarshal(cache["stale-enc"], &c); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := c["file"]; !present {
+		t.Fatal("the encrypted full-size file was dropped; the photo is gone, not just its preview")
+	}
+	info := c["info"].(map[string]any)
+	for _, key := range []string{"thumbnail_file", "thumbnail_info"} {
+		if _, present := info[key]; present {
+			t.Errorf("kept %s; it would be replayed sideways", key)
+		}
 	}
 }

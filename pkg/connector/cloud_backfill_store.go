@@ -4093,8 +4093,9 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 
 // loadAttachmentCacheJSON returns the persisted record_name → content_json
 // entries, with the thumbnail stripped from any entry older than the current
-// thumbnail generation, and populates the in-memory attachmentContentCache so
-// pre-upload skips already-uploaded attachments without touching CloudKit.
+// thumbnail generation. The caller (preUploadCloudAttachments) unmarshals these
+// into attachmentContentCache, so pre-upload skips already-uploaded attachments
+// without touching CloudKit.
 //
 // Stale entries are stripped rather than withheld. Withholding one looks
 // harmless — it would simply be regenerated on next use — but it discards a
@@ -4113,9 +4114,32 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 // re-download every stale attachment through preUploadCloudAttachments, which
 // treats an absent entry as uncached.
 //
-// The residue is that a stale entry keeps its old Info.Width/Height, which for
-// a quarter-turn image are transposed. A missing thumbnail and imperfect
-// dimensions beat a sideways thumbnail, and beat a missing photo by a long way.
+// Two costs come with that choice, both accepted deliberately.
+//
+// First, the strip is permanent for the life of the entry. A stripped entry is
+// still a cache HIT, so nothing downstream re-downloads it and
+// saveAttachmentCacheEntry — which only runs after a fresh download — never
+// rewrites it. The row keeps its old version, is stripped again on every start,
+// and those attachments render with no preview from here on. Regenerating them
+// is possible without CloudKit, since the full-size image is already on the
+// homeserver at the mxc URI the entry carries, but re-fetching and re-uploading
+// inside the backfill path is a larger change than this fix; it is left as
+// follow-up work rather than smuggled in here.
+//
+// Second, the strip cannot be narrowed to the formats that were actually wrong
+// (JPEG and TIFF; HEIC came back upright from libheif and PNG/GIF carry no
+// orientation). The obvious filter is the stored mime_type or uti_type, and
+// neither is trustworthy: in this deployment 538 attachment rows carry a
+// mime_type and uti_type that name different formats, in both directions —
+// image/heic tagged public.jpeg and image/jpeg tagged public.heic. The runtime
+// path agrees they are unreliable and sniffs the bytes instead, which are not
+// available here. Filtering on either field would both keep wrong thumbnails
+// and drop right ones, so every stale entry is treated as suspect.
+//
+// The remaining residue is that a stale entry keeps its old Info.Width/Height,
+// which for a quarter-turn image are transposed. A missing thumbnail and
+// imperfect dimensions beat a sideways thumbnail, and beat a missing photo by a
+// long way.
 func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[string][]byte, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT record_name, content_json, thumb_version FROM cloud_attachment_cache WHERE login_id=$1`,
