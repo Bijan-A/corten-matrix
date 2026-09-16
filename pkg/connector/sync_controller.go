@@ -4183,7 +4183,7 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 	// Folded into the ROOM groups, not the row re-keys: an orphan's cloud rows
 	// are already on the canonical key by definition, so there is nothing to
 	// re-key — only a room to move.
-	if orphans, ambiguous, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID)); oErr != nil {
+	if orphans, ambiguous, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID), c.Main.Config.BridgeFilteredChats); oErr != nil {
 		log.Warn().Err(oErr).Msg("Failed to look up orphaned gid: group rooms")
 	} else {
 		if len(orphans) > 0 {

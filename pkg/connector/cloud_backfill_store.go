@@ -2552,24 +2552,32 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 // gid:<group_id> is a different problem — its canonical target would itself be
 // a gid: key, which is not what moveGroupRooms is being handed here — and is
 // left for the normal participant-key path rather than widened into this one.
-// Two conditions decide whether a gid: room is actually orphaned, and both had
-// to be added after this shipped: without them the function nominated rooms
-// that were still in use, and consolidation churned them once per restart.
 //
-// A gid: portal that still owns live cloud_chat rows is not an orphan. The
-// join only proves that ONE row sharing its group_id has moved to a
-// participant key; other rows can still point at the gid: portal itself, and
-// re-IDing it away from a key its own rows still use cannot stick.
-// createPortalsFromCloudSync sees those rows on the next pass and builds the
-// room again, so the tombstone-and-recreate repeats forever, leaving the
-// operator a new empty room after every restart. That happens whenever one
-// group_id spans both a real group and a degenerate conversation: the
-// degenerate one is parked at gid:<group_id> because resolvePortalIDForCloudChat
-// wants two non-self members for a participant key, and consolidateGroupPortals
-// skips it at the same gate, so nothing ever re-keys it. Keying the room-level
-// decision on group_id while the row-level decision keys on participants is
-// what lets the two disagree permanently; issue #10 proposes removing that
-// asymmetry, and until then the NOT EXISTS keeps this side from acting on it.
+// A gid: room is only orphaned if createPortalsFromCloudSync would NOT rebuild
+// it, so that is the test used: nominees are filtered against
+// listPortalIDsWithNewestTimestamp, the same function that decides what gets
+// created. Asking the narrower question — "do live cloud_chat rows still point
+// here?" — gets two shapes wrong, because that predicate also counts live
+// cloud_message rows and discounts iCloud-filtered chats.
+//
+// Nominating a room that will be rebuilt does not consolidate it, it churns it.
+// The join only proves that ONE row sharing the group_id moved to a participant
+// key; whatever still sits at the gid: key brings the room straight back, so
+// the tombstone-and-recreate repeats on every startup and the operator collects
+// a new empty room each time. That happens whenever one group_id spans both a
+// real group and a degenerate conversation: the degenerate one is parked at
+// gid:<group_id> because resolvePortalIDForCloudChat wants two non-self members
+// for a participant key, and consolidateGroupPortals skips it at the same gate,
+// so nothing ever re-keys it. Keying the room-level decision on group_id while
+// the row-level decision keys on participants is what lets the two disagree
+// permanently; issue #10 proposes removing that asymmetry.
+//
+// Conversely, a room nothing would rebuild must still be nominated, or it is
+// stranded at the gid: key forever — the issue #9 state this function exists to
+// resolve, including the message_real_pkey collision against the canonical
+// portal's backfill. A gid: room whose only remaining chat row is iCloud-
+// filtered is exactly that case when bridge_filtered_chats is off, which is why
+// the flag is threaded through rather than assumed.
 //
 // A soft-deleted chat cannot nominate a canonical either. Its portal_id is a
 // record of where a conversation used to live, and tombstoning a live room on
@@ -2579,7 +2587,7 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 // out because their group_id resolves to more than one canonical key (see
 // resolveOrphanedGroupRooms), so the caller can say so rather than silently
 // reporting fewer.
-func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string) (map[string]string, []string, error) {
+func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bridgeID string, bridgeFilteredChats bool) (map[string]string, []string, error) {
 	// Every candidate pair, not one collapsed row per portal. This used to be
 	// GROUP BY p.id with MIN(cc.portal_id), which cannot represent a group_id
 	// whose rows sit at two different canonical keys — it just picked the
@@ -2597,11 +2605,6 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 		WHERE p.bridge_id = $2 AND p.receiver = $1 AND p.mxid <> '' AND p.id LIKE 'gid:%'
 		  AND cc.portal_id <> p.id
 		  AND cc.portal_id NOT LIKE 'gid:%'
-		  AND NOT EXISTS (
-		        SELECT 1 FROM cloud_chat own
-		        WHERE own.login_id = $1 AND own.portal_id = p.id
-		          AND own.deleted = FALSE
-		      )
 	`, s.loginID, bridgeID)
 	if err != nil {
 		return nil, nil, err
@@ -2622,6 +2625,20 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+
+	// Drop any nominee createPortalsFromCloudSync would rebuild. Filtering
+	// against that function's own output rather than restating its predicate
+	// here means the two cannot drift: it already accounts for live
+	// cloud_message rows with a record_name, for chats whose rows are all
+	// iCloud-filtered, and for bridge_filtered_chats turning that off.
+	rebuildable, err := s.listPortalIDsWithNewestTimestamp(ctx, bridgeFilteredChats)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, portal := range rebuildable {
+		delete(candidates, portal.PortalID)
+	}
+
 	resolved, ambiguous := resolveOrphanedGroupRooms(candidates)
 	return resolved, ambiguous, nil
 }
