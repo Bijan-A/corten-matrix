@@ -35,6 +35,22 @@ make build
 macOS only — see [the README](README.md#linux-is-not-supported-here) for why Linux cannot
 be built from this tree.
 
+### `#cgo linux` lines are dead here
+
+Two files carry `#cgo linux` directives — `pkg/connector/heic.go` and the generated
+`pkg/rustpushgo/rustpushgo.go`. **Neither is ever compiled**, because the Makefile
+hard-errors on any non-Darwin host. They are kept so the tree stays mergeable with
+upstream, which does build for Linux.
+
+This matters when reviewing: a defect reachable only on the Linux path cannot occur
+here, and a "fix" for one is untestable in this repo. `heic.go` says so in a comment
+above its preamble; `rustpushgo.go` cannot, because it is generated and must never be
+hand-edited — hence this note.
+
+The same applies to `runtime.GOOS` branches (mostly in `pkg/cli` service management):
+the non-darwin arms exist for upstream's benefit and are unreachable in any binary
+built from this tree.
+
 Install `uniffi-bindgen-go` (must match UniFFI 0.25.0 as pinned in `pkg/rustpushgo/Cargo.toml`):
 ```bash
 cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.2+v0.25.0
