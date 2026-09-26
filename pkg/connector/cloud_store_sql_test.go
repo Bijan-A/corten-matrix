@@ -789,6 +789,28 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 			t.Fatalf("insert chat %s: %v", cid, err)
 		}
 	}
+	deletedChat := func(cid, groupID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,0,1)`,
+			testSQLLoginID, cid, groupID, portalID, now); err != nil {
+			t.Fatalf("insert deleted chat %s: %v", cid, err)
+		}
+	}
+	filteredChat := func(cid, groupID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_chat (login_id, cloud_chat_id, group_id, portal_id, created_ts, is_filtered, deleted) VALUES ($1,$2,$3,$4,$5,1,0)`,
+			testSQLLoginID, cid, groupID, portalID, now); err != nil {
+			t.Fatalf("insert filtered chat %s: %v", cid, err)
+		}
+	}
+	message := func(guid, chatID, portalID string) {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO cloud_message (login_id, guid, record_name, chat_id, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,0,0,$6,$6)`,
+			testSQLLoginID, guid, "rec-"+guid, chatID, portalID, now); err != nil {
+			t.Fatalf("insert message %s: %v", guid, err)
+		}
+	}
 	room := func(portalID string) {
 		if _, err := db.Exec(ctx,
 			`INSERT INTO portal (bridge_id, id, receiver, mxid) VALUES ($1,$2,$3,$4)`,
@@ -842,13 +864,62 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	chat("c-amb-a", "iiii", "tel:+10,tel:+11")
 	chat("c-amb-b", "iiii", "tel:+10,tel:+12")
 
-	got, ambiguous, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID)
+	// p_stillowned: looks exactly like p_orphan from the join's point of view —
+	// a chat sharing its group_id sits at a participant key — but a second,
+	// live conversation still points at gid:jjjj itself. That happens when one
+	// group_id spans a real group and a degenerate one (a group-style chat with
+	// fewer than two non-self members): resolvePortalIDForCloudChat parks the
+	// degenerate one at gid:<group_id>, and consolidateGroupPortals skips it at
+	// the same >=2 gate, so nothing ever re-keys it. Re-IDing the room away
+	// cannot stick — createPortalsFromCloudSync rebuilds it from those rows on
+	// the next pass — so consolidation tombstones and recreates the room once
+	// per restart, handing the operator a new empty room every time. A portal
+	// that still owns live rows is not orphaned.
+	room("gid:jjjj")
+	chat("c-still-group", "jjjj", "tel:+13,tel:+14")
+	chat("c-still-degenerate", "jjjj", "gid:jjjj")
+
+	// p_deletednominee: the only row nominating a canonical for this group_id
+	// is soft-deleted. Its portal_id records where a conversation used to live,
+	// which is no authority to tombstone a room that still exists.
+	room("gid:kkkk")
+	deletedChat("c-deleted", "kkkk", "tel:+15,tel:+16")
+
+	// p_deletedplus: a deleted row must not create ambiguity either. The live
+	// row alone decides, so this one is still resolved rather than reported as
+	// having two candidate canonicals.
+	room("gid:llll")
+	chat("c-live", "llll", "tel:+17,tel:+18")
+	deletedChat("c-gone", "llll", "tel:+17,tel:+19")
+
+	// p_messageonly: no chat row left at the gid: key, but a live cloud_message
+	// row with a record_name still carries it. listPortalIDsWithNewestTimestamp
+	// draws portal IDs from messages as well as chats, so this room is rebuilt
+	// just like p_stillowned and nominating it only churns it. Asking "do live
+	// cloud_chat rows point here?" misses this shape entirely.
+	room("gid:nnnn")
+	chat("c-msg-group", "nnnn", "tel:+20,tel:+21")
+	message("m-orphan-1", "c-gone-from-cloud_chat", "gid:nnnn")
+
+	// p_filteredonly: the mirror image. Its only remaining chat row is
+	// iCloud-filtered, and with bridge_filtered_chats off that portal is never
+	// created — so nothing rebuilds this room and it MUST be nominated, or it
+	// stays stranded at the gid: key forever (the issue #9 state, including the
+	// message_real_pkey collision with the canonical portal's backfill).
+	// Counting the filtered row as ownership would silently strand it.
+	room("gid:mmmm")
+	chat("c-filt-group", "mmmm", "tel:+22,tel:+23")
+	filteredChat("c-filt-degenerate", "mmmm", "gid:mmmm")
+
+	got, ambiguous, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID, false)
 	if err != nil {
 		t.Fatalf("orphanedGroupRoomPortalIDs: %v", err)
 	}
 	want := map[string]string{
 		"gid:aaaa": "tel:+1,tel:+2",
 		"gid:eeee": "tel:+7,tel:+8",
+		"gid:llll": "tel:+17,tel:+18",
+		"gid:mmmm": "tel:+22,tel:+23",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("orphanedGroupRoomPortalIDs() = %#v, want %#v", got, want)
@@ -860,6 +931,48 @@ func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	// returned, so pin that it is NOT silently chosen.
 	if _, picked := got["gid:iiii"]; picked {
 		t.Error("an ambiguous group_id was resolved anyway — MIN()'s arbitrary pick is back")
+	}
+
+	// Cross-check the nominees against the function that decides what gets
+	// created, rather than against a restatement of its rules. This is the
+	// invariant the fix rests on: nominating a room that would be rebuilt
+	// tombstones it and gets it back on the next pass, once per restart.
+	rebuildable, err := store.listPortalIDsWithNewestTimestamp(ctx, false)
+	if err != nil {
+		t.Fatalf("listPortalIDsWithNewestTimestamp: %v", err)
+	}
+	wouldRebuild := make(map[string]bool, len(rebuildable))
+	for _, portal := range rebuildable {
+		wouldRebuild[portal.PortalID] = true
+	}
+	for gidPortal := range got {
+		if wouldRebuild[gidPortal] {
+			t.Errorf("%s was nominated but createPortalsFromCloudSync would rebuild it", gidPortal)
+		}
+	}
+	// And the converse, so "skipped" cannot quietly become "skips everything":
+	// these two are excluded precisely because they WOULD be rebuilt.
+	for _, gidPortal := range []string{"gid:jjjj", "gid:nnnn"} {
+		if !wouldRebuild[gidPortal] {
+			t.Errorf("%s is treated as still in use, but nothing would rebuild it — "+
+				"it is being stranded, not protected", gidPortal)
+		}
+	}
+
+	// bridge_filtered_chats flips gid:mmmm from stranded to rebuilt, so it must
+	// stop being nominated. Pinning both directions keeps the flag threaded
+	// through instead of assumed.
+	gotFiltered, _, err := store.orphanedGroupRoomPortalIDs(ctx, bridgeID, true)
+	if err != nil {
+		t.Fatalf("orphanedGroupRoomPortalIDs(bridgeFilteredChats=true): %v", err)
+	}
+	if _, picked := gotFiltered["gid:mmmm"]; picked {
+		t.Error("gid:mmmm was nominated with bridge_filtered_chats on, but its filtered " +
+			"chat row would then rebuild the room")
+	}
+	if _, picked := gotFiltered["gid:aaaa"]; !picked {
+		t.Error("gid:aaaa stopped being nominated with bridge_filtered_chats on; the flag " +
+			"should only affect portals whose rows are filtered")
 	}
 }
 
